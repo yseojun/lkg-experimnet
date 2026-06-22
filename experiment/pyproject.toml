@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lkg-experiment"
+version = "0.1.0"
+description = "Looking Glass CoherentRaster experiment code kept separate from Bridge SDK"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "Pillow",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lkg_experiment*"]
+
+[project.scripts]
+lkg-run-coherent-raster = "lkg_experiment.run_coherent_raster_experiment:main"
+lkg-build-web-index = "lkg_experiment.build_web_index:main"
+lkg-open-experiment = "lkg_experiment.open_experiment:main"

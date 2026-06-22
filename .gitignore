@@ -1,0 +1,21 @@
+# External dependency checkouts. Clone these manually; see README.md.
+/Bridge-Python-SDK-Lab/
+/coherent-raster/
+/gsplat/
+
+# Generated experiment outputs.
+/experiment/generated/coherent_raster_experiments/
+
+# Python caches and packaging output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Local environments and logs.
+.venv/
+venv/
+*.log
