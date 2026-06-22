@@ -42,7 +42,7 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertTrue((gsplat_root / "gsplat").is_dir(), gsplat_root)
         self.assertEqual(bridge_sdk_root, workspace_root / "Bridge-Python-SDK-Lab")
         self.assertTrue((bridge_sdk_root / "src/bridge_python_sdk").is_dir(), bridge_sdk_root)
-        self.assertEqual(viewpoint_index, experiment_root / "generated" / "lkg_go_1440x2560_66_views_balanced.npz")
+        self.assertEqual(viewpoint_index, experiment_root / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz")
         self.assertTrue(viewpoint_index.is_file(), viewpoint_index)
         self.assertEqual(artifact_dir, experiment_root / "generated" / "coherent_raster_experiments")
         self.assertEqual(args.width, 1440)

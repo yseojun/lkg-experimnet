@@ -114,7 +114,7 @@ def install_bridge_sdk_root(path: Path | str) -> Path:
 
 DEFAULT_BRIDGE_SDK_ROOT = CLEAN_ROOT / "Bridge-Python-SDK-Lab"
 DEFAULT_GSPLAT_ROOT = CLEAN_ROOT / "gsplat"
-DEFAULT_VIEWPOINT_INDEX_PATH = REPO_ROOT / "generated" / "lkg_go_1440x2560_66_views_balanced.npz"
+DEFAULT_VIEWPOINT_INDEX_PATH = REPO_ROOT / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
 DEFAULT_ARTIFACT_DIR = REPO_ROOT / "generated" / "coherent_raster_experiments"
 
 

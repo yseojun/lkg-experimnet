@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import argparse
+from ctypes import byref, c_float, c_int32
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
 
 
 RGB_CHANNELS = 3
+INDEX_METHOD_BALANCED_RAMP = "balanced-ramp"
+INDEX_METHOD_LKG_CALIBRATION = "lkg-calibration"
 
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[2]
@@ -20,19 +24,24 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "generated"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate an empirical Looking Glass subpixel view-index LUT as an .npz file"
+        description="Generate a Looking Glass subpixel view-index LUT as an .npz file"
     )
     parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
     parser.add_argument("--display-index", default=0, type=int)
     parser.add_argument("--quilt-cols", default=0, type=int, help="0 uses Bridge default quilt columns")
     parser.add_argument("--quilt-rows", default=0, type=int, help="0 uses Bridge default quilt rows")
     parser.add_argument("--layout", choices=("gl-top", "gl-bottom"), default="gl-top")
-    parser.add_argument("--index-method", choices=("balanced-ramp",), default="balanced-ramp")
+    parser.add_argument(
+        "--index-method",
+        choices=(INDEX_METHOD_LKG_CALIBRATION, INDEX_METHOD_BALANCED_RAMP),
+        default=INDEX_METHOD_LKG_CALIBRATION,
+    )
+    parser.add_argument("--coherent-quantize", choices=("floor", "nearest"), default="floor")
     parser.add_argument(
         "--output",
         help=(
             "Output .npz path. Default is generated/lkg_go_<native_width>x<native_height>_"
-            "<view_count>_views_balanced.npz"
+            "<view_count>_views_<method>.npz"
         ),
     )
     parser.add_argument(
@@ -159,6 +168,179 @@ def balanced_view_index_from_float(view_float: np.ndarray, view_count: int) -> n
     viewpoint_flat = np.empty(count, dtype=np.int32)
     viewpoint_flat[order] = bins.astype(np.int32, copy=False)
     return viewpoint_flat.reshape(view_float.shape)
+
+
+def _call_display_scalar(
+    bridge: Any,
+    display_handle: Any,
+    public_name: str,
+    private_name: str,
+    c_type: type[c_float] | type[c_int32],
+) -> float | int:
+    public = getattr(bridge, public_name, None)
+    if public is not None:
+        try:
+            return public(display_handle)
+        except TypeError:
+            pass
+
+    raw = getattr(bridge, private_name, None)
+    if raw is None:
+        raise RuntimeError(f"Bridge does not expose {public_name}")
+    value = c_type()
+    if raw(display_handle, byref(value)):
+        return value.value
+    raise RuntimeError(f"{public_name} failed")
+
+
+def _read_raw_display_calibration(bridge: Any, display_handle: Any) -> Any:
+    public = getattr(bridge, "get_calibration_for_display", None)
+    if public is not None:
+        try:
+            return public(display_handle)
+        except (RuntimeError, TypeError):
+            pass
+
+    raw = getattr(bridge, "_get_calibration_for_display", None)
+    if raw is None:
+        raise RuntimeError("Bridge does not expose get_calibration_for_display")
+
+    center = c_float()
+    pitch = c_float()
+    slope = c_float()
+    width = c_int32()
+    height = c_int32()
+    dpi = c_float()
+    flip_x = c_float()
+    inv_view = c_int32()
+    viewcone = c_float()
+    fringe = c_float()
+    cell_pattern_mode = c_int32()
+    cell_count = c_int32()
+    if not raw(
+        display_handle,
+        byref(center),
+        byref(pitch),
+        byref(slope),
+        byref(width),
+        byref(height),
+        byref(dpi),
+        byref(flip_x),
+        byref(inv_view),
+        byref(viewcone),
+        byref(fringe),
+        byref(cell_pattern_mode),
+        byref(cell_count),
+        None,
+    ):
+        raise RuntimeError("get_calibration_for_display failed")
+
+    return SimpleNamespace(
+        Center=float(center.value),
+        Pitch=float(pitch.value),
+        Slope=float(slope.value),
+        Width=int(width.value),
+        Height=int(height.value),
+        Dpi=float(dpi.value),
+        FlipX=float(flip_x.value),
+        InvView=int(inv_view.value),
+        Viewcone=float(viewcone.value),
+        Fringe=float(fringe.value),
+        CellPatternMode=int(cell_pattern_mode.value),
+        CellCount=int(cell_count.value),
+    )
+
+
+def read_lkg_display_calibration(bridge: Any, display_handle: Any):
+    from lkg_experiment.coherent_raster import (
+        LKGViewMappingCalibration,
+        bridge_calibration_slope_to_lkg_slope,
+        bridge_tilt_to_lkg_slope,
+    )
+
+    try:
+        raw = _read_raw_display_calibration(bridge, display_handle)
+        display_aspect = float(
+            _call_display_scalar(
+                bridge,
+                display_handle,
+                "get_display_aspect_for_display",
+                "_get_displayaspect_for_display",
+                c_float,
+            )
+        )
+        slope = bridge_calibration_slope_to_lkg_slope(float(raw.Slope), display_aspect)
+    except Exception:
+        display_aspect = float(
+            _call_display_scalar(
+                bridge,
+                display_handle,
+                "get_display_aspect_for_display",
+                "_get_displayaspect_for_display",
+                c_float,
+            )
+        )
+        slope = bridge_tilt_to_lkg_slope(
+            _call_display_scalar(
+                bridge,
+                display_handle,
+                "get_tilt_for_display",
+                "_get_tilt_for_display",
+                c_float,
+            ),
+            display_aspect,
+        )
+
+    return LKGViewMappingCalibration(
+        pitch=float(
+            _call_display_scalar(bridge, display_handle, "get_pitch_for_display", "_get_pitch_for_display", c_float)
+        ),
+        slope=float(slope),
+        center=float(
+            _call_display_scalar(bridge, display_handle, "get_center_for_display", "_get_center_for_display", c_float)
+        ),
+        subp=float(
+            _call_display_scalar(bridge, display_handle, "get_subp_for_display", "_get_subp_for_display", c_float)
+        ),
+        inv_view=bool(
+            _call_display_scalar(bridge, display_handle, "get_invview_for_display", "_get_invview_for_display", c_int32)
+        ),
+        ri=int(_call_display_scalar(bridge, display_handle, "get_ri_for_display", "_get_ri_for_display", c_int32)),
+        bi=int(_call_display_scalar(bridge, display_handle, "get_bi_for_display", "_get_bi_for_display", c_int32)),
+        y_origin="bottom",
+    )
+
+
+def build_calculated_lkg_viewpoint_index(
+    *,
+    width: int,
+    height: int,
+    view_count: int,
+    calibration: Any,
+    quantize: str,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    from lkg_experiment.coherent_raster import build_lkg_viewpoint_index
+
+    viewpoint_index = build_lkg_viewpoint_index(
+        int(width),
+        int(height),
+        int(view_count),
+        calibration,
+        quantize=str(quantize),
+    )
+    metadata = {
+        "lkg_pitch": np.asarray(float(calibration.pitch), dtype=np.float32),
+        "lkg_slope": np.asarray(float(calibration.slope), dtype=np.float32),
+        "lkg_center": np.asarray(float(calibration.center), dtype=np.float32),
+        "lkg_subp": np.asarray(float(calibration.subp), dtype=np.float32),
+        "lkg_inv_view": np.asarray(bool(calibration.inv_view)),
+        "lkg_ri": np.asarray(int(calibration.ri), dtype=np.int32),
+        "lkg_bi": np.asarray(int(calibration.bi), dtype=np.int32),
+        "lkg_y_origin": np.asarray(str(calibration.y_origin)),
+        "lkg_quantize": np.asarray(str(quantize)),
+        "calculated_lkg_view_index": np.asarray(True),
+    }
+    return viewpoint_index.astype(np.int32, copy=False), metadata
 
 
 def recover_viewpoint_index_from_balanced_ramp(
@@ -343,7 +525,10 @@ def get_display(bridge: Any, display_index: int) -> Any:
 
 
 def quilt_settings_for_display(bridge: Any, display_handle: Any) -> tuple[float, int, int, int, int]:
-    quilt = bridge.get_default_quilt_settings_for_display(display_handle)
+    try:
+        quilt = bridge.get_default_quilt_settings_for_display(display_handle)
+    except (AttributeError, RuntimeError, TypeError):
+        return _raw_quilt_settings_for_display(bridge, display_handle)
     aspect = float(getattr(quilt, "Aspect"))
     width = as_int(getattr(quilt, "QuiltWidth"))
     height = as_int(getattr(quilt, "QuiltHeight"))
@@ -354,8 +539,39 @@ def quilt_settings_for_display(bridge: Any, display_handle: Any) -> tuple[float,
     return aspect, width, height, cols, rows
 
 
-def default_output_path(native_width: int, native_height: int, view_count: int) -> Path:
-    return DEFAULT_OUTPUT_DIR / f"lkg_go_{int(native_width)}x{int(native_height)}_{int(view_count)}_views_balanced.npz"
+def _raw_quilt_settings_for_display(bridge: Any, display_handle: Any) -> tuple[float, int, int, int, int]:
+    raw = getattr(bridge, "_get_default_quilt_settings_for_display", None)
+    if raw is None:
+        raise RuntimeError("Bridge does not expose get_default_quilt_settings_for_display")
+    aspect = c_float()
+    width = c_int32()
+    height = c_int32()
+    cols = c_int32()
+    rows = c_int32()
+    if not raw(display_handle, byref(aspect), byref(width), byref(height), byref(cols), byref(rows)):
+        raise RuntimeError("get_default_quilt_settings_for_display failed")
+    if width.value <= 0 or height.value <= 0 or cols.value <= 0 or rows.value <= 0:
+        raise RuntimeError(
+            f"invalid Bridge quilt settings: {width.value}x{height.value}, {cols.value}x{rows.value}"
+        )
+    return float(aspect.value), int(width.value), int(height.value), int(cols.value), int(rows.value)
+
+
+def _output_method_suffix(index_method: str) -> str:
+    if index_method == INDEX_METHOD_BALANCED_RAMP:
+        return "balanced"
+    if index_method == INDEX_METHOD_LKG_CALIBRATION:
+        return "lkg_calibration"
+    return str(index_method).replace("-", "_")
+
+
+def index_method_requires_opengl(index_method: str) -> bool:
+    return index_method == INDEX_METHOD_BALANCED_RAMP
+
+
+def default_output_path(native_width: int, native_height: int, view_count: int, index_method: str) -> Path:
+    suffix = _output_method_suffix(index_method)
+    return DEFAULT_OUTPUT_DIR / f"lkg_go_{int(native_width)}x{int(native_height)}_{int(view_count)}_views_{suffix}.npz"
 
 
 def _load_bridge_api():
@@ -377,7 +593,8 @@ def main() -> None:
     context = None
     bridge = BridgeAPI()
     try:
-        context = create_hidden_context()
+        if index_method_requires_opengl(args.index_method):
+            context = create_hidden_context()
         if not bridge.initialize("BuildLutNpz"):
             raise RuntimeError("Bridge initialize failed")
 
@@ -390,7 +607,6 @@ def main() -> None:
             raise ValueError("resolved quilt columns and rows must be positive")
         view_count = quilt_cols * quilt_rows
 
-        bridge_window = bridge.instance_offscreen_window_gl(-1)
         print(
             "BuildLutNpz: "
             f"display={args.display_index}, native={native_width}x{native_height}, "
@@ -400,33 +616,48 @@ def main() -> None:
             flush=True,
         )
 
-        viewpoint_index, white_response, ramp_response, normalized_view_float, normalized_valid_mask = (
-            recover_viewpoint_index_from_balanced_ramp(
-                bridge,
-                bridge_window,
-                PixelFormats.RGBA,
-                quilt_width,
-                quilt_height,
-                quilt_cols,
-                quilt_rows,
-                aspect,
-                args.layout,
-                view_count,
+        if index_method_requires_opengl(args.index_method):
+            bridge_window = bridge.instance_offscreen_window_gl(-1)
+            viewpoint_index, white_response, ramp_response, normalized_view_float, normalized_valid_mask = (
+                recover_viewpoint_index_from_balanced_ramp(
+                    bridge,
+                    bridge_window,
+                    PixelFormats.RGBA,
+                    quilt_width,
+                    quilt_height,
+                    quilt_cols,
+                    quilt_rows,
+                    aspect,
+                    args.layout,
+                    view_count,
+                )
             )
-        )
-        metadata: dict[str, np.ndarray] = {
-            "normalized_view_range": np.asarray(
-                [float(np.nanmin(normalized_view_float)), float(np.nanmax(normalized_view_float))],
-                dtype=np.float32,
-            ),
-            "normalized_valid_count": np.asarray(int(np.count_nonzero(normalized_valid_mask)), dtype=np.int64),
-            "balanced_rank_remap": np.asarray(True),
-        }
-        if not args.no_save_responses:
-            metadata["white_response"] = white_response
-            metadata["ramp_response"] = ramp_response
+            metadata: dict[str, np.ndarray] = {
+                "normalized_view_range": np.asarray(
+                    [float(np.nanmin(normalized_view_float)), float(np.nanmax(normalized_view_float))],
+                    dtype=np.float32,
+                ),
+                "normalized_valid_count": np.asarray(int(np.count_nonzero(normalized_valid_mask)), dtype=np.int64),
+                "balanced_rank_remap": np.asarray(True),
+            }
+            if not args.no_save_responses:
+                metadata["white_response"] = white_response
+                metadata["ramp_response"] = ramp_response
+        else:
+            calibration = read_lkg_display_calibration(bridge, display_handle)
+            viewpoint_index, metadata = build_calculated_lkg_viewpoint_index(
+                width=int(native_width),
+                height=int(native_height),
+                view_count=int(view_count),
+                calibration=calibration,
+                quantize=args.coherent_quantize,
+            )
 
-        output = Path(args.output).expanduser() if args.output else default_output_path(native_width, native_height, view_count)
+        output = (
+            Path(args.output).expanduser()
+            if args.output
+            else default_output_path(native_width, native_height, view_count, args.index_method)
+        )
         path = save_viewpoint_index_npz(
             output,
             viewpoint_index,
@@ -439,7 +670,7 @@ def main() -> None:
         )
         unique_views = np.unique(viewpoint_index)
         print(
-            f"Saved balanced-ramp viewpoint index to {path} "
+            f"Saved {args.index_method} viewpoint index to {path} "
             f"shape={viewpoint_index.shape}, view_count={view_count}, "
             f"used_views={int(unique_views.min())}..{int(unique_views.max())} ({len(unique_views)} unique)",
             file=sys.stderr,

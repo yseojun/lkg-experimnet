@@ -24,6 +24,7 @@ class LKGViewMappingCalibration:
     inv_view: bool = False
     ri: int = 0
     bi: int = 2
+    y_origin: str = "bottom"
 
 
 def raw_lkg_slope_to_shader_slope(raw_slope: float, display_aspect: float) -> float:
@@ -34,6 +35,26 @@ def raw_lkg_slope_to_shader_slope(raw_slope: float, display_aspect: float) -> fl
     if display_aspect <= 0.0:
         raise ValueError("display_aspect must be positive")
     return 1.0 / (raw_slope * display_aspect)
+
+
+def bridge_calibration_slope_to_lkg_slope(calibration_slope: float, display_aspect: float) -> float:
+    calibration_slope = float(calibration_slope)
+    display_aspect = float(display_aspect)
+    if abs(calibration_slope) < 1e-12:
+        raise ValueError("calibration_slope must be non-zero")
+    if display_aspect <= 0.0:
+        raise ValueError("display_aspect must be positive")
+    return 1.0 / (calibration_slope * display_aspect)
+
+
+def bridge_tilt_to_lkg_slope(tilt: float, display_aspect: float) -> float:
+    tilt = float(tilt)
+    display_aspect = float(display_aspect)
+    if abs(tilt) < 1e-12:
+        raise ValueError("tilt must be non-zero")
+    if display_aspect <= 0.0:
+        raise ValueError("display_aspect must be positive")
+    return display_aspect / tilt
 
 
 def _quantize_view(view_float: np.ndarray, view_count: int, mode: QuantizationMode) -> np.ndarray:
@@ -79,6 +100,10 @@ def build_lkg_viewpoint_index(
     _validate_dimensions(width, height, view_count)
     x = (np.arange(width, dtype=np.float64) + 0.5) / float(width)
     y = (np.arange(height, dtype=np.float64) + 0.5) / float(height)
+    if calibration.y_origin == "bottom":
+        y = 1.0 - y
+    elif calibration.y_origin != "top":
+        raise ValueError("calibration.y_origin must be 'bottom' or 'top'")
     channel = _physical_channel_indices(calibration.ri, calibration.bi).astype(np.float64)
     channel = channel * float(calibration.subp)
 
@@ -143,9 +168,10 @@ def bridge_calibration_to_lkg(
         try:
             raw = bridge.get_calibration(window_handle)
             display_aspect = float(bridge.get_display_aspect(window_handle))
-            slope = raw_lkg_slope_to_shader_slope(float(raw.Slope), display_aspect)
+            slope = bridge_calibration_slope_to_lkg_slope(float(raw.Slope), display_aspect)
         except Exception:
-            slope = float(bridge.get_tilt(window_handle))
+            display_aspect = float(bridge.get_display_aspect(window_handle))
+            slope = bridge_tilt_to_lkg_slope(float(bridge.get_tilt(window_handle)), display_aspect)
         return LKGViewMappingCalibration(
             pitch=float(bridge.get_pitch(window_handle)),
             slope=slope,
@@ -154,6 +180,7 @@ def bridge_calibration_to_lkg(
             inv_view=bool(bridge.get_invview(window_handle)),
             ri=int(bridge.get_ri(window_handle)),
             bi=int(bridge.get_bi(window_handle)),
+            y_origin="bottom",
         )
     except Exception:
         return fallback
@@ -169,9 +196,10 @@ def bridge_display_calibration_to_lkg(
         try:
             raw = bridge.get_calibration_for_display(display_handle)
             display_aspect = float(bridge.get_display_aspect_for_display(display_handle))
-            slope = raw_lkg_slope_to_shader_slope(float(raw.Slope), display_aspect)
+            slope = bridge_calibration_slope_to_lkg_slope(float(raw.Slope), display_aspect)
         except Exception:
-            slope = float(bridge.get_tilt_for_display(display_handle))
+            display_aspect = float(bridge.get_display_aspect_for_display(display_handle))
+            slope = bridge_tilt_to_lkg_slope(float(bridge.get_tilt_for_display(display_handle)), display_aspect)
         return LKGViewMappingCalibration(
             pitch=float(bridge.get_pitch_for_display(display_handle)),
             slope=slope,
@@ -180,6 +208,7 @@ def bridge_display_calibration_to_lkg(
             inv_view=bool(bridge.get_invview_for_display(display_handle)),
             ri=int(bridge.get_ri_for_display(display_handle)),
             bi=int(bridge.get_bi_for_display(display_handle)),
+            y_origin="bottom",
         )
     except Exception:
         return fallback

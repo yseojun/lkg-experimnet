@@ -79,6 +79,7 @@ class RenderLookingGlassTest(unittest.TestCase):
         self.assertIn("lkg_experiment.render_looking_glass", text)
         self.assertIn("CHECKPOINT_PATH", text)
         self.assertIn("VIEWPOINT_INDEX_PATH", text)
+        self.assertIn("lkg_go_1440x2560_66_views_lkg_calibration.npz", text)
 
 
 if __name__ == "__main__":
