@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -146,6 +147,42 @@ def tensor_to_hwc_uint8(image: Any) -> np.ndarray:
     return array.astype(np.uint8, copy=False)
 
 
+def image_artifact_path(variant_name: str, image_name: str, *, output_prefix: str = "") -> Path:
+    safe_variant = _safe_artifact_name(variant_name)
+    safe_image_name = Path(image_name).name
+    safe_prefix = _safe_artifact_prefix(output_prefix)
+    filename = f"{safe_prefix}_{safe_image_name}" if safe_prefix else safe_image_name
+    return Path("images") / safe_variant / filename
+
+
+def read_metrics_csv(path: Path | str) -> list[dict[str, str]]:
+    metrics_path = Path(path).expanduser()
+    if not metrics_path.is_file():
+        return []
+    with metrics_path.open("r", encoding="utf-8", newline="") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
+def remove_matching_metric_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    output_prefix: str,
+    camera_split: str,
+    camera_index: int,
+) -> list[dict[str, Any]]:
+    prefix = str(output_prefix)
+    split = str(camera_split)
+    index = str(camera_index)
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        if prefix and str(row.get("output_prefix", "")) == prefix:
+            continue
+        if not prefix and str(row.get("camera_split", "")) == split and str(row.get("camera_index", "")) == index:
+            continue
+        kept.append(dict(row))
+    return kept
+
+
 def select_metric_view_indices(
     view_count: int,
     *,
@@ -210,6 +247,9 @@ class ArtifactWriter:
             path.write_text("", encoding="utf-8")
             return path
         preferred = [
+            "camera_split",
+            "camera_index",
+            "output_prefix",
             "variant",
             "group",
             "cluster_size",
@@ -311,6 +351,16 @@ class ArtifactWriter:
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(tensor_to_hwc_uint8(image), mode="RGB").save(path)
         return path
+
+
+def _safe_artifact_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+    return sanitized or "artifact"
+
+
+def _safe_artifact_prefix(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+    return sanitized
 
 
 class OfficialGsplatRenderer:

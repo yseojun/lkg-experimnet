@@ -42,9 +42,12 @@ from lkg_experiment.coherent_raster_experiment import (
     cluster_index_from_view_index,
     compact_viewpoint_index,
     compute_metric_stats,
+    image_artifact_path,
     load_viewpoint_index_file,
     parse_cluster_values,
+    read_metrics_csv,
     reference_interlace_from_views,
+    remove_matching_metric_rows,
     select_metric_view_indices,
     time_interlaced_render,
 )
@@ -129,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
     parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT_DIR))
     parser.add_argument("--run-id", help="Output subdirectory name; default is timestamp plus checkpoint stem")
+    parser.add_argument("--output-prefix", default="", help="Prefix for per-camera image filenames inside a run directory")
+    parser.add_argument("--append-metrics", action="store_true", help="Append metrics.csv/json in an existing run directory")
 
     parser.add_argument("--data-dir", default="auto", help="'auto', a dataset path, or empty to force bbox camera")
     parser.add_argument("--camera-source", choices=("auto", "dataset", "bbox"), default="auto")
@@ -178,6 +183,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-lpips", action="store_true")
     parser.add_argument("--no-reference-interlaced", action="store_true")
     parser.add_argument("--skip-web-assets", action="store_true")
+    parser.add_argument(
+        "--write-mapping-artifacts",
+        action="store_true",
+        help="Write mappings/raw_mapping.npz and numeric mapping values; disabled by default",
+    )
+    parser.add_argument(
+        "--write-mapping-previews",
+        action="store_true",
+        help="Write colorized mapping PNG previews; implies --write-mapping-artifacts",
+    )
     parser.add_argument("--debug-render", action="store_true")
     return parser
 
@@ -301,21 +316,32 @@ def main() -> None:
         variant.name: cluster_index_from_view_index(viewpoint_index, variant.cluster_size)
         for variant in variants
     }
-    writer.write_mapping_npz(
-        viewpoint_index,
-        cluster_indices,
-        view_labels=view_labels,
-        source_view_index_hwc=source_viewpoint_index,
-    )
-    writer.save_index_previews("view_index", viewpoint_index)
-    writer.save_mapping_values("view_index", viewpoint_index)
-    if not np.array_equal(source_viewpoint_index, viewpoint_index):
-        writer.save_index_previews("source_view_index", source_viewpoint_index)
-        writer.save_mapping_values("source_view_index", source_viewpoint_index)
-    for variant in variants:
-        writer.save_index_previews(f"{variant.name}_cluster_index", cluster_indices[variant.name])
+    if args.write_mapping_artifacts or args.write_mapping_previews:
+        writer.write_mapping_npz(
+            viewpoint_index,
+            cluster_indices,
+            view_labels=view_labels,
+            source_view_index_hwc=source_viewpoint_index,
+        )
+        writer.save_mapping_values("view_index", viewpoint_index)
+        if not np.array_equal(source_viewpoint_index, viewpoint_index):
+            writer.save_mapping_values("source_view_index", source_viewpoint_index)
+        if args.write_mapping_previews:
+            writer.save_index_previews("view_index", viewpoint_index)
+            if not np.array_equal(source_viewpoint_index, viewpoint_index):
+                writer.save_index_previews("source_view_index", source_viewpoint_index)
+            for variant in variants:
+                writer.save_index_previews(f"{variant.name}_cluster_index", cluster_indices[variant.name])
 
-    rows: list[dict[str, Any]] = []
+    if args.append_metrics:
+        rows: list[dict[str, Any]] = remove_matching_metric_rows(
+            read_metrics_csv(artifact_root / "metrics.csv"),
+            output_prefix=args.output_prefix,
+            camera_split=args.camera_split,
+            camera_index=args.camera_index,
+        )
+    else:
+        rows = []
     for variant in variants:
         print(
             f"Running variant {variant.name}: cluster={variant.cluster_size}, "
@@ -352,11 +378,17 @@ def main() -> None:
             measure_iters=args.measure_iters,
             debug=args.debug_render,
         )
-        writer.save_tensor_image(f"images/{variant.name}/looking_glass_tensor.png", interlaced)
+        writer.save_tensor_image(
+            image_artifact_path(variant.name, "looking_glass_tensor.png", output_prefix=args.output_prefix),
+            interlaced,
+        )
         if reference_interlaced is not None:
-            writer.save_tensor_image(f"images/{variant.name}/reference_interlaced.png", reference_interlaced)
             writer.save_tensor_image(
-                f"images/{variant.name}/abs_error.png",
+                image_artifact_path(variant.name, "reference_interlaced.png", output_prefix=args.output_prefix),
+                reference_interlaced,
+            )
+            writer.save_tensor_image(
+                image_artifact_path(variant.name, "abs_error.png", output_prefix=args.output_prefix),
                 (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0),
             )
 
@@ -378,6 +410,9 @@ def main() -> None:
             )
 
         row = {
+            "camera_split": args.camera_split,
+            "camera_index": args.camera_index,
+            "output_prefix": args.output_prefix,
             "variant": variant.name,
             "group": variant.group,
             "cluster_size": variant.cluster_size,
@@ -415,6 +450,7 @@ def main() -> None:
         "background": "white" if use_white_background else "none",
         "variants": [variant.to_json() for variant in variants],
         "metric_view_indices": metric_view_indices,
+        "output_prefix": args.output_prefix,
         "artifact_root": str(artifact_root),
         "git": git_summary(REPO_ROOT),
         "args": vars(args),

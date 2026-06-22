@@ -11,6 +11,7 @@ from lkg_experiment.run_coherent_raster_experiment import build_parser
 from lkg_experiment.coherent_raster_experiment import (
     build_experiment_variants,
     cluster_index_from_view_index,
+    image_artifact_path,
     parse_cluster_values,
 )
 
@@ -49,6 +50,10 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertEqual(args.height, 2560)
         self.assertEqual(args.views, 66)
         self.assertEqual(args.clusters, "2,4,8,16")
+        self.assertFalse(args.append_metrics)
+        self.assertEqual(args.output_prefix, "")
+        self.assertFalse(args.write_mapping_artifacts)
+        self.assertFalse(args.write_mapping_previews)
 
     def test_parser_accepts_explicit_experiment_inputs(self):
         parser = build_parser()
@@ -65,6 +70,11 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
                 "--clusters",
                 "2,4",
                 "--no-compact-view-index",
+                "--append-metrics",
+                "--output-prefix",
+                "test/17",
+                "--write-mapping-artifacts",
+                "--write-mapping-previews",
             ]
         )
 
@@ -74,6 +84,10 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertEqual(args.viewpoint_index_path, "/tmp/map.npz")
         self.assertEqual(args.clusters, "2,4")
         self.assertTrue(args.no_compact_view_index)
+        self.assertTrue(args.append_metrics)
+        self.assertEqual(args.output_prefix, "test/17")
+        self.assertTrue(args.write_mapping_artifacts)
+        self.assertTrue(args.write_mapping_previews)
 
     def test_experiment_variant_helpers_are_available(self):
         self.assertEqual(parse_cluster_values("2,4,8,16"), (2, 4, 8, 16))
@@ -90,6 +104,16 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
             ],
         )
         np.testing.assert_array_equal(cluster_index_from_view_index(view_index, cluster_size=4), view_index // 4)
+
+    def test_image_artifact_path_prefixes_camera_outputs(self):
+        self.assertEqual(
+            image_artifact_path("cluster_8", "looking_glass_tensor.png", output_prefix="test/17"),
+            Path("images/cluster_8/test_17_looking_glass_tensor.png"),
+        )
+        self.assertEqual(
+            image_artifact_path("cluster_8", "looking_glass_tensor.png"),
+            Path("images/cluster_8/looking_glass_tensor.png"),
+        )
 
     def test_web_index_parser_defaults_to_experiment_generated_root(self):
         experiment_root = Path(__file__).resolve().parents[1]
