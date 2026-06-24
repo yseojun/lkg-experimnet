@@ -4,11 +4,26 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-DATADIR="${DATADIR:-${DATA_DIR_ROOT:-$HOME/Data/datasets}}"
-RESULTDIR="${RESULTDIR:-${RESULT_DIR_ROOT:-$HOME/Data/results}}"
+LKG_DATASET_BASE="${LKG_DATASET_BASE:-/data/ysj/dataset}"
+LKG_RESULT_BASE="${LKG_RESULT_BASE:-/data/ysj/result}"
+GENERATED_DIR="${LKG_GENERATED_DIR:-${GENERATED_DIR:-$LKG_RESULT_BASE/generated}}"
+
+resolve_result_root() {
+    local base="$1"
+    if [[ -d "$base/blender_MCMC100000_init50000" ]]; then
+        printf '%s\n' "$base"
+    elif [[ -d "$base/coherent-raster" ]]; then
+        printf '%s\n' "$base/coherent-raster"
+    else
+        printf '%s\n' "$base"
+    fi
+}
+
+DATADIR="${DATADIR:-${DATA_DIR_ROOT:-$LKG_DATASET_BASE}}"
+RESULTDIR="$(resolve_result_root "${RESULTDIR:-${RESULT_DIR_ROOT:-$LKG_RESULT_BASE}}")"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-$RESULTDIR/blender_MCMC100000_init50000/drums/ckpts/ckpt_29999_rank0.pt}"
 DATA_DIR="${DATA_DIR:-$DATADIR/nerf_synthetic/drums}"
-VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$ROOT_DIR/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
+VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$GENERATED_DIR/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
 
 require_file() {
     local path="$1"
@@ -42,4 +57,5 @@ PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON_BIN" -m lkg_
     --views 66 \
     --map-mode file \
     --viewpoint-index-path "$VIEWPOINT_INDEX_PATH" \
+    --artifact-dir "$GENERATED_DIR/coherent_raster_experiments" \
     "$@"

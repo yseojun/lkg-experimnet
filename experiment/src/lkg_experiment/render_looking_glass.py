@@ -30,7 +30,6 @@ from lkg_experiment.coherent_raster_experiment import (
 from lkg_experiment.run_coherent_raster_experiment import (
     DEFAULT_BRIDGE_SDK_ROOT,
     DEFAULT_GSPLAT_ROOT,
-    DEFAULT_VIEWPOINT_INDEX_PATH,
     default_checkpoint_path,
     estimate_bbox_camera,
     load_blender_camera,
@@ -40,6 +39,7 @@ from lkg_experiment.run_coherent_raster_experiment import (
     result_root_from_checkpoint,
     subset_splats_for_debug,
 )
+from lkg_experiment.paths import default_viewpoint_index_path
 
 
 DEFAULT_PANEL_VIEWS = 45
@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-crop-to-fill", action="store_true")
 
     parser.add_argument("--map-mode", choices=("file", "linear"), default="file")
-    parser.add_argument("--viewpoint-index-path", default=str(DEFAULT_VIEWPOINT_INDEX_PATH))
+    parser.add_argument("--viewpoint-index-path", default=str(default_viewpoint_index_path()))
     parser.add_argument("--no-compact-view-index", action="store_true")
     parser.add_argument("--coherent-quantize", choices=("floor", "nearest"), default="floor")
 

@@ -4,20 +4,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = THIS_FILE.parents[2]
-
 from lkg_experiment.coherent_raster_experiment import build_experiment_web_assets
+from lkg_experiment.paths import coherent_raster_experiments_root
 
 
-DEFAULT_EXPERIMENTS_ROOT = REPO_ROOT / "generated" / "coherent_raster_experiments"
+DEFAULT_EXPERIMENTS_ROOT = coherent_raster_experiments_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build the static web dashboard for CoherentRaster experiment folders"
     )
-    parser.add_argument("--experiments-root", default=str(DEFAULT_EXPERIMENTS_ROOT))
+    parser.add_argument("--experiments-root", default=str(coherent_raster_experiments_root()))
     parser.add_argument(
         "--no-regenerate-previews",
         action="store_true",

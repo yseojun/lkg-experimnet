@@ -11,13 +11,11 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
-THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = THIS_FILE.parents[2]
-
 from lkg_experiment.coherent_raster_experiment import build_experiment_web_assets
+from lkg_experiment.paths import coherent_raster_experiments_root
 
 
-DEFAULT_EXPERIMENTS_ROOT = REPO_ROOT / "generated" / "coherent_raster_experiments"
+DEFAULT_EXPERIMENTS_ROOT = coherent_raster_experiments_root()
 
 
 @dataclass(frozen=True)
@@ -33,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "path",
         nargs="?",
-        default=str(DEFAULT_EXPERIMENTS_ROOT),
+        default=str(coherent_raster_experiments_root()),
         help="Experiment run directory containing manifest.json, or the experiments root directory",
     )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host")

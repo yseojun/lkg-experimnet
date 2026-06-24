@@ -10,6 +10,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from lkg_experiment.paths import generated_root
+
 
 RGB_CHANNELS = 3
 INDEX_METHOD_BALANCED_RAMP = "balanced-ramp"
@@ -19,7 +21,7 @@ THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[2]
 CLEAN_ROOT = REPO_ROOT.parent
 DEFAULT_BRIDGE_SDK_ROOT = CLEAN_ROOT / "Bridge-Python-SDK-Lab"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "generated"
+DEFAULT_OUTPUT_DIR = generated_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         help=(
-            "Output .npz path. Default is generated/lkg_go_<native_width>x<native_height>_"
-            "<view_count>_views_<method>.npz"
+            "Output .npz path. Default is $LKG_RESULT_BASE/generated/"
+            "lkg_go_<native_width>x<native_height>_<view_count>_views_<method>.npz"
         ),
     )
     parser.add_argument(
@@ -571,7 +573,7 @@ def index_method_requires_opengl(index_method: str) -> bool:
 
 def default_output_path(native_width: int, native_height: int, view_count: int, index_method: str) -> Path:
     suffix = _output_method_suffix(index_method)
-    return DEFAULT_OUTPUT_DIR / f"lkg_go_{int(native_width)}x{int(native_height)}_{int(view_count)}_views_{suffix}.npz"
+    return generated_root() / f"lkg_go_{int(native_width)}x{int(native_height)}_{int(view_count)}_views_{suffix}.npz"
 
 
 def _load_bridge_api():

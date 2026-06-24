@@ -4,7 +4,7 @@
 /gsplat/
 
 # Generated experiment outputs.
-/experiment/generated/coherent_raster_experiments/
+/experiment/generated/
 
 # Python caches and packaging output.
 __pycache__/
@@ -21,3 +21,5 @@ venv/
 *.log
 
 /coherentraster_paper_summary
+
+experiment/scripts/set_server_dirs.sh

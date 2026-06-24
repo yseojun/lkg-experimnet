@@ -1,7 +1,9 @@
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -100,14 +102,23 @@ class BuildLutNpzTest(unittest.TestCase):
         balanced_args = build_parser().parse_args(["--output", "/tmp/lut.npz", "--index-method", "balanced-ramp"])
         self.assertEqual(balanced_args.index_method, "balanced-ramp")
 
-    def test_default_output_path_uses_method_suffix(self):
+    def test_default_output_path_uses_result_generated_root_and_method_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result_base = Path(tmp) / "result"
+            env = os.environ.copy()
+            env["LKG_RESULT_BASE"] = str(result_base)
+            env.pop("LKG_GENERATED_DIR", None)
+            with patch.dict("os.environ", env, clear=True):
+                calibration_path = default_output_path(1440, 2560, 66, "lkg-calibration")
+                balanced_path = default_output_path(1440, 2560, 66, "balanced-ramp")
+
         self.assertEqual(
-            default_output_path(1440, 2560, 66, "lkg-calibration").name,
-            "lkg_go_1440x2560_66_views_lkg_calibration.npz",
+            calibration_path,
+            result_base / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz",
         )
         self.assertEqual(
-            default_output_path(1440, 2560, 66, "balanced-ramp").name,
-            "lkg_go_1440x2560_66_views_balanced.npz",
+            balanced_path,
+            result_base / "generated" / "lkg_go_1440x2560_66_views_balanced.npz",
         )
 
     def test_only_balanced_ramp_requires_opengl(self):

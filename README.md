@@ -98,7 +98,8 @@ $RESULTDIR/
 ```
 
 If `DATADIR` or `RESULTDIR` is omitted, the code tries common local defaults
-such as `~/Data/datasets`, `~/Data/results`, `~/data/dataset`,
+such as `/data/ysj/dataset`, `/data/ysj/result/coherent-raster`,
+`~/Data/datasets`, `~/Data/results`, `~/data/dataset`,
 `~/data/result`, `/data/dataset`, and `/data/result`.
 
 ## Run The Drums Experiment
@@ -121,5 +122,6 @@ python run_coherent_raster_experiment.py --run-id drums_smoke
 ```
 
 Experiment outputs are generated under
-`experiment/generated/coherent_raster_experiments/` and are intentionally
-ignored by Git.
+`/data/ysj/result/generated/coherent_raster_experiments/` by default. Override
+`LKG_RESULT_BASE`, `LKG_GENERATED_DIR`, or `ARTIFACT_DIR` when a server needs a
+different storage root.

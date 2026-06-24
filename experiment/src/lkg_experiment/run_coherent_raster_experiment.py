@@ -51,6 +51,12 @@ from lkg_experiment.coherent_raster_experiment import (
     select_metric_view_indices,
     time_interlaced_render,
 )
+from lkg_experiment.paths import (
+    coherent_raster_experiments_root,
+    default_viewpoint_index_path,
+    lkg_dataset_base,
+    lkg_result_base,
+)
 
 
 def first_existing_path(*candidates: Path) -> Path:
@@ -69,10 +75,11 @@ def env_path(*names: str) -> Optional[Path]:
 
 
 def default_data_root() -> Path:
-    env = env_path("DATADIR", "DATA_DIR", "CR_DATASETS_ROOT")
+    env = env_path("DATADIR", "DATA_DIR", "DATA_DIR_ROOT", "CR_DATASETS_ROOT")
     if env is not None:
         return env
     return first_existing_path(
+        lkg_dataset_base(),
         Path.home() / "Data" / "datasets",
         Path.home() / "data" / "dataset",
         Path.home() / "data" / "datasets",
@@ -82,10 +89,13 @@ def default_data_root() -> Path:
 
 
 def default_result_root() -> Path:
-    env = env_path("RESULTDIR", "RESULT_DIR", "CR_RESULTS_ROOT")
+    env = env_path("RESULTDIR", "RESULT_DIR", "RESULT_DIR_ROOT", "CR_RESULTS_ROOT")
     if env is not None:
         return env
+    result_base = lkg_result_base()
     return first_existing_path(
+        result_base / "coherent-raster",
+        result_base,
         Path.home() / "Data" / "results",
         Path.home() / "data" / "result",
         Path.home() / "data" / "results",
@@ -117,8 +127,8 @@ def install_bridge_sdk_root(path: Path | str) -> Path:
 
 DEFAULT_BRIDGE_SDK_ROOT = CLEAN_ROOT / "Bridge-Python-SDK-Lab"
 DEFAULT_GSPLAT_ROOT = CLEAN_ROOT / "gsplat"
-DEFAULT_VIEWPOINT_INDEX_PATH = REPO_ROOT / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
-DEFAULT_ARTIFACT_DIR = REPO_ROOT / "generated" / "coherent_raster_experiments"
+DEFAULT_VIEWPOINT_INDEX_PATH = default_viewpoint_index_path()
+DEFAULT_ARTIFACT_DIR = coherent_raster_experiments_root()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gsplat-root", default=str(DEFAULT_GSPLAT_ROOT))
     parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
-    parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT_DIR))
+    parser.add_argument("--artifact-dir", default=str(coherent_raster_experiments_root()))
     parser.add_argument("--run-id", help="Output subdirectory name; default is timestamp plus checkpoint stem")
     parser.add_argument("--output-prefix", default="", help="Prefix for per-camera image filenames inside a run directory")
     parser.add_argument("--append-metrics", action="store_true", help="Append metrics.csv/json in an existing run directory")
@@ -149,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-crop-to-fill", action="store_true")
 
     parser.add_argument("--map-mode", choices=("file", "linear", "lkg"), default="file")
-    parser.add_argument("--viewpoint-index-path", default=str(DEFAULT_VIEWPOINT_INDEX_PATH))
+    parser.add_argument("--viewpoint-index-path", default=str(default_viewpoint_index_path()))
     parser.add_argument("--no-compact-view-index", action="store_true")
     parser.add_argument("--coherent-quantize", choices=("floor", "nearest"), default="floor")
     parser.add_argument("--lkg-pitch", type=float)

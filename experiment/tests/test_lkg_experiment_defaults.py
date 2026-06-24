@@ -24,36 +24,47 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
             root = Path(tmp)
             data_root = root / "datasets"
             result_root = root / "results"
+            generated_root = root / "result" / "generated"
             checkpoint = result_root / "blender_MCMC100000_init50000/drums/ckpts/ckpt_29999_rank0.pt"
+            viewpoint_index_file = generated_root / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
             checkpoint.parent.mkdir(parents=True)
             checkpoint.write_bytes(b"")
+            viewpoint_index_file.parent.mkdir(parents=True)
+            viewpoint_index_file.write_bytes(b"")
 
-            with patch.dict("os.environ", {"DATADIR": str(data_root), "RESULTDIR": str(result_root)}):
+            with patch.dict(
+                "os.environ",
+                {
+                    "DATADIR": str(data_root),
+                    "LKG_RESULT_BASE": str(root / "result"),
+                    "RESULTDIR": str(result_root),
+                },
+            ):
                 parser = build_parser()
                 args = parser.parse_args([])
 
-        checkpoint_path = Path(args.checkpoint_path)
-        gsplat_root = Path(args.gsplat_root)
-        bridge_sdk_root = Path(args.bridge_sdk_root)
-        viewpoint_index = Path(args.viewpoint_index_path)
-        artifact_dir = Path(args.artifact_dir)
+            checkpoint_path = Path(args.checkpoint_path)
+            gsplat_root = Path(args.gsplat_root)
+            bridge_sdk_root = Path(args.bridge_sdk_root)
+            viewpoint_index = Path(args.viewpoint_index_path)
+            artifact_dir = Path(args.artifact_dir)
 
-        self.assertEqual(checkpoint_path, checkpoint)
-        self.assertEqual(gsplat_root, workspace_root / "gsplat")
-        self.assertTrue((gsplat_root / "gsplat").is_dir(), gsplat_root)
-        self.assertEqual(bridge_sdk_root, workspace_root / "Bridge-Python-SDK-Lab")
-        self.assertTrue((bridge_sdk_root / "src/bridge_python_sdk").is_dir(), bridge_sdk_root)
-        self.assertEqual(viewpoint_index, experiment_root / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz")
-        self.assertTrue(viewpoint_index.is_file(), viewpoint_index)
-        self.assertEqual(artifact_dir, experiment_root / "generated" / "coherent_raster_experiments")
-        self.assertEqual(args.width, 1440)
-        self.assertEqual(args.height, 2560)
-        self.assertEqual(args.views, 66)
-        self.assertEqual(args.clusters, "2,4,8,16")
-        self.assertFalse(args.append_metrics)
-        self.assertEqual(args.output_prefix, "")
-        self.assertFalse(args.write_mapping_artifacts)
-        self.assertFalse(args.write_mapping_previews)
+            self.assertEqual(checkpoint_path, checkpoint)
+            self.assertEqual(gsplat_root, workspace_root / "gsplat")
+            self.assertTrue((gsplat_root / "gsplat").is_dir(), gsplat_root)
+            self.assertEqual(bridge_sdk_root, workspace_root / "Bridge-Python-SDK-Lab")
+            self.assertTrue((bridge_sdk_root / "src/bridge_python_sdk").is_dir(), bridge_sdk_root)
+            self.assertEqual(viewpoint_index, viewpoint_index_file)
+            self.assertTrue(viewpoint_index.is_file(), viewpoint_index)
+            self.assertEqual(artifact_dir, generated_root / "coherent_raster_experiments")
+            self.assertEqual(args.width, 1440)
+            self.assertEqual(args.height, 2560)
+            self.assertEqual(args.views, 66)
+            self.assertEqual(args.clusters, "2,4,8,16")
+            self.assertFalse(args.append_metrics)
+            self.assertEqual(args.output_prefix, "")
+            self.assertFalse(args.write_mapping_artifacts)
+            self.assertFalse(args.write_mapping_previews)
 
     def test_parser_accepts_explicit_experiment_inputs(self):
         parser = build_parser()
@@ -115,11 +126,13 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
             Path("images/cluster_8/looking_glass_tensor.png"),
         )
 
-    def test_web_index_parser_defaults_to_experiment_generated_root(self):
-        experiment_root = Path(__file__).resolve().parents[1]
-        args = build_web_index_parser().parse_args([])
+    def test_web_index_parser_defaults_to_result_generated_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result_base = Path(tmp) / "result"
+            with patch.dict("os.environ", {"LKG_RESULT_BASE": str(result_base)}):
+                args = build_web_index_parser().parse_args([])
 
-        self.assertEqual(args.experiments_root, str(experiment_root / "generated" / "coherent_raster_experiments"))
+        self.assertEqual(args.experiments_root, str(result_base / "generated" / "coherent_raster_experiments"))
         self.assertFalse(args.no_regenerate_previews)
 
     def test_open_experiment_resolves_run_and_builds_url(self):

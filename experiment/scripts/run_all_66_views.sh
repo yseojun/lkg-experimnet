@@ -11,10 +11,25 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
     fi
 fi
 
-DATADIR="${DATADIR:-${DATA_DIR_ROOT:-$HOME/Data/datasets}}"
-RESULTDIR="${RESULTDIR:-${RESULT_DIR_ROOT:-$HOME/Data/results}}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/generated/coherent_raster_experiments}"
-VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$ROOT_DIR/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
+LKG_DATASET_BASE="${LKG_DATASET_BASE:-/data/ysj/dataset}"
+LKG_RESULT_BASE="${LKG_RESULT_BASE:-/data/ysj/result}"
+GENERATED_DIR="${LKG_GENERATED_DIR:-${GENERATED_DIR:-$LKG_RESULT_BASE/generated}}"
+
+resolve_result_root() {
+    local base="$1"
+    if [[ -d "$base/blender_MCMC500000" || -d "$base/MipNeRF360_MCMC500000" || -d "$base/blender_MCMC100000_init50000" ]]; then
+        printf '%s\n' "$base"
+    elif [[ -d "$base/coherent-raster" ]]; then
+        printf '%s\n' "$base/coherent-raster"
+    else
+        printf '%s\n' "$base"
+    fi
+}
+
+DATADIR="${DATADIR:-${DATA_DIR_ROOT:-$LKG_DATASET_BASE}}"
+RESULTDIR="$(resolve_result_root "${RESULTDIR:-${RESULT_DIR_ROOT:-$LKG_RESULT_BASE}}")"
+ARTIFACT_DIR="${ARTIFACT_DIR:-$GENERATED_DIR/coherent_raster_experiments}"
+VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$GENERATED_DIR/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
 
 RUN_GROUP="${RUN_GROUP:-all_66_views_$(date +%Y%m%d_%H%M%S)}"
 SUMMARY_TXT="${SUMMARY_TXT:-$ARTIFACT_DIR/${RUN_GROUP}_metrics.txt}"
