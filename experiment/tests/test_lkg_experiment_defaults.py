@@ -101,6 +101,8 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
                 "14000",
                 "--four-dgs-time",
                 "0.25",
+                "--camera-source",
+                "fourdgs",
             ]
         )
 
@@ -108,6 +110,7 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertEqual(args.four_dgs_code_root, "/tmp/4DGaussians")
         self.assertEqual(args.four_dgs_iteration, 14000)
         self.assertEqual(args.four_dgs_time, 0.25)
+        self.assertEqual(args.camera_source, "fourdgs")
 
     def test_experiment_variant_helpers_are_available(self):
         self.assertEqual(parse_cluster_values("2,4,8,16"), (2, 4, 8, 16))

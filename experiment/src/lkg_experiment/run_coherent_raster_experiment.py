@@ -51,7 +51,12 @@ from lkg_experiment.coherent_raster_experiment import (
     select_metric_view_indices,
     time_interlaced_render,
 )
-from lkg_experiment.fourdgs_bridge import DEFAULT_4DGS_CODE_ROOT, load_4dgs_checkpoint
+from lkg_experiment.fourdgs_bridge import (
+    DEFAULT_4DGS_CODE_ROOT,
+    has_4dgs_dynerf_camera,
+    load_4dgs_checkpoint,
+    load_4dgs_dynerf_camera,
+)
 
 
 def first_existing_path(*candidates: Path) -> Path:
@@ -142,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--append-metrics", action="store_true", help="Append metrics.csv/json in an existing run directory")
 
     parser.add_argument("--data-dir", default="auto", help="'auto', a dataset path, or empty to force bbox camera")
-    parser.add_argument("--camera-source", choices=("auto", "dataset", "bbox"), default="auto")
+    parser.add_argument("--camera-source", choices=("auto", "fourdgs", "dataset", "bbox"), default="auto")
     parser.add_argument("--camera-split", choices=("auto", "val", "train", "test"), default="auto")
     parser.add_argument("--camera-index", default=0, type=int)
     parser.add_argument("--width", default=1440, type=int)
@@ -241,6 +246,7 @@ def main() -> None:
     writer = ArtifactWriter(artifact_root)
 
     print(f"Loading checkpoint: {checkpoint}", file=sys.stderr, flush=True)
+    four_dgs = None
     if args.four_dgs_model_path:
         four_dgs = load_4dgs_checkpoint(
             args.four_dgs_model_path,
@@ -255,18 +261,34 @@ def main() -> None:
         splats, step = load_splats_from_checkpoint(checkpoint, device=device)
     splats = subset_splats_for_debug(splats, args.max_gaussians)
 
-    data_dir = maybe_resolve_data_dir(args, cfg)
-    dataset_category = dataset_category_from_cfg(cfg, data_dir)
-    if args.camera_source == "dataset" and data_dir is None:
-        raise RuntimeError("--camera-source dataset requested but no valid data_dir is available")
-    if data_dir is not None and args.camera_source in {"auto", "dataset"}:
+    data_dir: Optional[Path] = None
+    if four_dgs is not None and (
+        args.camera_source == "fourdgs"
+        or (args.camera_source == "auto" and has_4dgs_dynerf_camera(four_dgs.cfg_args))
+    ):
+        c2w_np, K_np, scene_center_np, camera_label = load_4dgs_dynerf_camera(
+            four_dgs.cfg_args,
+            args,
+            width,
+            height,
+        )
+        data_dir = Path(str(four_dgs.cfg_args.source_path)).expanduser()
+        dataset_category = "fourdgs-dynerf"
+    elif args.camera_source == "fourdgs":
+        raise RuntimeError("--camera-source fourdgs requires a 4DGS model with dynerf poses_bounds.npy")
+    else:
+        data_dir = maybe_resolve_data_dir(args, cfg)
+        dataset_category = dataset_category_from_cfg(cfg, data_dir)
+        if args.camera_source == "dataset" and data_dir is None:
+            raise RuntimeError("--camera-source dataset requested but no valid data_dir is available")
+    if data_dir is not None and dataset_category != "fourdgs-dynerf" and args.camera_source in {"auto", "dataset"}:
         if dataset_category == "blender":
             c2w_np, K_np, scene_center_np, camera_label = load_blender_camera(args, cfg, data_dir, width, height)
         elif dataset_category == "colmap":
             c2w_np, K_np, scene_center_np, camera_label = load_colmap_camera(args, cfg, data_dir, width, height)
         else:
             raise ValueError(f"Unsupported dataset_category: {dataset_category!r}")
-    else:
+    elif args.camera_source == "bbox" or data_dir is None:
         c2w_np, K_np, scene_center_np, camera_label = estimate_bbox_camera(args, splats["means"], width, height)
         dataset_category = "bbox"
 
@@ -276,7 +298,11 @@ def main() -> None:
     orbit_center_distance = float(args.orbit_center_distance or max(initial_distance, 1e-4))
     orbit_center = c2w[:3, 3] + c2w[:3, 2] * orbit_center_distance
 
-    use_white_background = bool(args.white_background or dataset_category == "blender")
+    use_white_background = bool(
+        args.white_background
+        or dataset_category == "blender"
+        or (four_dgs is not None and getattr(four_dgs.cfg_args, "white_background", False))
+    )
     background = torch.ones(3, device=device) if use_white_background else None
     original_renderer = OfficialGsplatRenderer(
         splats,

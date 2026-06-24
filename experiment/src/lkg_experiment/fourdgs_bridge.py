@@ -12,6 +12,8 @@ from typing import Any, Mapping, Optional
 
 import numpy as np
 
+from lkg_experiment.coherent_gsplat_bridge import scale_intrinsics_to_panel
+
 
 DEFAULT_4DGS_CODE_ROOT = Path("/home/ysj/GS/4DGaussians")
 
@@ -229,6 +231,87 @@ def _ensure_namespace_package(name: str, directory: Path) -> None:
     spec.submodule_search_locations = [directory_s]
     package.__spec__ = spec
     sys.modules[name] = package
+
+
+def has_4dgs_dynerf_camera(cfg_args: Any) -> bool:
+    source_path = getattr(cfg_args, "source_path", None)
+    if not source_path:
+        return False
+    return (Path(str(source_path)).expanduser() / "poses_bounds.npy").is_file()
+
+
+def load_4dgs_dynerf_camera(
+    cfg_args: Any,
+    args: Any,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    source_path_value = getattr(cfg_args, "source_path", None)
+    if not source_path_value:
+        raise ValueError("4DGS cfg_args has no source_path for dynerf camera loading")
+    source_path = Path(str(source_path_value)).expanduser()
+    poses_path = source_path / "poses_bounds.npy"
+    if not poses_path.is_file():
+        raise FileNotFoundError(f"4DGS dynerf poses_bounds.npy not found: {poses_path}")
+
+    poses_arr = np.load(poses_path)
+    if poses_arr.ndim != 2 or poses_arr.shape[1] < 17:
+        raise ValueError(f"poses_bounds.npy must have shape (N,17+): {poses_path}")
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5])
+    if poses.shape[0] == 0:
+        raise ValueError(f"poses_bounds.npy contains no cameras: {poses_path}")
+
+    pose_height, pose_width, pose_focal = [float(value) for value in poses[0, :, -1]]
+    downsample = max(pose_width / 1352.0, 1e-8)
+    native_width = int(round(pose_width / downsample))
+    native_height = int(round(pose_height / downsample))
+    focal = pose_focal / downsample
+
+    converted = np.concatenate([poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], axis=-1)
+    requested_split = "val" if args.camera_split == "auto" else str(args.camera_split)
+    eval_index = 0
+    if requested_split in {"val", "test"}:
+        camera_indices = [eval_index]
+    elif requested_split == "train":
+        camera_indices = [index for index in range(converted.shape[0]) if index != eval_index]
+    else:
+        raise ValueError("4DGS dynerf camera supports --camera-split auto, val, test, or train")
+    if not camera_indices:
+        raise ValueError(f"4DGS dynerf split {requested_split!r} has no cameras")
+    if args.camera_index < 0 or args.camera_index >= len(camera_indices):
+        raise IndexError(
+            f"--camera-index {args.camera_index} outside {requested_split} split count {len(camera_indices)}"
+        )
+
+    all_c2ws = np.stack([_dynerf_pose_to_c2w(converted[index]) for index in range(converted.shape[0])], axis=0)
+    selected_camera_index = int(camera_indices[int(args.camera_index)])
+    c2w = all_c2ws[selected_camera_index].astype(np.float32)
+    K_original = np.array(
+        [[focal, 0.0, native_width / 2.0], [0.0, focal, native_height / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    K_scaled = scale_intrinsics_to_panel(
+        K_original,
+        original_height=native_height,
+        original_width=native_width,
+        target_height=int(height),
+        target_width=int(width),
+        crop_to_fill=not args.no_crop_to_fill,
+    )
+    scene_center = all_c2ws[:, :3, 3].mean(axis=0).astype(np.float32)
+    label = f"fourdgs-dynerf:{source_path}:{requested_split}[{args.camera_index}]/cam{selected_camera_index:02d}"
+    return c2w, K_scaled.astype(np.float32), scene_center, label
+
+
+def _dynerf_pose_to_c2w(pose: np.ndarray) -> np.ndarray:
+    R = np.array(pose[:3, :3], dtype=np.float64, copy=True)
+    R = -R
+    R[:, 0] = -R[:, 0]
+    T = -np.asarray(pose[:3, 3], dtype=np.float64).dot(R)
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = R.T
+    w2c[:3, 3] = T
+    return np.linalg.inv(w2c).astype(np.float32)
 
 
 def _iteration_number(path: Path) -> Optional[int]:
