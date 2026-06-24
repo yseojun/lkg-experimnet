@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 import sys
+import types
 from argparse import Namespace
 from dataclasses import dataclass
+from importlib import import_module
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -140,10 +143,9 @@ def load_4dgs_checkpoint(
         deformation_path = iteration_dir / "deformation.pth"
         if not deformation_path.is_file():
             raise FileNotFoundError(f"4DGS deformation checkpoint not found: {deformation_path}")
-        install_4dgs_code_root(code_root or DEFAULT_4DGS_CODE_ROOT)
         import torch
-        from scene.deformation import deform_network
 
+        deform_network = load_4dgs_deform_network_class(code_root or DEFAULT_4DGS_CODE_ROOT)
         deformation = deform_network(cfg_args).to(device)
         state = torch.load(str(deformation_path), map_location=device)
         deformation.load_state_dict(state)
@@ -197,6 +199,36 @@ def install_4dgs_code_root(code_root: Path | str) -> Path:
     if root_s not in sys.path:
         sys.path.insert(0, root_s)
     return root
+
+
+def load_4dgs_deform_network_class(code_root: Path | str):
+    root = install_4dgs_code_root(code_root)
+    _ensure_namespace_package("scene", root / "scene")
+    _ensure_namespace_package("utils", root / "utils")
+    module = import_module("scene.deformation")
+    try:
+        return module.deform_network
+    except AttributeError as exc:
+        raise RuntimeError(f"4DGaussians deformation module has no deform_network: {root}") from exc
+
+
+def _ensure_namespace_package(name: str, directory: Path) -> None:
+    if not directory.is_dir():
+        return
+    module = sys.modules.get(name)
+    directory_s = str(directory)
+    if module is not None:
+        search_locations = getattr(module, "__path__", None)
+        if search_locations is not None and directory_s in [str(path) for path in search_locations]:
+            return
+
+    package = types.ModuleType(name)
+    package.__package__ = name
+    package.__path__ = [directory_s]
+    spec = ModuleSpec(name, loader=None, is_package=True)
+    spec.submodule_search_locations = [directory_s]
+    package.__spec__ = spec
+    sys.modules[name] = package
 
 
 def _iteration_number(path: Path) -> Optional[int]:

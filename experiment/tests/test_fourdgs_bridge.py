@@ -7,6 +7,7 @@ import torch
 
 from lkg_experiment.fourdgs_bridge import (
     FourDGSCheckpoint,
+    load_4dgs_deform_network_class,
     load_4dgs_static_splats,
     parse_4dgs_cfg_args,
     resolve_4dgs_iteration_dir,
@@ -96,6 +97,22 @@ class FourDGSBridgeTest(unittest.TestCase):
         torch.testing.assert_close(splats["opacities"], torch.full((2,), 4.0))
         torch.testing.assert_close(splats["sh0"], torch.full((2, 1, 3), 4.0))
         torch.testing.assert_close(splats["shN"], torch.full((2, 3, 3), 4.0))
+
+    def test_deform_network_loader_does_not_import_scene_package_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_dir = root / "scene"
+            scene_dir.mkdir()
+            (scene_dir / "__init__.py").write_text("raise ModuleNotFoundError('plyfile')\n", encoding="utf-8")
+            (scene_dir / "deformation.py").write_text(
+                "class deform_network:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+
+            deform_network = load_4dgs_deform_network_class(root)
+
+        self.assertEqual(deform_network.__name__, "deform_network")
 
 
 if __name__ == "__main__":
