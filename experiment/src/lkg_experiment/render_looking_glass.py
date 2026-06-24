@@ -27,6 +27,7 @@ from lkg_experiment.coherent_raster_experiment import (
     load_viewpoint_index_file,
     tensor_to_hwc_uint8,
 )
+from lkg_experiment.fourdgs_bridge import DEFAULT_4DGS_CODE_ROOT, load_4dgs_checkpoint
 from lkg_experiment.run_coherent_raster_experiment import (
     DEFAULT_BRIDGE_SDK_ROOT,
     DEFAULT_GSPLAT_ROOT,
@@ -54,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gsplat-root", default=str(DEFAULT_GSPLAT_ROOT))
     parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
+    parser.add_argument("--four-dgs-model-path", help="4DGaussians model directory; overrides --checkpoint-path")
+    parser.add_argument("--four-dgs-code-root", default=str(DEFAULT_4DGS_CODE_ROOT))
+    parser.add_argument("--four-dgs-iteration", type=int, help="4DGaussians iteration; omitted means latest")
+    parser.add_argument("--four-dgs-time", default=0.0, type=float, help="Timestamp used to materialize 4DGS as 3DGS")
+    parser.add_argument("--four-dgs-stage", choices=("fine", "coarse"), default="fine")
 
     parser.add_argument("--data-dir", default="auto", help="'auto', a dataset path, or empty to force bbox camera")
     parser.add_argument("--camera-source", choices=("auto", "dataset", "bbox"), default="auto")
@@ -182,6 +188,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-gaussians must be non-negative")
     if args.max_frames < 0:
         raise ValueError("--max-frames must be non-negative")
+    if args.four_dgs_time < 0.0:
+        raise ValueError("--four-dgs-time must be non-negative")
     if args.map_mode == "file" and not args.viewpoint_index_path:
         raise ValueError("--map-mode file requires --viewpoint-index-path")
 
@@ -469,8 +477,12 @@ def main() -> None:
     install_bridge_sdk_root(args.bridge_sdk_root)
     BridgeAPI, _PixelFormats = _load_bridge_api()
     gsplat_root = install_gsplat_root(args.gsplat_root)
-    checkpoint = resolve_checkpoint_path(args.checkpoint_path, iteration=args.iteration, rank=args.rank)
-    cfg = load_cfg(result_root_from_checkpoint(checkpoint))
+    if args.four_dgs_model_path:
+        checkpoint = Path(args.four_dgs_model_path).expanduser()
+        cfg: dict[str, Any] = {}
+    else:
+        checkpoint = resolve_checkpoint_path(args.checkpoint_path, iteration=args.iteration, rank=args.rank)
+        cfg = load_cfg(result_root_from_checkpoint(checkpoint))
 
     bridge = BridgeAPI()
     window = None
@@ -535,7 +547,18 @@ def main() -> None:
         view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device="cuda")
 
         print(f"Loading checkpoint: {checkpoint}", file=sys.stderr, flush=True)
-        splats, step = load_splats_from_checkpoint(checkpoint, device="cuda")
+        if args.four_dgs_model_path:
+            four_dgs = load_4dgs_checkpoint(
+                args.four_dgs_model_path,
+                code_root=args.four_dgs_code_root,
+                iteration=args.four_dgs_iteration,
+                device="cuda",
+            )
+            splats = four_dgs.splats_at(args.four_dgs_time, stage=args.four_dgs_stage)
+            step = int(four_dgs.iteration)
+            cfg["sh_degree"] = int(four_dgs.sh_degree)
+        else:
+            splats, step = load_splats_from_checkpoint(checkpoint, device="cuda")
         splats = subset_splats_for_debug(splats, args.max_gaussians)
 
         data_dir = maybe_resolve_data_dir(args, cfg)

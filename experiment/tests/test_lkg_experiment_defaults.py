@@ -89,6 +89,26 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertTrue(args.write_mapping_artifacts)
         self.assertTrue(args.write_mapping_previews)
 
+    def test_parser_accepts_4dgs_inputs(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--four-dgs-model-path",
+                "/tmp/4dgs-model",
+                "--four-dgs-code-root",
+                "/tmp/4DGaussians",
+                "--four-dgs-iteration",
+                "14000",
+                "--four-dgs-time",
+                "0.25",
+            ]
+        )
+
+        self.assertEqual(args.four_dgs_model_path, "/tmp/4dgs-model")
+        self.assertEqual(args.four_dgs_code_root, "/tmp/4DGaussians")
+        self.assertEqual(args.four_dgs_iteration, 14000)
+        self.assertEqual(args.four_dgs_time, 0.25)
+
     def test_experiment_variant_helpers_are_available(self):
         self.assertEqual(parse_cluster_values("2,4,8,16"), (2, 4, 8, 16))
         view_index = np.array([[[0, 1, 2], [3, 4, 5]]], dtype=np.int32)

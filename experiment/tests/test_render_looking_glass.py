@@ -45,6 +45,25 @@ class RenderLookingGlassTest(unittest.TestCase):
         self.assertTrue(args.no_remapping)
         self.assertEqual(args.max_frames, 1)
 
+    def test_parser_accepts_4dgs_panel_inputs(self):
+        args = build_parser().parse_args(
+            [
+                "--four-dgs-model-path",
+                "/tmp/4dgs-model",
+                "--four-dgs-code-root",
+                "/tmp/4DGaussians",
+                "--four-dgs-iteration",
+                "14000",
+                "--four-dgs-time",
+                "0.75",
+            ]
+        )
+
+        self.assertEqual(args.four_dgs_model_path, "/tmp/4dgs-model")
+        self.assertEqual(args.four_dgs_code_root, "/tmp/4DGaussians")
+        self.assertEqual(args.four_dgs_iteration, 14000)
+        self.assertEqual(args.four_dgs_time, 0.75)
+
     def test_resolve_panel_render_size_uses_native_display_by_default(self):
         width, height, label = resolve_panel_render_size(
             requested_width=0,
