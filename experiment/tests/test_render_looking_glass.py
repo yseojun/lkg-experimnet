@@ -1,8 +1,10 @@
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 from lkg_experiment.render_looking_glass import (
     build_parser,
+    resolve_bridge_or_fallback_display,
     resolve_effective_view_count,
     resolve_panel_render_size,
 )
@@ -89,6 +91,44 @@ class RenderLookingGlassTest(unittest.TestCase):
         self.assertEqual(resolve_effective_view_count(requested_views=0, file_view_count=66, bridge_view_count=45), 66)
         self.assertEqual(resolve_effective_view_count(requested_views=64, file_view_count=66, bridge_view_count=45), 64)
         self.assertEqual(resolve_effective_view_count(requested_views=0, file_view_count=None, bridge_view_count=45), 45)
+
+    def test_bridge_display_fallback_uses_explicit_panel_geometry(self):
+        class EmptyBridge:
+            def get_displays(self):
+                return []
+
+        args = Namespace(
+            display_index=0,
+            allow_bridge_display_fallback=True,
+            width=1440,
+            height=2560,
+            window_x=1920,
+            window_y=0,
+        )
+
+        handle, info = resolve_bridge_or_fallback_display(EmptyBridge(), args)
+
+        self.assertEqual(handle, -1)
+        self.assertEqual(info["dimensions"], (1440, 2560))
+        self.assertEqual(info["position"], (1920, 0))
+        self.assertEqual(info["name"], "manual-fallback")
+
+    def test_bridge_display_fallback_requires_explicit_panel_size(self):
+        class EmptyBridge:
+            def get_displays(self):
+                return []
+
+        args = Namespace(
+            display_index=0,
+            allow_bridge_display_fallback=True,
+            width=0,
+            height=0,
+            window_x=None,
+            window_y=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "--width and --height"):
+            resolve_bridge_or_fallback_display(EmptyBridge(), args)
 
     def test_panel_wrapper_script_exists_and_uses_render_entrypoint(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "run_drums_panel.sh"

@@ -99,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--window-x", type=int)
     parser.add_argument("--window-y", type=int)
+    parser.add_argument(
+        "--allow-bridge-display-fallback",
+        action="store_true",
+        help="Render to an explicit OS window when Bridge initializes but reports no Looking Glass displays.",
+    )
     parser.add_argument("--decorated", action="store_true")
     parser.add_argument("--not-floating", action="store_true")
     parser.add_argument("--swap-interval", default=0, type=int)
@@ -213,6 +218,42 @@ def select_bridge_display(bridge: Any, display_index: int) -> tuple[int, dict[st
     if info["dimensions"] is None:
         raise RuntimeError("Bridge display dimensions unavailable")
     return handle, info
+
+
+def resolve_bridge_or_fallback_display(bridge: Any, args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    try:
+        return select_bridge_display(bridge, int(args.display_index))
+    except RuntimeError as exc:
+        if "did not report any Looking Glass displays" not in str(exc):
+            raise
+        if not bool(args.allow_bridge_display_fallback):
+            raise RuntimeError(
+                f"{exc}. If the panel is visible to X11/GLFW but not to Bridge, retry with "
+                "--allow-bridge-display-fallback plus explicit --width/--height and optional --window-x/--window-y."
+            ) from exc
+        return fallback_display_info(args, str(exc))
+
+
+def fallback_display_info(args: argparse.Namespace, reason: str = "") -> tuple[int, dict[str, Any]]:
+    width = int(args.width)
+    height = int(args.height)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            "Bridge display fallback requires explicit --width and --height because Bridge native "
+            f"dimensions are unavailable. Original Bridge error: {reason}"
+        )
+    x = int(args.window_x) if args.window_x is not None else 0
+    y = int(args.window_y) if args.window_y is not None else 0
+    return -1, {
+        "handle": -1,
+        "name": "manual-fallback",
+        "serial": "",
+        "dimensions": (width, height),
+        "position": (x, y),
+        "quilt": None,
+        "source": "manual-fallback",
+        "reason": reason,
+    }
 
 
 def safe_call(fn, fallback: Any = None) -> Any:
@@ -493,7 +534,7 @@ def main() -> None:
     try:
         if not bridge.initialize("LkgExperimentRenderPanel"):
             raise RuntimeError("Bridge initialize failed")
-        display_handle, display_info = select_bridge_display(bridge, int(args.display_index))
+        display_handle, display_info = resolve_bridge_or_fallback_display(bridge, args)
         native_width, native_height = display_info["dimensions"]
         panel_x, panel_y = display_info["position"]
         if args.window_x is not None:
