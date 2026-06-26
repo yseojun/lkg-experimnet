@@ -8,6 +8,7 @@
 # Generated experiment outputs.
 /experiment/generated/coherent_raster_experiments/
 /experiment/generated/rtgs_coherent/
+/experiment/generated/rtgs_single_views/
 
 # Python caches and packaging output.
 __pycache__/

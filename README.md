@@ -123,3 +123,29 @@ python run_coherent_raster_experiment.py --run-id drums_smoke
 Experiment outputs are generated under
 `experiment/generated/coherent_raster_experiments/` and are intentionally
 ignored by Git.
+
+## Run 66-View Batch Experiments
+
+Blender and MipNeRF360 batch runs are split by suite:
+
+```bash
+cd experiment
+DATADIR=/path/to/datasets \
+RESULTDIR=/path/to/results \
+PYTHON_BIN="$(command -v python)" \
+./scripts/run_blender_66_views.sh
+```
+
+The Blender batch defaults to `blender_MCMC100000_init50000`, the 100k-GS
+init50000 result group. MipNeRF360 uses its own entrypoint:
+
+```bash
+cd experiment
+DATADIR=/path/to/datasets \
+RESULTDIR=/path/to/results \
+PYTHON_BIN="$(command -v python)" \
+./scripts/run_mipnerf360_66_views.sh
+```
+
+`./scripts/run_all_66_views.sh` remains available and runs both suite-specific
+entrypoints through the same shared batch logic.

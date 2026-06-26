@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import json
 import math
 import os
@@ -33,6 +34,7 @@ DEFAULT_GSPLAT_ROOT = REPO_ROOT / "gsplat"
 DEFAULT_DNERF_ROOT = Path("/data/ysj/dataset/dnerf")
 DEFAULT_N3DV_ROOT = Path("/data/ysj/dataset/N3DV")
 DEFAULT_OUTPUT_ROOT = EXPERIMENT_ROOT / "generated" / "rtgs_coherent"
+DEFAULT_VIEWPOINT_INDEX_PATH = EXPERIMENT_ROOT / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
 
 _N3DV_SCENE_ALIASES = {
     "flame_salmon": "flame_salmon_1",
@@ -53,6 +55,14 @@ class RtgsSnapshot:
     covars: Any
     opacities: Any
     colors: Any
+    mask: Any
+
+
+@dataclass(frozen=True)
+class RtgsSnapshotGeometry:
+    means: Any
+    covars: Any
+    opacities: Any
     mask: Any
 
 
@@ -130,6 +140,14 @@ class RtgsLiteGaussianModel:
             ) = model_args
             return
         raise ValueError(f"unsupported RTGS checkpoint model tuple length: {len(model_args)}")
+
+    def to(self, device: str):
+        import torch
+
+        for key, value in list(self.__dict__.items()):
+            if torch.is_tensor(value):
+                self.__dict__[key] = value.to(device)
+        return self
 
     @property
     def get_scaling(self):
@@ -281,7 +299,7 @@ class RtgsSimpleCamera:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Render a 4d-gaussian-splatting RTGS checkpoint through a 1-view CoherentRaster snapshot path")
+    parser = argparse.ArgumentParser(description="Render a 4d-gaussian-splatting RTGS checkpoint through CoherentRaster")
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH), help="RTGS scene output directory")
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT), help="Checkpoint file or path relative to --model-path")
     parser.add_argument("--rtgs-code-root", default=str(DEFAULT_RTGS_CODE_ROOT), help="Cloned 4d-gaussian-splatting code root")
@@ -290,9 +308,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n3dv-root", default=str(DEFAULT_N3DV_ROOT), help="N3DV dataset root")
     parser.add_argument("--config", default=None, help="RTGS YAML config override")
     parser.add_argument("--output-dir", default=None, help="Output directory; defaults under experiment/generated/rtgs_coherent")
-    parser.add_argument("--split", choices=("train", "test"), default="test")
+    parser.add_argument("--render-mode", choices=("single", "single-all-cams", "views66"), default="single")
+    parser.add_argument("--split", choices=("train", "test", "all"), default="test")
     parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-indices", default=None, help="Comma or whitespace separated camera indices for --render-mode single-all-cams")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--checkpoint-load-device",
+        default="cpu",
+        help="Device used for torch.load map_location; default keeps checkpoint deserialization off CUDA before moving tensors to --device",
+    )
     parser.add_argument("--tile-size", type=int, default=16)
     parser.add_argument("--near-plane", type=float, default=0.01)
     parser.add_argument("--far-plane", type=float, default=100.0)
@@ -300,6 +325,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background", choices=("auto", "black", "white"), default="auto")
     parser.add_argument("--no-ssim", action="store_true", help="Skip optional torchmetrics SSIM computation")
     parser.add_argument("--debug-cr", action="store_true", help="Print CoherentRaster timing/debug output")
+    parser.add_argument("--width", type=int, default=1440, help="66-view render width; single-view mode uses the dataset camera width")
+    parser.add_argument("--height", type=int, default=2560, help="66-view render height; single-view mode uses the dataset camera height")
+    parser.add_argument("--views", type=int, default=66, help="Number of synthetic views for --render-mode views66")
+    parser.add_argument("--view-degree", type=float, default=53.0, help="Total horizontal orbit range in degrees")
+    parser.add_argument("--orbit-direction", type=int, default=-1, help="Orbit direction sign used by the coherent raster experiment")
+    parser.add_argument(
+        "--orbit-center-distance",
+        type=float,
+        default=0.0,
+        help="Distance from the anchor camera along its forward axis; 0 estimates it from the snapshot mean",
+    )
+    parser.add_argument("--no-crop-to-fill", action="store_true", help="Use fit scaling instead of crop-to-fill when resizing 66-view intrinsics")
+    parser.add_argument("--map-mode", choices=("file", "linear"), default="file")
+    parser.add_argument("--viewpoint-index-path", default=str(DEFAULT_VIEWPOINT_INDEX_PATH))
+    parser.add_argument("--coherent-quantize", choices=("floor", "nearest"), default="floor")
+    parser.add_argument("--cluster-size", type=int, default=8, help="Adjacent view group size for 66-view CoherentRaster")
+    parser.add_argument("--compare-original-views", type=int, default=5, help="Number of sampled views to compare with original RTGS; 0 disables")
+    parser.add_argument("--write-interlaced", dest="write_interlaced", action="store_true", default=True)
+    parser.add_argument("--no-write-interlaced", dest="write_interlaced", action="store_false")
+    parser.add_argument("--write-per-view", dest="write_per_view", action="store_true", default=True)
+    parser.add_argument("--no-write-per-view", dest="write_per_view", action="store_false")
     return parser
 
 
@@ -375,6 +421,7 @@ def install_rtgs_code_root(code_root: Path | str) -> Path:
         sys.path.remove(root_s)
     sys.path.insert(0, root_s)
     os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(Path("/tmp") / "torch_extensions"))
+    _install_pointops_import_stub_if_needed()
     _install_scene_gaussian_model_stub(root)
     return root
 
@@ -416,6 +463,7 @@ def load_rtgs_checkpoint(
     n3dv_root: Path | str,
     config_path: Path | str | None,
     device: str,
+    checkpoint_load_device: str = "cpu",
 ) -> RtgsCheckpoint:
     install_rtgs_code_root(rtgs_code_root)
     import torch
@@ -430,7 +478,7 @@ def load_rtgs_checkpoint(
     cfg = load_rtgs_yaml_config(scene_paths.config_path)
     cfg_args = _load_cfg_args(Path(model_path).expanduser())
     checkpoint_path = resolve_checkpoint_path(model_path, checkpoint)
-    model_args, iteration = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_args, iteration = torch.load(checkpoint_path, map_location=str(checkpoint_load_device), weights_only=False)
 
     model_cfg = cfg.get("ModelParams", {})
     pipe_cfg = cfg.get("PipelineParams", {})
@@ -452,6 +500,7 @@ def load_rtgs_checkpoint(
         prefilter_var=prefilter_var,
     )
     model.restore(model_args)
+    model.to(device)
 
     return RtgsCheckpoint(
         model=model,
@@ -470,23 +519,16 @@ def load_rtgs_camera(
     camera_index: int,
     device: str,
 ):
-    model_cfg = dict(checkpoint.config.get("ModelParams", {}))
-    source_path = _camera_source_path(checkpoint.scene_paths)
-    args = SimpleNamespace(
-        source_path=str(source_path),
-        model_path=str(Path(checkpoint.cfg_args.model_path).expanduser()) if hasattr(checkpoint.cfg_args, "model_path") else "",
-        images=model_cfg.get("images", getattr(checkpoint.cfg_args, "images", "images")),
-        resolution=int(model_cfg.get("resolution", getattr(checkpoint.cfg_args, "resolution", 2))),
-        white_background=bool(model_cfg.get("white_background", getattr(checkpoint.cfg_args, "white_background", False))),
-        data_device=device,
-        eval=bool(model_cfg.get("eval", getattr(checkpoint.cfg_args, "eval", True))),
-        extension=model_cfg.get("extension", getattr(checkpoint.cfg_args, "extension", ".png")),
-        num_extra_pts=int(model_cfg.get("num_extra_pts", getattr(checkpoint.cfg_args, "num_extra_pts", 0))),
-        frame_ratio=int(model_cfg.get("frame_ratio", getattr(checkpoint.cfg_args, "frame_ratio", 1))),
-        dataloader=bool(model_cfg.get("dataloader", getattr(checkpoint.cfg_args, "dataloader", False))),
+    args = _rtgs_camera_loader_args(
+        config=checkpoint.config,
+        cfg_args=checkpoint.cfg_args,
+        scene_paths=checkpoint.scene_paths,
+        device=device,
     )
 
     if checkpoint.scene_paths.dataset_kind == "dnerf" or (Path(args.source_path) / "transforms_train.json").exists():
+        if split == "all":
+            raise ValueError("--split all is only supported for RTGS Colmap/N3DV datasets")
         return _load_blender_camera(
             source_path=Path(args.source_path),
             split=split,
@@ -504,7 +546,41 @@ def load_rtgs_camera(
         split=split,
         camera_index=camera_index,
         time_duration=checkpoint.model.time_duration,
+        device=device,
     )
+
+
+def count_rtgs_cameras(
+    *,
+    model_path: Path | str,
+    rtgs_code_root: Path | str,
+    dataset_root: Path | str,
+    n3dv_root: Path | str,
+    config_path: Path | str | None,
+    split: str,
+    device: str = "cpu",
+) -> int:
+    install_rtgs_code_root(rtgs_code_root)
+    scene_paths = resolve_rtgs_scene_paths(
+        model_path,
+        rtgs_code_root=rtgs_code_root,
+        dataset_root=dataset_root,
+        n3dv_root=n3dv_root,
+        config_path=config_path,
+    )
+    cfg = load_rtgs_yaml_config(scene_paths.config_path)
+    cfg_args = _load_cfg_args(Path(model_path).expanduser())
+    args = _rtgs_camera_loader_args(config=cfg, cfg_args=cfg_args, scene_paths=scene_paths, device=device)
+    if scene_paths.dataset_kind == "dnerf" or (Path(args.source_path) / "transforms_train.json").exists():
+        return _count_blender_cameras(
+            source_path=Path(args.source_path),
+            split=split,
+            frame_ratio=args.frame_ratio,
+            time_duration=[float(value) for value in cfg.get("time_duration", [0.0, 1.0])],
+        )
+    if not (Path(args.source_path) / "sparse").exists():
+        raise ValueError(f"cannot count cameras for unsupported RTGS dataset layout: {args.source_path}")
+    return len(_select_rtgs_colmap_cameras(_read_rtgs_colmap_cameras(args), args=args, split=split))
 
 
 def rtgs_camera_to_gsplat_inputs(camera: Any, *, device: str):
@@ -525,6 +601,74 @@ def rtgs_camera_to_gsplat_inputs(camera: Any, *, device: str):
     return viewmat, K
 
 
+def rtgs_camera_from_gsplat_viewmat(
+    anchor_camera: Any,
+    viewmat: Any,
+    *,
+    uid: int,
+    image_name: str,
+    timestamp: float,
+    device: str,
+    width: int | None = None,
+    height: int | None = None,
+    crop_to_fill: bool = True,
+) -> RtgsSimpleCamera:
+    import torch
+
+    viewmat_t = torch.as_tensor(viewmat, dtype=torch.float32, device="cpu")
+    if tuple(viewmat_t.shape) != (4, 4):
+        raise ValueError("viewmat must have shape [4,4]")
+
+    source_width = int(anchor_camera.image_width)
+    source_height = int(anchor_camera.image_height)
+    width = source_width if width is None else int(width)
+    height = source_height if height is None else int(height)
+    if float(getattr(anchor_camera, "fl_x", -1.0)) > 0 and float(getattr(anchor_camera, "fl_y", -1.0)) > 0:
+        if width == source_width and height == source_height:
+            fl_x = float(anchor_camera.fl_x)
+            fl_y = float(anchor_camera.fl_y)
+            cx = float(anchor_camera.cx)
+            cy = float(anchor_camera.cy)
+        else:
+            scale_w = float(width) / float(source_width)
+            scale_h = float(height) / float(source_height)
+            scale = max(scale_w, scale_h) if bool(crop_to_fill) else min(scale_w, scale_h)
+            fl_x = float(anchor_camera.fl_x) * scale
+            fl_y = float(anchor_camera.fl_y) * scale
+            cx = width / 2.0
+            cy = height / 2.0
+    else:
+        fl_x = _fov_to_focal(float(anchor_camera.FoVx), width)
+        fl_y = _fov_to_focal(float(anchor_camera.FoVy), height)
+        cx = width / 2.0
+        cy = height / 2.0
+
+    FoVx = _focal_to_fov(fl_x, width)
+    FoVy = _focal_to_fov(fl_y, height)
+    image = getattr(anchor_camera, "image", None)
+    if image is None or width != source_width or height != source_height:
+        image = torch.zeros((3, height, width), dtype=torch.float32)
+    elif hasattr(image, "detach"):
+        image = image.detach().cpu()
+
+    return RtgsSimpleCamera(
+        R=viewmat_t[:3, :3].numpy().T,
+        T=viewmat_t[:3, 3].numpy(),
+        FoVx=FoVx,
+        FoVy=FoVy,
+        image=image,
+        image_name=str(image_name),
+        uid=int(uid),
+        timestamp=float(timestamp),
+        fl_x=fl_x,
+        fl_y=fl_y,
+        cx=cx,
+        cy=cy,
+        resolution=(width, height),
+        data_device=device,
+    )
+
+
 def materialize_rtgs_snapshot(
     pc: Any,
     *,
@@ -534,6 +678,47 @@ def materialize_rtgs_snapshot(
     eval_shfs_4d_fn: Optional[Callable[..., Any]] = None,
     eval_sh_fn: Optional[Callable[..., Any]] = None,
 ) -> RtgsSnapshot:
+    geometry = materialize_rtgs_geometry(pc, timestamp=timestamp, scaling_modifier=scaling_modifier)
+
+    import torch
+
+    centers = torch.as_tensor(camera_center, dtype=geometry.means.dtype, device=geometry.means.device)
+    if centers.ndim == 1:
+        colors = evaluate_rtgs_colors(
+            pc,
+            timestamp=float(timestamp),
+            camera_center=centers,
+            mask=geometry.mask,
+            eval_shfs_4d_fn=eval_shfs_4d_fn,
+            eval_sh_fn=eval_sh_fn,
+        )
+    elif centers.ndim == 2 and centers.shape[1] == 3:
+        colors = evaluate_rtgs_colors_for_centers(
+            pc,
+            timestamp=float(timestamp),
+            camera_centers=centers,
+            mask=geometry.mask,
+            eval_shfs_4d_fn=eval_shfs_4d_fn,
+            eval_sh_fn=eval_sh_fn,
+        )
+    else:
+        raise ValueError("camera_center must have shape [3] or [C,3]")
+
+    return RtgsSnapshot(
+        means=geometry.means,
+        covars=geometry.covars,
+        opacities=geometry.opacities,
+        colors=colors.contiguous(),
+        mask=geometry.mask,
+    )
+
+
+def materialize_rtgs_geometry(
+    pc: Any,
+    *,
+    timestamp: float,
+    scaling_modifier: float = 1.0,
+) -> RtgsSnapshotGeometry:
     import torch
 
     means_base = pc.get_xyz
@@ -552,22 +737,56 @@ def materialize_rtgs_snapshot(
     else:
         mask = torch.ones((means_base.shape[0],), dtype=torch.bool, device=means_base.device)
 
-    colors = evaluate_rtgs_colors(
-        pc,
-        timestamp=float(timestamp),
-        camera_center=camera_center,
-        mask=mask,
-        eval_shfs_4d_fn=eval_shfs_4d_fn,
-        eval_sh_fn=eval_sh_fn,
-    )
-
-    return RtgsSnapshot(
+    return RtgsSnapshotGeometry(
         means=means[mask].contiguous(),
         covars=covars[mask].contiguous(),
         opacities=opacity[mask].contiguous(),
-        colors=colors.contiguous(),
         mask=mask.contiguous(),
     )
+
+
+def snapshot_from_geometry(
+    geometry: RtgsSnapshotGeometry,
+    *,
+    colors: Any,
+) -> RtgsSnapshot:
+    return RtgsSnapshot(
+        means=geometry.means,
+        covars=geometry.covars,
+        opacities=geometry.opacities,
+        colors=colors.contiguous(),
+        mask=geometry.mask,
+    )
+
+
+def evaluate_rtgs_colors_for_centers(
+    pc: Any,
+    *,
+    timestamp: float,
+    camera_centers: Any,
+    mask: Any,
+    eval_shfs_4d_fn: Optional[Callable[..., Any]] = None,
+    eval_sh_fn: Optional[Callable[..., Any]] = None,
+):
+    import torch
+
+    centers = torch.as_tensor(camera_centers, dtype=pc.get_xyz.dtype, device=pc.get_xyz.device)
+    if centers.ndim == 1:
+        centers = centers.reshape(1, 3)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("camera_centers must have shape [3] or [C,3]")
+    colors = [
+        evaluate_rtgs_colors(
+            pc,
+            timestamp=timestamp,
+            camera_center=center,
+            mask=mask,
+            eval_shfs_4d_fn=eval_shfs_4d_fn,
+            eval_sh_fn=eval_sh_fn,
+        )
+        for center in centers
+    ]
+    return torch.stack(colors, dim=0).contiguous()
 
 
 def evaluate_rtgs_colors(
@@ -794,30 +1013,189 @@ def _load_blender_camera(
     return gt, camera
 
 
+def _count_blender_cameras(
+    *,
+    source_path: Path,
+    split: str,
+    frame_ratio: int,
+    time_duration: list[float],
+) -> int:
+    splits = ("train", "test") if split == "all" else (split,)
+    count = 0
+    for selected_split in splits:
+        transforms_name = "transforms_test.json" if selected_split == "test" else "transforms_train.json"
+        transforms_path = source_path / transforms_name
+        if not transforms_path.is_file():
+            continue
+        contents = json.loads(transforms_path.read_text(encoding="utf-8"))
+        for frame in contents.get("frames", []):
+            timestamp = float(frame.get("time", 0.0))
+            if int(frame_ratio) > 1:
+                timestamp /= int(frame_ratio)
+            if time_duration is not None and "time" in frame:
+                if timestamp < float(time_duration[0]) or timestamp > float(time_duration[1]):
+                    continue
+            count += 1
+    return count
+
+
+def _load_rtgs_colmap_camera_lite(
+    *,
+    args: Any,
+    split: str,
+    camera_index: int,
+    device: str,
+):
+    import torch
+    from PIL import Image
+
+    selected_cameras = _select_rtgs_colmap_cameras(_read_rtgs_colmap_cameras(args), args=args, split=split)
+    if not selected_cameras:
+        raise ValueError(f"RTGS Colmap dataset has no {split} cameras: {args.source_path}")
+    if camera_index < 0 or camera_index >= len(selected_cameras):
+        raise IndexError(f"camera index {camera_index} out of range for {split} split with {len(selected_cameras)} cameras")
+
+    selected = selected_cameras[int(camera_index)]
+    resolution, scale = _rtgs_scaled_resolution(
+        selected["width"],
+        selected["height"],
+        int(getattr(args, "resolution", 1)),
+    )
+    with Image.open(selected["image_path"]) as image_load:
+        image = image_load.convert("RGB").resize(resolution, Image.BILINEAR)
+        image_np = np.asarray(image, dtype=np.float32) / 255.0
+    gt = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+    fl_x = selected["fl_x"] / scale
+    fl_y = selected["fl_y"] / scale
+    cx = selected["cx"] / scale
+    cy = selected["cy"] / scale
+
+    camera = RtgsSimpleCamera(
+        R=selected["R"],
+        T=selected["T"],
+        FoVx=_focal_to_fov(fl_x, resolution[0]),
+        FoVy=_focal_to_fov(fl_y, resolution[1]),
+        image=gt,
+        image_name=selected["image_name"],
+        uid=int(camera_index),
+        timestamp=0.0,
+        fl_x=fl_x,
+        fl_y=fl_y,
+        cx=cx,
+        cy=cy,
+        resolution=resolution,
+        data_device=device,
+    )
+    return gt, camera
+
+
+def _read_rtgs_colmap_cameras(args: Any) -> list[dict[str, Any]]:
+    from scene.colmap_loader import (
+        qvec2rotmat,
+        read_extrinsics_binary,
+        read_extrinsics_text,
+        read_intrinsics_binary,
+        read_intrinsics_text,
+    )
+
+    source_path = Path(args.source_path)
+    sparse_path = source_path / "sparse" / "0"
+    try:
+        cam_extrinsics = read_extrinsics_binary(sparse_path / "images.bin")
+        cam_intrinsics = read_intrinsics_binary(sparse_path / "cameras.bin")
+    except Exception:
+        cam_extrinsics = read_extrinsics_text(sparse_path / "images.txt")
+        cam_intrinsics = read_intrinsics_text(sparse_path / "cameras.txt")
+
+    reading_dir = "images" if getattr(args, "images", None) is None else str(args.images)
+    images_folder = source_path / reading_dir
+    cameras = []
+    for key in cam_extrinsics:
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+        fl_x, fl_y, cx, cy = _colmap_intrinsics_to_pinhole(intr)
+        image_path = images_folder / Path(extr.name).name
+        image_name = image_path.stem
+        cameras.append(
+            {
+                "uid": int(intr.id),
+                "R": R,
+                "T": T,
+                "fl_x": float(fl_x),
+                "fl_y": float(fl_y),
+                "cx": float(cx),
+                "cy": float(cy),
+                "width": int(intr.width),
+                "height": int(intr.height),
+                "image_path": image_path,
+                "image_name": image_name,
+            }
+        )
+    return sorted(cameras, key=lambda camera: camera["image_name"])
+
+
+def _select_rtgs_colmap_cameras(cameras: list[dict[str, Any]], *, args: Any, split: str) -> list[dict[str, Any]]:
+    if split == "all":
+        return list(cameras)
+    if bool(getattr(args, "eval", True)):
+        if split == "test":
+            return [camera for idx, camera in enumerate(cameras) if idx % 8 == 0]
+        return [camera for idx, camera in enumerate(cameras) if idx % 8 != 0]
+    if split == "test":
+        return []
+    return list(cameras)
+
+
+def _colmap_intrinsics_to_pinhole(intr: Any) -> tuple[float, float, float, float]:
+    if intr.model == "SIMPLE_PINHOLE":
+        return float(intr.params[0]), float(intr.params[0]), float(intr.params[1]), float(intr.params[2])
+    if intr.model == "PINHOLE":
+        return float(intr.params[0]), float(intr.params[1]), float(intr.params[2]), float(intr.params[3])
+    raise ValueError(f"Colmap camera model not handled: {intr.model!r}; expected PINHOLE or SIMPLE_PINHOLE")
+
+
+def _rtgs_scaled_resolution(width: int, height: int, resolution: int) -> tuple[tuple[int, int], float]:
+    if int(resolution) in {1, 2, 3, 4, 8}:
+        scale = float(resolution)
+    elif int(resolution) == -1:
+        scale = float(width) / 1600.0 if int(width) > 1600 else 1.0
+    else:
+        scale = float(width) / float(resolution)
+    return (round(float(width) / scale), round(float(height) / scale)), scale
+
+
 def _load_rtgs_camera_with_original_readers(
     *,
     args: Any,
     split: str,
     camera_index: int,
     time_duration: list[float],
+    device: str,
 ):
+    if (Path(args.source_path) / "sparse").exists():
+        return _load_rtgs_colmap_camera_lite(
+            args=args,
+            split=split,
+            camera_index=camera_index,
+            device=device,
+        )
+
     from scene.dataset_readers import sceneLoadTypeCallbacks
     from utils.camera_utils import loadCam
     from utils.data_utils import CameraDataset
 
-    if (Path(args.source_path) / "sparse").exists():
-        scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
-    else:
-        scene_info = sceneLoadTypeCallbacks["Blender"](
-            args.source_path,
-            args.white_background,
-            args.eval,
-            time_duration=time_duration,
-            extension=args.extension,
-            num_extra_pts=args.num_extra_pts,
-            frame_ratio=args.frame_ratio,
-            dataloader=args.dataloader,
-        )
+    scene_info = sceneLoadTypeCallbacks["Blender"](
+        args.source_path,
+        args.white_background,
+        args.eval,
+        time_duration=time_duration,
+        extension=args.extension,
+        num_extra_pts=args.num_extra_pts,
+        frame_ratio=args.frame_ratio,
+        dataloader=args.dataloader,
+    )
     cam_infos = scene_info.test_cameras if split == "test" else scene_info.train_cameras
     if not cam_infos:
         raise ValueError(f"RTGS dataset has no {split} cameras: {args.source_path}")
@@ -829,31 +1207,22 @@ def _load_rtgs_camera_with_original_readers(
     return gt_image.contiguous(), camera
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-
+def render_rtgs_single_camera(
+    *,
+    args: argparse.Namespace,
+    checkpoint: RtgsCheckpoint,
+    camera_index: int,
+    output_stem: Path | None,
+    pipe: Any,
+    background: Any,
+    ssim_metric: Any,
+) -> dict[str, Any]:
     import torch
 
-    if not str(args.device).startswith("cuda"):
-        raise RuntimeError("RTGS original renderer requires CUDA because 4d-gaussian-splatting hardcodes CUDA tensors")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available; cannot run RTGS original renderer")
-
-    install_rtgs_code_root(args.rtgs_code_root)
-    _install_gsplat_root(args.gsplat_root)
-    checkpoint = load_rtgs_checkpoint(
-        model_path=args.model_path,
-        checkpoint=args.checkpoint,
-        rtgs_code_root=args.rtgs_code_root,
-        dataset_root=args.dataset_root,
-        n3dv_root=args.n3dv_root,
-        config_path=args.config,
-        device=args.device,
-    )
     gt, camera = load_rtgs_camera(
         checkpoint=checkpoint,
         split=args.split,
-        camera_index=args.camera_index,
+        camera_index=int(camera_index),
         device=args.device,
     )
     gt = gt.to(device=args.device, non_blocking=True).contiguous()
@@ -861,9 +1230,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     width = int(camera.image_width)
     height = int(camera.image_height)
     timestamp = float(camera.timestamp)
-
-    pipe = _pipeline_namespace(checkpoint.config.get("PipelineParams", {}))
-    background = _background_tensor(args.background, checkpoint.cfg_args, args.device)
+    if output_stem is None:
+        output_stem = default_output_path(
+            args.model_path,
+            split=args.split,
+            camera_index=int(camera_index),
+            timestamp=timestamp,
+        )
 
     torch.cuda.synchronize()
     start = time.perf_counter()
@@ -895,19 +1268,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     torch.cuda.synchronize()
     cr_ms = (time.perf_counter() - start) * 1000.0
 
-    ssim_metric = None if args.no_ssim else _make_ssim_metric(args.device)
     metrics = {
         "rtgs_vs_gt": compute_pair_metrics(rtgs_original, gt, ssim_metric=ssim_metric),
         "cr_vs_gt": compute_pair_metrics(rtgs_coherent, gt, ssim_metric=ssim_metric),
         "cr_vs_rtgs": compute_pair_metrics(rtgs_coherent, rtgs_original, ssim_metric=ssim_metric),
     }
-
-    output_stem = Path(args.output_dir).expanduser() if args.output_dir else default_output_path(
-        args.model_path,
-        split=args.split,
-        camera_index=args.camera_index,
-        timestamp=timestamp,
-    )
+    args_manifest = dict(vars(args))
+    args_manifest["camera_index"] = int(camera_index)
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scene": checkpoint.scene_paths.scene_name,
@@ -918,7 +1285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "checkpoint_path": str(checkpoint.checkpoint_path),
         "iteration": checkpoint.iteration,
         "split": args.split,
-        "camera_index": args.camera_index,
+        "camera_index": int(camera_index),
         "timestamp": timestamp,
         "width": width,
         "height": height,
@@ -929,10 +1296,113 @@ def main(argv: Optional[list[str]] = None) -> int:
         "rtgs_render_ms": rtgs_ms,
         "coherent_render_ms": cr_ms,
         "metrics": metrics,
-        "args": vars(args),
+        "args": args_manifest,
     }
     save_outputs(output_stem=output_stem, gt=gt, rtgs_original=rtgs_original, rtgs_coherent=rtgs_coherent, manifest=manifest)
-    print(f"Wrote {output_stem} ({width}x{height}, snapshot_gs={snapshot.means.shape[0]}, cr_vs_rtgs_psnr={metrics['cr_vs_rtgs']['psnr']:.3f})", file=sys.stderr)
+    print(
+        f"Wrote {output_stem} ({width}x{height}, snapshot_gs={snapshot.means.shape[0]}, "
+        f"cr_vs_rtgs_psnr={metrics['cr_vs_rtgs']['psnr']:.3f})",
+        file=sys.stderr,
+    )
+    return manifest
+
+
+def render_rtgs_single_all_cameras(*, args: argparse.Namespace, checkpoint: RtgsCheckpoint) -> int:
+    indices = _parse_camera_indices(args.camera_indices)
+    if indices is None:
+        camera_count = count_rtgs_cameras(
+            model_path=args.model_path,
+            rtgs_code_root=args.rtgs_code_root,
+            dataset_root=args.dataset_root,
+            n3dv_root=args.n3dv_root,
+            config_path=args.config,
+            split=args.split,
+            device="cpu",
+        )
+        indices = list(range(camera_count))
+    if not indices:
+        raise ValueError(f"no cameras selected for split {args.split}")
+
+    pipe = _pipeline_namespace_for_model(checkpoint.config.get("PipelineParams", {}), checkpoint.model)
+    background = _background_tensor(args.background, checkpoint.cfg_args, args.device)
+    ssim_metric = None if args.no_ssim else _make_ssim_metric(args.device)
+    output_root = Path(args.output_dir).expanduser() if args.output_dir else _default_all_cams_output_path(args.model_path, split=args.split)
+
+    for camera_index in indices:
+        output_stem = output_root / f"cam_{int(camera_index):03d}"
+        render_rtgs_single_camera(
+            args=args,
+            checkpoint=checkpoint,
+            camera_index=int(camera_index),
+            output_stem=output_stem,
+            pipe=pipe,
+            background=background,
+            ssim_metric=ssim_metric,
+        )
+    print(f"Wrote {len(indices)} camera renders under {output_root}", file=sys.stderr)
+    return 0
+
+
+def _parse_camera_indices(value: str | None) -> list[int] | None:
+    if value is None or not str(value).strip():
+        return None
+    indices = []
+    for token in str(value).replace(",", " ").split():
+        camera_index = int(token)
+        if camera_index < 0:
+            raise ValueError(f"camera index must be non-negative: {camera_index}")
+        indices.append(camera_index)
+    return indices
+
+
+def _default_all_cams_output_path(model_path: Path | str, *, split: str) -> Path:
+    scene_name = Path(model_path).expanduser().name
+    return DEFAULT_OUTPUT_ROOT / scene_name / f"{scene_name}_{split}_all_cams"
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    import torch
+
+    if not str(args.device).startswith("cuda"):
+        raise RuntimeError("RTGS and CoherentRaster renderers require CUDA")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; cannot run RTGS/CoherentRaster renderer")
+
+    if args.render_mode == "views66":
+        from lkg_experiment.rtgs_coherent.views66 import render_rtgs_66_views
+
+        return render_rtgs_66_views(args)
+
+    install_rtgs_code_root(args.rtgs_code_root)
+    _install_gsplat_root(args.gsplat_root)
+    checkpoint = load_rtgs_checkpoint(
+        model_path=args.model_path,
+        checkpoint=args.checkpoint,
+        rtgs_code_root=args.rtgs_code_root,
+        dataset_root=args.dataset_root,
+        n3dv_root=args.n3dv_root,
+        config_path=args.config,
+        device=args.device,
+        checkpoint_load_device=args.checkpoint_load_device,
+    )
+    if args.render_mode == "single-all-cams":
+        return render_rtgs_single_all_cameras(args=args, checkpoint=checkpoint)
+
+    pipe = _pipeline_namespace_for_model(checkpoint.config.get("PipelineParams", {}), checkpoint.model)
+    background = _background_tensor(args.background, checkpoint.cfg_args, args.device)
+    ssim_metric = None if args.no_ssim else _make_ssim_metric(args.device)
+    output_stem = Path(args.output_dir).expanduser() if args.output_dir else None
+    render_rtgs_single_camera(
+        args=args,
+        checkpoint=checkpoint,
+        camera_index=args.camera_index,
+        output_stem=output_stem,
+        pipe=pipe,
+        background=background,
+        ssim_metric=ssim_metric,
+    )
     return 0
 
 
@@ -959,6 +1429,63 @@ def _load_cfg_args(model_path: Path) -> Namespace:
     return Namespace()
 
 
+def _rtgs_camera_loader_args(
+    *,
+    config: Mapping[str, Any],
+    cfg_args: Namespace,
+    scene_paths: RtgsScenePaths,
+    device: str,
+) -> SimpleNamespace:
+    model_cfg = dict(config.get("ModelParams", {}))
+    source_path = _camera_source_path(scene_paths)
+    return SimpleNamespace(
+        source_path=str(source_path),
+        model_path=str(Path(cfg_args.model_path).expanduser()) if hasattr(cfg_args, "model_path") else "",
+        images=model_cfg.get("images", getattr(cfg_args, "images", "images")),
+        resolution=int(model_cfg.get("resolution", getattr(cfg_args, "resolution", 2))),
+        white_background=bool(model_cfg.get("white_background", getattr(cfg_args, "white_background", False))),
+        data_device=device,
+        eval=bool(model_cfg.get("eval", getattr(cfg_args, "eval", True))),
+        extension=model_cfg.get("extension", getattr(cfg_args, "extension", ".png")),
+        num_extra_pts=int(model_cfg.get("num_extra_pts", getattr(cfg_args, "num_extra_pts", 0))),
+        frame_ratio=int(model_cfg.get("frame_ratio", getattr(cfg_args, "frame_ratio", 1))),
+        dataloader=bool(model_cfg.get("dataloader", getattr(cfg_args, "dataloader", False))),
+    )
+
+
+def _install_pointops_import_stub_if_needed() -> None:
+    try:
+        importlib.import_module("pointops2.functions.pointops")
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"pointops2", "pointops2.functions", "pointops2.functions.pointops", "pointops2_cuda"}:
+            raise
+
+    message = "pointops2_cuda is required for RTGS pointops operations; camera loading must not call this stub"
+
+    def _missing_pointops(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(message)
+
+    pointops_pkg = sys.modules.get("pointops2")
+    if pointops_pkg is None:
+        pointops_pkg = types.ModuleType("pointops2")
+        pointops_pkg.__path__ = []
+        sys.modules["pointops2"] = pointops_pkg
+
+    functions_pkg = sys.modules.get("pointops2.functions")
+    if functions_pkg is None:
+        functions_pkg = types.ModuleType("pointops2.functions")
+        functions_pkg.__path__ = []
+        sys.modules["pointops2.functions"] = functions_pkg
+
+    pointops_module = types.ModuleType("pointops2.functions.pointops")
+    pointops_module.furthestsampling = _missing_pointops
+    pointops_module.knnquery = _missing_pointops
+    sys.modules["pointops2.functions.pointops"] = pointops_module
+    setattr(functions_pkg, "pointops", pointops_module)
+    setattr(pointops_pkg, "functions", functions_pkg)
+
+
 def _install_scene_gaussian_model_stub(root: Path) -> None:
     scene_module = sys.modules.get("scene")
     if scene_module is None:
@@ -966,8 +1493,11 @@ def _install_scene_gaussian_model_stub(root: Path) -> None:
         scene_module.__package__ = "scene"
         scene_module.__path__ = [str(root / "scene")]
         sys.modules["scene"] = scene_module
+    from utils.graphics_utils import BasicPointCloud
+
     gaussian_model_module = types.ModuleType("scene.gaussian_model")
     gaussian_model_module.GaussianModel = RtgsLiteGaussianModel
+    gaussian_model_module.BasicPointCloud = BasicPointCloud
     sys.modules["scene.gaussian_model"] = gaussian_model_module
 
 
@@ -1187,6 +1717,15 @@ def _pipeline_namespace(pipe_cfg: Mapping[str, Any]) -> SimpleNamespace:
         env_optimize_from=int(pipe_cfg.get("env_optimize_from", 0) or 0),
         eval_shfs_4d=bool(pipe_cfg.get("eval_shfs_4d", True)),
     )
+
+
+def _pipeline_namespace_for_model(pipe_cfg: Mapping[str, Any], model: Any) -> SimpleNamespace:
+    pipe = _pipeline_namespace(pipe_cfg)
+    env_map = getattr(model, "env_map", None)
+    env_map_missing = env_map is None or (hasattr(env_map, "numel") and int(env_map.numel()) == 0)
+    if int(pipe.env_map_res) > 0 and env_map_missing:
+        pipe.env_map_res = 0
+    return pipe
 
 
 def _background_tensor(background_mode: str, cfg_args: Namespace, device: str):
