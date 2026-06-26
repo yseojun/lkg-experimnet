@@ -20,10 +20,11 @@ where = ["src"]
 include = ["lkg_experiment*"]
 
 [project.scripts]
-lkg-run-coherent-raster = "lkg_experiment.run_coherent_raster_experiment:main"
-lkg-build-web-index = "lkg_experiment.build_web_index:main"
-lkg-open-experiment = "lkg_experiment.open_experiment:main"
-lkg-build-lut-npz = "lkg_experiment.build_lut_npz:main"
-lkg-render-looking-glass = "lkg_experiment.render_looking_glass:main"
-lkg-batch-experiments = "lkg_experiment.batch_experiments:main"
-lkg-generate-mapping-artifacts = "lkg_experiment.generate_mapping_artifacts:main"
+lkg-run-coherent-raster = "lkg_experiment.coherent_default.run_coherent_raster_experiment:main"
+lkg-build-web-index = "lkg_experiment.experiment.build_web_index:main"
+lkg-open-experiment = "lkg_experiment.experiment.open_experiment:main"
+lkg-build-lut-npz = "lkg_experiment.coherent_default.build_lut_npz:main"
+lkg-render-looking-glass = "lkg_experiment.coherent_default.render_looking_glass:main"
+lkg-batch-experiments = "lkg_experiment.experiment.batch_experiments:main"
+lkg-generate-mapping-artifacts = "lkg_experiment.coherent_default.generate_mapping_artifacts:main"
+lkg-rtgs-coherent = "lkg_experiment.rtgs_coherent.cli:main"

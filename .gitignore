@@ -2,9 +2,12 @@
 /Bridge-Python-SDK-Lab/
 /coherent-raster/
 /gsplat/
+/4d-gaussian-splatting/
+/OMG4/
 
 # Generated experiment outputs.
 /experiment/generated/coherent_raster_experiments/
+/experiment/generated/rtgs_coherent/
 
 # Python caches and packaging output.
 __pycache__/

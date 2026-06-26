@@ -9,8 +9,8 @@ SRC_ROOT = Path(__file__).resolve().parent / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from lkg_experiment.coherent_default.run_coherent_raster_experiment import main
+from lkg_experiment.rtgs_coherent.cli import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
