@@ -312,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", choices=("train", "test", "all"), default="test")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-indices", default=None, help="Comma or whitespace separated camera indices for --render-mode single-all-cams")
+    parser.add_argument("--n3dv-frame-index", type=int, default=0, help="N3DV dynamic frame index used with cameras.json; -1 uses all frames")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--checkpoint-load-device",
@@ -518,6 +519,7 @@ def load_rtgs_camera(
     split: str,
     camera_index: int,
     device: str,
+    n3dv_frame_index: int = 0,
 ):
     args = _rtgs_camera_loader_args(
         config=checkpoint.config,
@@ -525,6 +527,16 @@ def load_rtgs_camera(
         scene_paths=checkpoint.scene_paths,
         device=device,
     )
+    args.n3dv_frame_index = int(n3dv_frame_index)
+
+    if checkpoint.scene_paths.dataset_kind == "n3dv" and _has_rtgs_n3dv_dynamic_cameras(args):
+        return _load_rtgs_n3dv_dynamic_camera(
+            args=args,
+            split=split,
+            camera_index=camera_index,
+            time_duration=checkpoint.model.time_duration,
+            device=device,
+        )
 
     if checkpoint.scene_paths.dataset_kind == "dnerf" or (Path(args.source_path) / "transforms_train.json").exists():
         if split == "all":
@@ -559,6 +571,7 @@ def count_rtgs_cameras(
     config_path: Path | str | None,
     split: str,
     device: str = "cpu",
+    n3dv_frame_index: int = 0,
 ) -> int:
     install_rtgs_code_root(rtgs_code_root)
     scene_paths = resolve_rtgs_scene_paths(
@@ -571,6 +584,13 @@ def count_rtgs_cameras(
     cfg = load_rtgs_yaml_config(scene_paths.config_path)
     cfg_args = _load_cfg_args(Path(model_path).expanduser())
     args = _rtgs_camera_loader_args(config=cfg, cfg_args=cfg_args, scene_paths=scene_paths, device=device)
+    args.n3dv_frame_index = int(n3dv_frame_index)
+    if scene_paths.dataset_kind == "n3dv" and _has_rtgs_n3dv_dynamic_cameras(args):
+        return _count_rtgs_n3dv_dynamic_cameras(
+            args=args,
+            split=split,
+            time_duration=[float(value) for value in cfg.get("time_duration", [0.0, 1.0])],
+        )
     if scene_paths.dataset_kind == "dnerf" or (Path(args.source_path) / "transforms_train.json").exists():
         return _count_blender_cameras(
             source_path=Path(args.source_path),
@@ -1039,6 +1059,198 @@ def _count_blender_cameras(
     return count
 
 
+def _has_rtgs_n3dv_dynamic_cameras(args: Any) -> bool:
+    model_path = Path(str(getattr(args, "model_path", ""))).expanduser()
+    source_path = Path(str(getattr(args, "source_path", ""))).expanduser()
+    return (model_path / "cameras.json").is_file() and (source_path / "poses_bounds.npy").is_file()
+
+
+def _count_rtgs_n3dv_dynamic_cameras(
+    *,
+    args: Any,
+    split: str,
+    time_duration: list[float],
+) -> int:
+    return len(_select_rtgs_n3dv_dynamic_cameras(_read_rtgs_n3dv_dynamic_camera_index(args), args=args, split=split))
+
+
+def _load_rtgs_n3dv_dynamic_camera(
+    *,
+    args: Any,
+    split: str,
+    camera_index: int,
+    time_duration: list[float],
+    device: str,
+):
+    import torch
+    from PIL import Image
+
+    selected_cameras = _select_rtgs_n3dv_dynamic_cameras(
+        _read_rtgs_n3dv_dynamic_cameras(args, time_duration=time_duration),
+        args=args,
+        split=split,
+    )
+    if not selected_cameras:
+        raise ValueError(f"RTGS N3DV dataset has no {split} dynamic cameras: {args.source_path}")
+    if camera_index < 0 or camera_index >= len(selected_cameras):
+        raise IndexError(f"camera index {camera_index} out of range for {split} split with {len(selected_cameras)} cameras")
+
+    selected = selected_cameras[int(camera_index)]
+    resolution, scale = _rtgs_scaled_resolution(
+        selected["width"],
+        selected["height"],
+        int(getattr(args, "resolution", 1)),
+    )
+    with Image.open(selected["image_path"]) as image_load:
+        image = image_load.convert("RGB").resize(resolution, Image.BILINEAR)
+        image_np = np.asarray(image, dtype=np.float32) / 255.0
+    gt = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+    fl_x = selected["fl_x"] / scale
+    fl_y = selected["fl_y"] / scale
+    cx = selected["cx"] / scale
+    cy = selected["cy"] / scale
+
+    camera = RtgsSimpleCamera(
+        R=selected["R"],
+        T=selected["T"],
+        FoVx=_focal_to_fov(fl_x, resolution[0]),
+        FoVy=_focal_to_fov(fl_y, resolution[1]),
+        image=gt,
+        image_name=selected["image_name"],
+        uid=int(camera_index),
+        timestamp=float(selected["timestamp"]),
+        fl_x=fl_x,
+        fl_y=fl_y,
+        cx=cx,
+        cy=cy,
+        resolution=resolution,
+        data_device=device,
+    )
+    return gt, camera
+
+
+def _read_rtgs_n3dv_dynamic_cameras(args: Any, *, time_duration: list[float]) -> list[dict[str, Any]]:
+    model_path = Path(args.model_path).expanduser()
+    source_path = Path(args.source_path).expanduser()
+    cameras_path = model_path / "cameras.json"
+    poses_path = source_path / "poses_bounds.npy"
+    cameras_json = json.loads(cameras_path.read_text(encoding="utf-8"))
+    if not isinstance(cameras_json, list):
+        raise ValueError(f"RTGS cameras.json must contain a camera list: {cameras_path}")
+    poses_arr = np.load(poses_path)
+    if poses_arr.ndim != 2 or poses_arr.shape[1] < 17:
+        raise ValueError(f"N3DV poses_bounds.npy must have shape (N,17+): {poses_path}")
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5])
+    pose_height, pose_width, pose_focal = [float(value) for value in poses[0, :, -1]]
+
+    camera_labels = sorted({_n3dv_camera_label(str(camera["img_name"])) for camera in cameras_json})
+    max_frame_index = max((_n3dv_frame_index(str(camera["img_name"])) for camera in cameras_json), default=0)
+    frame_count = max_frame_index + 1
+    duration_start = float(time_duration[0]) if time_duration else 0.0
+    duration_end = float(time_duration[1]) if time_duration else float(frame_count)
+    duration = duration_end - duration_start
+
+    cameras = []
+    for camera in cameras_json:
+        image_name = str(camera["img_name"])
+        camera_label = _n3dv_camera_label(image_name)
+        frame_index = _n3dv_frame_index(image_name)
+        image_path = source_path / camera_label / "images" / f"{frame_index:04d}.png"
+        if not image_path.is_file():
+            raise FileNotFoundError(f"N3DV frame image not found for {image_name}: {image_path}")
+        width = int(camera.get("width", int(round(pose_width))))
+        height = int(camera.get("height", int(round(pose_height))))
+        focal = float(pose_focal)
+        c2w = np.eye(4, dtype=np.float64)
+        c2w[:3, :3] = np.asarray(camera["rotation"], dtype=np.float64)
+        c2w[:3, 3] = np.asarray(camera["position"], dtype=np.float64)
+        w2c = np.linalg.inv(c2w)
+        timestamp = duration_start + (float(frame_index) / float(max(frame_count, 1))) * duration
+        cameras.append(
+            {
+                "uid": int(camera.get("id", len(cameras))),
+                "R": w2c[:3, :3].T,
+                "T": w2c[:3, 3],
+                "fl_x": float(focal),
+                "fl_y": float(focal),
+                "cx": float(width) / 2.0,
+                "cy": float(height) / 2.0,
+                "width": int(width),
+                "height": int(height),
+                "image_path": image_path,
+                "image_name": image_name,
+                "camera_label": camera_label,
+                "camera_label_index": camera_labels.index(camera_label),
+                "frame_index": int(frame_index),
+                "timestamp": float(timestamp),
+            }
+        )
+    return sorted(cameras, key=lambda camera: (camera["frame_index"], camera["camera_label"], camera["image_name"]))
+
+
+def _read_rtgs_n3dv_dynamic_camera_index(args: Any) -> list[dict[str, Any]]:
+    model_path = Path(args.model_path).expanduser()
+    cameras_path = model_path / "cameras.json"
+    cameras_json = json.loads(cameras_path.read_text(encoding="utf-8"))
+    if not isinstance(cameras_json, list):
+        raise ValueError(f"RTGS cameras.json must contain a camera list: {cameras_path}")
+    camera_labels = sorted({_n3dv_camera_label(str(camera["img_name"])) for camera in cameras_json})
+    cameras = [
+        {
+            "image_name": str(camera["img_name"]),
+            "camera_label": _n3dv_camera_label(str(camera["img_name"])),
+            "camera_label_index": camera_labels.index(_n3dv_camera_label(str(camera["img_name"]))),
+            "frame_index": _n3dv_frame_index(str(camera["img_name"])),
+        }
+        for camera in cameras_json
+    ]
+    return sorted(cameras, key=lambda camera: (camera["frame_index"], camera["camera_label"], camera["image_name"]))
+
+
+def _select_rtgs_n3dv_dynamic_cameras(cameras: list[dict[str, Any]], *, args: Any, split: str) -> list[dict[str, Any]]:
+    frame_index = int(getattr(args, "n3dv_frame_index", 0))
+    selected = list(cameras)
+    if frame_index >= 0:
+        selected = [camera for camera in selected if int(camera["frame_index"]) == frame_index]
+    if split == "all":
+        return selected
+    if split == "test":
+        return [camera for camera in selected if int(camera["camera_label_index"]) == 0]
+    if split == "train":
+        return [camera for camera in selected if int(camera["camera_label_index"]) != 0]
+    raise ValueError(f"unsupported N3DV split: {split!r}")
+
+
+def _n3dv_camera_label(image_name: str) -> str:
+    if "_" not in image_name:
+        raise ValueError(f"N3DV camera image name must look like camXX_NNNN: {image_name!r}")
+    return image_name.rsplit("_", 1)[0]
+
+
+def _n3dv_frame_index(image_name: str) -> int:
+    if "_" not in image_name:
+        raise ValueError(f"N3DV camera image name must look like camXX_NNNN: {image_name!r}")
+    return int(image_name.rsplit("_", 1)[1])
+
+
+def _camera_manifest_fields(camera: Any) -> dict[str, Any]:
+    image_name = str(getattr(camera, "image_name", ""))
+    uid = getattr(camera, "uid", None)
+    fields: dict[str, Any] = {
+        "camera_uid": None if uid is None else int(uid),
+        "camera_image_name": image_name,
+        "camera_timestamp": float(getattr(camera, "timestamp", 0.0)),
+        "n3dv_camera_label": None,
+        "n3dv_frame_index": None,
+    }
+    try:
+        fields["n3dv_camera_label"] = _n3dv_camera_label(image_name)
+        fields["n3dv_frame_index"] = _n3dv_frame_index(image_name)
+    except (TypeError, ValueError):
+        pass
+    return fields
+
+
 def _load_rtgs_colmap_camera_lite(
     *,
     args: Any,
@@ -1224,6 +1436,7 @@ def render_rtgs_single_camera(
         split=args.split,
         camera_index=int(camera_index),
         device=args.device,
+        n3dv_frame_index=args.n3dv_frame_index,
     )
     gt = gt.to(device=args.device, non_blocking=True).contiguous()
     viewmat, K = rtgs_camera_to_gsplat_inputs(camera, device=args.device)
@@ -1298,6 +1511,7 @@ def render_rtgs_single_camera(
         "metrics": metrics,
         "args": args_manifest,
     }
+    manifest.update(_camera_manifest_fields(camera))
     save_outputs(output_stem=output_stem, gt=gt, rtgs_original=rtgs_original, rtgs_coherent=rtgs_coherent, manifest=manifest)
     print(
         f"Wrote {output_stem} ({width}x{height}, snapshot_gs={snapshot.means.shape[0]}, "
@@ -1318,6 +1532,7 @@ def render_rtgs_single_all_cameras(*, args: argparse.Namespace, checkpoint: Rtgs
             config_path=args.config,
             split=args.split,
             device="cpu",
+            n3dv_frame_index=args.n3dv_frame_index,
         )
         indices = list(range(camera_count))
     if not indices:
@@ -1502,6 +1717,8 @@ def _install_scene_gaussian_model_stub(root: Path) -> None:
 
 
 def _camera_source_path(scene_paths: RtgsScenePaths) -> Path:
+    if scene_paths.dataset_kind == "n3dv" and (scene_paths.dataset_path / "poses_bounds.npy").exists():
+        return scene_paths.dataset_path
     if scene_paths.dataset_kind == "n3dv" and (scene_paths.dataset_path / "colmap" / "sparse").exists():
         return scene_paths.dataset_path / "colmap"
     return scene_paths.dataset_path

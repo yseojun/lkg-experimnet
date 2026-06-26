@@ -2,16 +2,20 @@ import sys
 import tempfile
 import types
 import unittest
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
 
+import lkg_experiment.rtgs_coherent.cli as rtgs_cli
 from lkg_experiment.rtgs_coherent.cli import (
     RtgsLiteGaussianModel,
     _install_pointops_import_stub_if_needed,
     _install_scene_gaussian_model_stub,
     _load_rtgs_colmap_camera_lite,
+    _load_rtgs_n3dv_dynamic_camera,
+    _count_rtgs_n3dv_dynamic_cameras,
     _pipeline_namespace_for_model,
 )
 from lkg_experiment.rtgs_coherent import (
@@ -40,6 +44,7 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(args.dataset_root, "/data/ysj/dataset/dnerf")
         self.assertEqual(args.split, "test")
         self.assertEqual(args.camera_index, 0)
+        self.assertEqual(args.n3dv_frame_index, 0)
         self.assertEqual(args.render_mode, "single")
         self.assertEqual(args.checkpoint_load_device, "cpu")
         self.assertEqual(args.views, 66)
@@ -215,7 +220,7 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(tuple(snapshot.means.shape), (1, 3))
         self.assertEqual(tuple(snapshot.covars.shape), (1, 6))
         self.assertEqual(tuple(snapshot.colors.shape), (1, 3))
-        torch.testing.assert_close(snapshot.means[0], torch.tensor([11.0, 0.0, 0.0]))
+        torch.testing.assert_close(snapshot.means[0], torch.tensor([1.0, 10.0, 0.0]))
         torch.testing.assert_close(snapshot.opacities, torch.tensor([0.8]))
         torch.testing.assert_close(snapshot.mask, torch.tensor([True, False]))
         torch.testing.assert_close(captured["dirs"][0], torch.tensor([1.0, 0.0, 0.0]))
@@ -498,6 +503,108 @@ class RtgsCoherentTest(unittest.TestCase):
                 else:
                     sys.modules[name] = module
 
+    def test_n3dv_dynamic_loader_uses_training_cameras_json_and_frame_gt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model"
+            source_path = root / "coffee_martini"
+            image_path = source_path / "cam00" / "images"
+            model_path.mkdir()
+            image_path.mkdir(parents=True)
+            from PIL import Image
+
+            Image.new("RGB", (1352, 1014), color=(64, 128, 192)).save(image_path / "0000.png")
+            cameras = [
+                {
+                    "id": 0,
+                    "img_name": "cam00_0000",
+                    "width": 2704,
+                    "height": 2028,
+                    "position": [3.0, 4.0, 5.0],
+                    "rotation": [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                    "fx": -1.0,
+                    "fy": -1.0,
+                }
+            ]
+            (model_path / "cameras.json").write_text(json.dumps(cameras), encoding="utf-8")
+            poses_bounds = np.zeros((1, 17), dtype=np.float64)
+            poses_bounds[0, :15] = np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 2028.0],
+                    [0.0, 1.0, 0.0, 0.0, 2704.0],
+                    [0.0, 0.0, 1.0, 0.0, 1460.0],
+                ]
+            ).reshape(-1)
+            np.save(source_path / "poses_bounds.npy", poses_bounds)
+            args = types.SimpleNamespace(
+                source_path=str(source_path),
+                model_path=str(model_path),
+                resolution=2,
+                white_background=False,
+                data_device="cpu",
+            )
+
+            gt, camera = _load_rtgs_n3dv_dynamic_camera(
+                args=args,
+                split="all",
+                camera_index=0,
+                time_duration=[0.0, 10.0],
+                device="cpu",
+            )
+
+        self.assertEqual(camera.image_name, "cam00_0000")
+        self.assertEqual(camera.timestamp, 0.0)
+        self.assertEqual(camera.image_width, 1352)
+        self.assertEqual(camera.image_height, 1014)
+        self.assertEqual(tuple(gt.shape), (3, 1014, 1352))
+        self.assertEqual(camera.fl_x, 730.0)
+        self.assertEqual(camera.fl_y, 730.0)
+        self.assertEqual(camera.cx, 676.0)
+        self.assertEqual(camera.cy, 507.0)
+        torch.testing.assert_close(camera.camera_center, torch.tensor([3.0, 4.0, 5.0]), atol=1e-5, rtol=1e-5)
+
+    def test_camera_manifest_fields_include_n3dv_frame_identity(self):
+        camera = types.SimpleNamespace(
+            uid=7,
+            image_name="cam02_0150",
+            image_width=1352,
+            image_height=1014,
+            timestamp=5.0,
+        )
+
+        self.assertTrue(hasattr(rtgs_cli, "_camera_manifest_fields"))
+        fields = rtgs_cli._camera_manifest_fields(camera)
+
+        self.assertEqual(
+            fields,
+            {
+                "camera_uid": 7,
+                "camera_image_name": "cam02_0150",
+                "camera_timestamp": 5.0,
+                "n3dv_camera_label": "cam02",
+                "n3dv_frame_index": 150,
+            },
+        )
+
+    def test_n3dv_dynamic_count_uses_cameras_json_frame_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model"
+            source_path = root / "coffee_martini"
+            model_path.mkdir()
+            source_path.mkdir()
+            cameras = [
+                {"id": 0, "img_name": "cam00_0000", "width": 2704, "height": 2028, "position": [0, 0, 0], "rotation": np.eye(3).tolist()},
+                {"id": 1, "img_name": "cam00_0001", "width": 2704, "height": 2028, "position": [0, 0, 0], "rotation": np.eye(3).tolist()},
+                {"id": 2, "img_name": "cam01_0000", "width": 2704, "height": 2028, "position": [1, 0, 0], "rotation": np.eye(3).tolist()},
+            ]
+            (model_path / "cameras.json").write_text(json.dumps(cameras), encoding="utf-8")
+            args = types.SimpleNamespace(source_path=str(source_path), model_path=str(model_path))
+
+            count = _count_rtgs_n3dv_dynamic_cameras(args=args, split="all", time_duration=[0.0, 10.0])
+
+        self.assertEqual(count, 2)
+
 
 class _FakeRtgsModel:
     gaussian_dim = 4
@@ -535,7 +642,7 @@ class _FakeRtgsModel:
                     [2.0, 0.0, 0.0, 2.0, 0.0, 2.0],
                 ]
             ),
-            torch.tensor([[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]),
+            torch.tensor([[0.0, 10.0, 0.0], [20.0, 0.0, 0.0]]),
         )
 
     def get_marginal_t(self, timestamp, scaling_modifier=1.0):

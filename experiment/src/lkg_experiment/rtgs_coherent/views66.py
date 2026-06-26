@@ -105,6 +105,7 @@ def render_rtgs_66_views(args: Any) -> int:
         split=args.split,
         camera_index=args.camera_index,
         device=args.device,
+        n3dv_frame_index=args.n3dv_frame_index,
     )
     anchor_viewmat, anchor_K = rtgs_camera_to_gsplat_inputs(anchor_camera, device=args.device)
     width = int(args.width)
@@ -456,7 +457,12 @@ def render_rtgs_coherent_views(
     for index in render_indices:
         viewmat = flat_viewmats[index]
         center = torch.linalg.inv(viewmat)[:3, 3]
-        colors = evaluate_rtgs_colors(pc, timestamp=float(timestamp), camera_center=center, mask=geometry.mask)
+        colors = evaluate_rtgs_colors(
+            pc,
+            timestamp=float(timestamp),
+            camera_center=center,
+            mask=geometry.mask,
+        )
         snapshot = snapshot_from_geometry(geometry, colors=colors)
         image = render_rtgs_coherent(
             snapshot=snapshot,

@@ -119,6 +119,44 @@ class RtgsSixtySixLkgScriptTest(unittest.TestCase):
             self.assertNotIn("--camera-index", proc.stderr)
             self.assertIn(f"--output-dir {output_root / 'single_all_cams' / 'coffee_martini'}", proc.stderr)
 
+    def test_single_view_all_cams_script_can_emit_selected_n3dv_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_root = root / "result" / "RTGS"
+            output_root = root / "generated" / "rtgs_single_views"
+            checkpoint = model_root / "coffee_martini" / "checkpoints" / "chkpnt_best.pth"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint")
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "MODEL_ROOT": str(model_root),
+                    "OUTPUT_ROOT": str(output_root),
+                    "PYTHON_BIN": sys.executable,
+                    "RTGS_SCENES": "coffee_martini",
+                    "RUN_GROUP": "single_frames",
+                    "CAMERA_INDICES": "0",
+                    "N3DV_FRAME_INDICES": "0 150",
+                }
+            )
+
+            proc = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "scripts" / "run_rtgs_single_views_all_cams.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr.count("--render-mode single-all-cams"), 2)
+            self.assertIn("--n3dv-frame-index 0", proc.stderr)
+            self.assertIn("--n3dv-frame-index 150", proc.stderr)
+            self.assertIn("--camera-indices 0", proc.stderr)
+            self.assertIn(f"--output-dir {output_root / 'single_frames' / 'coffee_martini' / 'frame_0000'}", proc.stderr)
+            self.assertIn(f"--output-dir {output_root / 'single_frames' / 'coffee_martini' / 'frame_0150'}", proc.stderr)
+
     def test_script_prefers_configured_coherent_raster_python(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
