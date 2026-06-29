@@ -272,7 +272,7 @@ generated/rtgs_official_1view/coffee_martini/coffee_martini_cam00_0000_official/
 
 Use the generated `rtgs_official_render.png` as the single-view image sent to the LKG display path. Record in `metrics.json` or the phase note whether the image is visually valid, not black, not transposed, not mirrored unexpectedly, and uses the expected scene/frame.
 
-- [ ] **Step 10: Commit Task 1 baseline**
+- [x] **Step 10: Commit Task 1 baseline**
 
 Only after Step 6, Step 7, Step 8, and Step 9 pass:
 
@@ -286,7 +286,7 @@ git add experiment/rtgs_official_1view.py \
 git commit -m "baseline: add RTGS official one-view render"
 ```
 
-Stop after the commit and report the commit hash before starting Task 2.
+Completed in commit `34fce60 Establish RTGS official 1-view baseline`. This is the restore point before Task 2/3 CR work.
 
 ---
 
@@ -296,7 +296,9 @@ Stop after the commit and report the commit hash before starting Task 2.
 - Create: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 - Modify: `docs/superpowers/plans/2026-06-29-rtgs-coherent-raster-lkg.md`
 
-- [ ] **Step 1: Capture official baseline facts**
+**Current Status, 2026-06-29:** The paper analysis and RTGS application brainstorm are documented in `experiment/docs/rtgs_coherent_raster_brainstorm.md`. The recommended direction is adapter-first gsplat CoherentRaster: load the model/camera through the Step 1 official RTGS path, materialize one timestamp-specific 3D snapshot from the 4D Gaussian model, precompute RTGS SH/4D SH RGB for CR representative views, and call the existing gsplat CR kernels. Native RTGS CUDA CR is deferred until this adapter path proves visually valid.
+
+- [x] **Step 1: Capture official baseline facts**
 
 Write the following values from Task 1 manifests into `experiment/docs/rtgs_coherent_raster_brainstorm.md`:
 
@@ -315,7 +317,7 @@ rtgs_vs_gt metrics
 visual inspection result
 ```
 
-- [ ] **Step 2: Map RTGS render inputs to CR inputs**
+- [x] **Step 2: Map RTGS render inputs to CR inputs**
 
 Document this mapping table:
 
@@ -329,7 +331,7 @@ RTGS projection/intrinsics -> gsplat K
 RTGS background -> CR backgrounds
 ```
 
-- [ ] **Step 3: Decide the 1-view CR invariant**
+- [x] **Step 3: Decide the 1-view CR invariant**
 
 Record this design decision:
 
@@ -337,12 +339,13 @@ Record this design decision:
 For 1-view CR validation, view_idx_matrix is all zeros and adjacent_viewmats has shape [1, 1, 4, 4]. The output must match the official RTGS 1-view render for the same camera, timestamp, and image size before any LKG-specific multi-view remapping is introduced.
 ```
 
-- [ ] **Step 4: Identify the first failure split**
+- [x] **Step 4: Identify the first failure split**
 
 Use these comparison layers in order:
 
 ```text
 official RTGS render image
+RTGS snapshot-reference render image
 RTGS materialized snapshot statistics
 RTGS + CR 1-view image
 RTGS + CR 1-view metrics against official image
@@ -351,7 +354,13 @@ RTGS + CR LKG interlaced output
 
 The document must state that Task 3 cannot start until the expected output filenames and comparison metric thresholds are written down.
 
-- [ ] **Step 5: Review with user**
+- [x] **Step 5: Subagent plan review**
+
+Ask a separate subagent to inspect `experiment/docs/rtgs_coherent_raster_brainstorm.md` and this plan for technical gaps, incorrect assumptions, missing validation gates, and contradictory sequencing. Patch the documents before asking for user review.
+
+**Review result:** The plan was updated to require timestamp-conditioned means for RTGS 4D SH color evaluation, official-vs-snapshot gating before judging CR, `cluster_size=1`/remapping-off multi-view isolation, N3DV sentinel preservation for synthetic comparison cameras, projection sanity checks, cluster map validation, and richer tensor diagnostics.
+
+- [ ] **Step 6: Review with user**
 
 Stop after saving the brainstorm document. Do not edit CR rendering code in Task 2.
 
@@ -367,7 +376,11 @@ Stop after saving the brainstorm document. Do not edit CR rendering code in Task
 - Modify: `experiment/src/lkg_experiment/rtgs_coherent/__init__.py`
 - Modify: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 
-- [ ] **Step 1: Write CR 1-view unit tests first**
+- [ ] **Step 1: Extract an official runtime adapter**
+
+Refactor `official_1view.py` only enough to expose a helper that returns the official model, camera, GT, pipeline namespace, and background without rendering. CR code must reuse this helper so dnerf and N3DV preserve the Step 1 camera/model contracts.
+
+- [ ] **Step 2: Write CR 1-view unit tests first**
 
 Create tests that assert:
 
@@ -412,11 +425,33 @@ PYTHONPATH=src python -m unittest tests.test_rtgs_cr_1view -v
 
 Expected: FAIL because `cr_1view` does not exist yet.
 
-- [ ] **Step 2: Share official-flow loading with Task 1**
+- [ ] **Step 3: Share official-flow loading with Task 1**
 
 `cr_1view.py` must reuse the Task 1 official loader so camera/model/path semantics match. It must not call `load_rtgs_checkpoint()` from the current wrapper path until the official-flow baseline and wrapper path have been compared and the difference is documented.
 
-- [ ] **Step 3: Materialize RTGS snapshot for one timestamp**
+- [ ] **Step 4: Add snapshot-reference diagnostics**
+
+Before blaming CR, render or otherwise validate a snapshot-reference path using the same timestamp-conditioned mean/covariance/opacity/color tensors that CR will consume. Save the snapshot tensor statistics and compare against official RTGS default output when feasible. For `rot_4d=True`, SH/4D SH color direction must use timestamp-conditioned means, not only base `pc.get_xyz`.
+
+Expected manifest fields:
+
+```text
+gaussians_total
+gaussians_after_temporal_mask
+means_shape
+covars_shape
+opacities_shape
+colors_shape
+color_direction_source
+tensor_nan_inf_counts
+opacity_min_max_mean
+color_min_max_mean
+covariance_sanity
+projection_sanity_rtgs_vs_gsplat
+official_vs_snapshot_metrics
+```
+
+- [ ] **Step 5: Materialize RTGS snapshot for one timestamp**
 
 Use the existing materialization concepts from `experiment/src/lkg_experiment/rtgs_coherent/cli.py`:
 
@@ -428,7 +463,7 @@ snapshot_from_geometry
 
 The snapshot must be produced from the official `GaussianModel` object used for Task 1, not from `RtgsLiteGaussianModel`.
 
-- [ ] **Step 4: Render CR with a 1-view lookup**
+- [ ] **Step 6: Render CR with a 1-view lookup**
 
 Use the same invariant from Task 2:
 
@@ -444,12 +479,16 @@ Save:
 ```text
 gt.png
 rtgs_official_render.png
+rtgs_snapshot_reference_render.png
 rtgs_cr_render.png
+comparison_official_vs_snapshot.png
+comparison_snapshot_vs_cr.png
 comparison_official_vs_cr.png
 metrics.json
+manifest.json
 ```
 
-- [ ] **Step 5: Run non-CUDA tests**
+- [ ] **Step 7: Run non-CUDA tests**
 
 Run:
 
@@ -461,7 +500,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 
 Expected: PASS.
 
-- [ ] **Step 6: Run CUDA CR 1-view comparison**
+- [ ] **Step 8: Run CUDA CR 1-view comparison**
 
 Run:
 
@@ -485,14 +524,43 @@ generated/rtgs_cr_1view/jumpingjacks/jumpingjacks_test0_cr_1view/rtgs_cr_render.
 generated/rtgs_cr_1view/jumpingjacks/jumpingjacks_test0_cr_1view/metrics.json
 ```
 
-- [ ] **Step 7: Gate Task 3 completion**
+- [ ] **Step 9: Run CUDA CR 1-view comparison for N3DV**
+
+Run:
+
+```bash
+cd experiment
+PYTHONPATH=src python rtgs_cr_1view.py \
+  --dataset-kind n3dv \
+  --model-path /data/ysj/result/4dgs/RTGS/coffee_martini \
+  --checkpoint checkpoints/chkpnt_best.pth \
+  --rtgs-code-root /home/ysj/lkg-experiment/4d-gaussian-splatting \
+  --n3dv-root /data/ysj/dataset/N3DV \
+  --split test \
+  --camera-index 0 \
+  --n3dv-frame-index 0 \
+  --run-label coffee_martini_cam00_0000_cr_1view
+```
+
+Expected:
+
+```text
+generated/rtgs_cr_1view/coffee_martini/coffee_martini_cam00_0000_cr_1view/rtgs_cr_render.png
+generated/rtgs_cr_1view/coffee_martini/coffee_martini_cam00_0000_cr_1view/metrics.json
+```
+
+- [ ] **Step 10: Gate Task 3 completion**
 
 Task 3 is complete only when:
 
 ```text
 rtgs_cr_render.png is visually valid
-rtgs_cr_render.png is compared against rtgs_official_render.png from the same camera
-metrics.json records PSNR/MAE/MSE for CR vs official
+official-vs-snapshot passes the initial alert threshold before official-vs-CR is used to judge CR quality
+snapshot-vs-CR is the primary CR adapter correctness metric
+official-vs-CR is recorded as an end-to-end diagnostic
+rtgs_cr_render.png is compared against rtgs_official_render.png from the same camera after the snapshot gate passes
+metrics.json records PSNR/MAE/MSE for official vs snapshot, snapshot vs CR, and CR vs official
+initial numeric alert thresholds from experiment/docs/rtgs_coherent_raster_brainstorm.md are evaluated
 the difference source is documented if CR and official do not match
 ```
 
@@ -504,15 +572,37 @@ Stop after reporting Task 3 status. Do not start Task 4 without user confirmatio
 
 **Files:**
 - Modify: `experiment/src/lkg_experiment/rtgs_coherent/views66.py`
+- Modify: `experiment/src/lkg_experiment/rtgs_coherent/cli.py`
 - Modify: `experiment/scripts/run_rtgs_66_lkg_all.sh`
 - Modify: `experiment/tests/test_rtgs_66_lkg_script.py`
 - Modify: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 
 - [ ] **Step 1: Promote Task 3 snapshot path into multi-view**
 
-`views66.py` must use the same model, camera, timestamp, color, covariance, opacity, and background path validated by Task 3. The only new variable in Task 4 is view synthesis and LKG viewpoint indexing.
+`views66.py` must use the same model, camera, timestamp, color, covariance, opacity, and background path validated by Task 3. The only new variable in Task 4 is view synthesis and LKG viewpoint indexing. This is a blocking gate: do not accept metrics from the current `load_rtgs_checkpoint()` / lightweight wrapper path as Task 4 evidence.
 
-- [ ] **Step 2: Compare sampled views against official RTGS**
+- [ ] **Step 2: Preserve N3DV synthetic camera sentinel**
+
+When `rtgs_camera_from_gsplat_viewmat()` or its replacement creates sampled official comparison cameras from an N3DV anchor, it must preserve `FoVx=FoVy=-1.0` and use `fl_x/fl_y/cx/cy` for projection. Add a manifest assertion and unit test for this before trusting sampled N3DV comparisons.
+
+- [ ] **Step 3: Add remapping control and cluster map validation**
+
+Expose a CR remapping switch instead of hardcoding `use_remapping=True`. Use this CLI shape unless implementation discovers a better local convention:
+
+```text
+--cr-remapping {on,off}
+```
+
+Before rendering quality images, validate:
+
+```text
+viewpoint_index.max() < source_view_count
+viewpoint_index.min() >= 0
+non-divisible cluster tails are deterministic
+color-coded view-index debug render matches expected subpixel placement
+```
+
+- [ ] **Step 4: Compare sampled views against official RTGS**
 
 Keep `--compare-original-views` enabled for a small sample of synthesized views. Each sampled view must save:
 
@@ -523,7 +613,19 @@ comparison.png
 metrics.json
 ```
 
-- [ ] **Step 3: Render LKG interlaced output**
+- [ ] **Step 5: Run isolated multi-view sequence before LKG completion**
+
+Run in this order:
+
+```text
+first: cluster_size=1, remapping disabled, linear debug map, sampled full-frame comparisons only
+second: cluster_size=1, remapping enabled, linear debug map, sampled full-frame comparisons only
+third: cluster_size=1, remapping enabled, real LKG map, sampled comparisons plus interlaced output
+fourth: cluster_size=2 or 4, remapping enabled, sampled comparisons
+fifth: cluster_size=8, remapping enabled, sampled comparisons plus interlaced output
+```
+
+- [ ] **Step 6: Render LKG interlaced output**
 
 Use the existing calibration artifact unless a different mapping is explicitly selected:
 
@@ -538,7 +640,7 @@ generated/rtgs_coherent/<scene>/<run_label>/rtgs_coherent_lkg.png
 generated/rtgs_coherent/<scene>/<run_label>/metrics.json
 ```
 
-- [ ] **Step 4: Run tests and CUDA smoke**
+- [ ] **Step 7: Run tests and CUDA smoke**
 
 Run non-CUDA tests:
 
@@ -562,12 +664,17 @@ PYTHONPATH=src python rtgs_coherent.py \
   --split test \
   --camera-index 0 \
   --views 66 \
+  --cluster-size 1 \
+  --cr-remapping off \
+  --map-mode linear \
+  --compare-original-views 5 \
+  --no-write-interlaced \
   --run-label jumpingjacks_test0_lkg_66
 ```
 
-Expected: PASS for tests and a visually valid `rtgs_coherent_lkg.png`.
+Expected: PASS for tests and valid sampled view comparisons. A visually valid `rtgs_coherent_lkg.png` is required only after the isolated sequence allows real LKG interlaced output.
 
-- [ ] **Step 5: Gate multi-view completion**
+- [ ] **Step 8: Gate multi-view completion**
 
 Task 4 is complete only when:
 
