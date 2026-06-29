@@ -600,21 +600,27 @@ Result: 31 tests passed. The user visually confirmed the N3DV `rtgscompat` outpu
 ### Task 4: RTGS + Coherent-Raster Multi-View LKG Extension
 
 **Files:**
-- Modify: `experiment/src/lkg_experiment/rtgs_coherent/views66.py`
-- Modify: `experiment/src/lkg_experiment/rtgs_coherent/cli.py`
-- Modify: `experiment/scripts/run_rtgs_66_lkg_all.sh`
-- Modify: `experiment/tests/test_rtgs_66_lkg_script.py`
+- Create: `experiment/src/lkg_experiment/rtgs_coherent/cr_66views.py`
+- Create: `experiment/rtgs_cr_66views.py`
+- Create: `experiment/tests/test_rtgs_cr_66views.py`
+- Optional create after smoke validation: `experiment/scripts/run_rtgs_cr_66views_all.sh`
 - Modify: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 
-- [ ] **Step 1: Promote Task 3 snapshot path into multi-view**
+**Design Status, 2026-06-29:** The Task 4 design is documented in `docs/superpowers/specs/2026-06-29-rtgs-cr-66view-design.md`. The implementation should create a new RTGS + CR 66-view entrypoint instead of rewriting the existing `views66.py` path in place. The new renderer uses all 66 synthesized views for the LKG interlaced image, but saves only 5 sampled full-frame CR views by default for visual/debug inspection.
 
-`views66.py` must use the same model, camera, timestamp, color, covariance, opacity, and background path validated by Task 3. The only new variable in Task 4 is view synthesis and LKG viewpoint indexing. This is a blocking gate: do not accept metrics from the current `load_rtgs_checkpoint()` / lightweight wrapper path as Task 4 evidence.
+- [ ] **Step 1: Create a separate RTGS + CR 66-view entrypoint**
 
-- [ ] **Step 2: Preserve N3DV synthetic camera sentinel**
+`cr_66views.py` must use the same model, camera, timestamp, color, covariance, opacity, background, and RTGS-compatible projection path validated by Task 3. The only new variables in Task 4 are synthetic view generation, sampled-view saving, LKG viewpoint indexing, remapping, and cluster grouping. Do not use metrics from the current `load_rtgs_checkpoint()` / lightweight wrapper path as Task 4 acceptance evidence.
 
-When `rtgs_camera_from_gsplat_viewmat()` or its replacement creates sampled official comparison cameras from an N3DV anchor, it must preserve `FoVx=FoVy=-1.0` and use `fl_x/fl_y/cx/cy` for projection. Add a manifest assertion and unit test for this before trusting sampled N3DV comparisons.
+- [ ] **Step 2: Save only sampled full-frame views**
 
-- [ ] **Step 3: Add remapping control and cluster map validation**
+Render all 66 synthetic views internally, but save only 5 sampled full-frame CR views by default. The default sampled indices are evenly spaced across `[0, views - 1]`; for 66 views this is expected to be equivalent to indices such as `0, 16, 32, 49, 65`. Add `--sample-save-views` and `--sample-view-indices` so this can be changed without editing code.
+
+- [ ] **Step 3: Preserve N3DV synthetic camera sentinel**
+
+When creating sampled official comparison cameras from an N3DV anchor, preserve `FoVx=FoVy=-1.0` and use `fl_x/fl_y/cx/cy` for projection. CR inputs must apply the Task 3 RTGS-compatible projection adapter, while explicit-intrinsics FoV normalization remains disabled. Add manifest assertions and unit tests before trusting sampled N3DV comparisons.
+
+- [ ] **Step 4: Add remapping control and cluster map validation**
 
 Expose a CR remapping switch instead of hardcoding `use_remapping=True`. Use this CLI shape unless implementation discovers a better local convention:
 
@@ -631,9 +637,9 @@ non-divisible cluster tails are deterministic
 color-coded view-index debug render matches expected subpixel placement
 ```
 
-- [ ] **Step 4: Compare sampled views against official RTGS**
+- [ ] **Step 5: Compare sampled views against official RTGS**
 
-Keep `--compare-original-views` enabled for a small sample of synthesized views. Each sampled view must save:
+Keep sampled official comparison enabled by default. Each sampled view must save:
 
 ```text
 official_view.png
@@ -642,7 +648,15 @@ comparison.png
 metrics.json
 ```
 
-- [ ] **Step 5: Run isolated multi-view sequence before LKG completion**
+- [ ] **Step 6: Render LKG interlaced output from all 66 views**
+
+Use all 66 synthetic views for the interlaced image even though only 5 full-frame views are saved. The expected primary output is:
+
+```text
+/data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/rtgs_cr_lkg_interlaced.png
+```
+
+- [ ] **Step 7: Run isolated multi-view sequence before LKG completion**
 
 Run in this order:
 
@@ -654,7 +668,7 @@ fourth: cluster_size=2 or 4, remapping enabled, sampled comparisons
 fifth: cluster_size=8, remapping enabled, sampled comparisons plus interlaced output
 ```
 
-- [ ] **Step 6: Render LKG interlaced output**
+- [ ] **Step 8: Use the LKG calibration artifact**
 
 Use the existing calibration artifact unless a different mapping is explicitly selected:
 
@@ -665,53 +679,75 @@ Use the existing calibration artifact unless a different mapping is explicitly s
 Expected output:
 
 ```text
-/data/ysj/result/coherent-raster/generated/rtgs_coherent/<scene>/<run_label>/rtgs_coherent_lkg.png
-/data/ysj/result/coherent-raster/generated/rtgs_coherent/<scene>/<run_label>/metrics.json
+/data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/rtgs_cr_lkg_interlaced.png
+/data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/sampled_views/view_000_cr.png
+/data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/metrics.json
+/data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/manifest.json
 ```
 
-- [ ] **Step 7: Run tests and CUDA smoke**
+- [ ] **Step 9: Run tests and CUDA smoke**
 
 Run non-CUDA tests:
 
 ```bash
 cd experiment
-PYTHONPATH=src python -m unittest tests.test_rtgs_66_lkg_script -v
+PYTHONPATH=src python -m unittest tests.test_rtgs_cr_66views -v
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-Run CUDA smoke:
+Run N3DV CUDA smoke:
 
 ```bash
 cd experiment
-PYTHONPATH=src python rtgs_coherent.py \
-  --render-mode views66 \
+PYTHONPATH=src python rtgs_cr_66views.py \
+  --dataset-kind n3dv \
+  --model-path /data/ysj/result/4dgs/RTGS/coffee_martini \
+  --checkpoint checkpoints/chkpnt_best.pth \
+  --rtgs-code-root /home/ysj/lkg-experiment/4d-gaussian-splatting \
+  --gsplat-root /home/ysj/lkg-experiment/gsplat \
+  --n3dv-root /data/ysj/dataset/N3DV \
+  --split test \
+  --camera-index 0 \
+  --n3dv-frame-index 0 \
+  --views 66 \
+  --sample-save-views 5 \
+  --cluster-size 1 \
+  --viewpoint-index-path /data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz \
+  --run-label coffee_martini_cam00_frame0000_cr66
+```
+
+Run dnerf CUDA smoke:
+
+```bash
+cd experiment
+PYTHONPATH=src python rtgs_cr_66views.py \
   --dataset-kind dnerf \
   --model-path /data/ysj/result/4dgs/RTGS/jumpingjacks \
   --checkpoint checkpoints/chkpnt_best.pth \
   --rtgs-code-root /home/ysj/lkg-experiment/4d-gaussian-splatting \
+  --gsplat-root /home/ysj/lkg-experiment/gsplat \
   --dataset-root /data/ysj/dataset/dnerf \
   --split test \
   --camera-index 0 \
   --views 66 \
+  --sample-save-views 5 \
   --cluster-size 1 \
-  --cr-remapping off \
-  --map-mode linear \
-  --compare-original-views 5 \
-  --no-write-interlaced \
-  --run-label jumpingjacks_test0_lkg_66
+  --viewpoint-index-path /data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz \
+  --run-label jumpingjacks_cam00_cr66
 ```
 
-Expected: PASS for tests and valid sampled view comparisons. A visually valid `rtgs_coherent_lkg.png` is required only after the isolated sequence allows real LKG interlaced output.
+Expected: PASS for tests and valid sampled view comparisons. A visually valid `rtgs_cr_lkg_interlaced.png` is required only after sampled views are acceptable.
 
-- [ ] **Step 8: Gate multi-view completion**
+- [ ] **Step 10: Gate multi-view completion**
 
 Task 4 is complete only when:
 
 ```text
 sampled coherent views are visually valid
 sampled coherent views have recorded metrics against official RTGS
-interlaced LKG image is visually valid on the target display
+interlaced LKG image uses all 66 synthetic views and is visually valid as an image artifact
 manifest records mapping artifact path and view synthesis parameters
+manifest records sampled view indices, cluster size, remapping mode, camera FoV normalization status, and CR projection adapter status
 ```
 
 Stop after reporting Task 4 status and ask whether to commit or open a PR.
