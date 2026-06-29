@@ -376,11 +376,31 @@ Stop after saving the brainstorm document. Do not edit CR rendering code in Task
 - Modify: `experiment/src/lkg_experiment/rtgs_coherent/__init__.py`
 - Modify: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 
-- [ ] **Step 1: Extract an official runtime adapter**
+**Current Status, 2026-06-29:** Task 3 is implemented and accepted for 1-view validation. `experiment/rtgs_cr_1view.py` keeps RTGS + CoherentRaster separate from the Task 1 official baseline while reusing the official runtime loader, camera contract, checkpoint restore, timestamp, background, and GT selection. Outputs now default to `/data/ysj/result/coherent-raster/generated/rtgs_cr_1view/...`.
+
+The accepted `rtgscompat` results are:
+
+```text
+dnerf jumpingjacks cam0:
+  official_vs_snapshot_psnr: 78.680 dB
+  snapshot_vs_cr_psnr:       80.720 dB
+  official_vs_cr_psnr:       76.551 dB
+  cr_vs_gt_psnr:             27.650 dB
+
+N3DV coffee_martini cam00 frame0000:
+  official_vs_snapshot_psnr: 51.485 dB
+  snapshot_vs_cr_psnr:       54.001 dB
+  official_vs_cr_psnr:       49.560 dB
+  cr_vs_gt_psnr:             27.515 dB
+```
+
+For N3DV, the valid path is explicitly the RTGS-compatible projection adapter: keep `FoVx=FoVy=-1.0`, leave explicit-intrinsics FoV normalization disabled, and adapt the CR input so gsplat/CR reproduces the RTGS official sentinel-FoV convention. The diagnostic FoV-normalized path reproduces the old bad N3DV rendering and must not be used for acceptance.
+
+- [x] **Step 1: Extract an official runtime adapter**
 
 Refactor `official_1view.py` only enough to expose a helper that returns the official model, camera, GT, pipeline namespace, and background without rendering. CR code must reuse this helper so dnerf and N3DV preserve the Step 1 camera/model contracts.
 
-- [ ] **Step 2: Write CR 1-view unit tests first**
+- [x] **Step 2: Write CR 1-view unit tests first**
 
 Create tests that assert:
 
@@ -425,11 +445,11 @@ PYTHONPATH=src python -m unittest tests.test_rtgs_cr_1view -v
 
 Expected: FAIL because `cr_1view` does not exist yet.
 
-- [ ] **Step 3: Share official-flow loading with Task 1**
+- [x] **Step 3: Share official-flow loading with Task 1**
 
 `cr_1view.py` must reuse the Task 1 official loader so camera/model/path semantics match. It must not call `load_rtgs_checkpoint()` from the current wrapper path until the official-flow baseline and wrapper path have been compared and the difference is documented.
 
-- [ ] **Step 4: Add snapshot-reference diagnostics**
+- [x] **Step 4: Add snapshot-reference diagnostics**
 
 Before blaming CR, render or otherwise validate a snapshot-reference path using the same timestamp-conditioned mean/covariance/opacity/color tensors that CR will consume. Save the snapshot tensor statistics and compare against official RTGS default output when feasible. For `rot_4d=True`, SH/4D SH color direction must use timestamp-conditioned means, not only base `pc.get_xyz`.
 
@@ -451,7 +471,7 @@ projection_sanity_rtgs_vs_gsplat
 official_vs_snapshot_metrics
 ```
 
-- [ ] **Step 5: Materialize RTGS snapshot for one timestamp**
+- [x] **Step 5: Materialize RTGS snapshot for one timestamp**
 
 Use the existing materialization concepts from `experiment/src/lkg_experiment/rtgs_coherent/cli.py`:
 
@@ -463,7 +483,7 @@ snapshot_from_geometry
 
 The snapshot must be produced from the official `GaussianModel` object used for Task 1, not from `RtgsLiteGaussianModel`.
 
-- [ ] **Step 6: Render CR with a 1-view lookup**
+- [x] **Step 6: Render CR with a 1-view lookup**
 
 Use the same invariant from Task 2:
 
@@ -488,7 +508,7 @@ metrics.json
 manifest.json
 ```
 
-- [ ] **Step 7: Run non-CUDA tests**
+- [x] **Step 7: Run non-CUDA tests**
 
 Run:
 
@@ -500,7 +520,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 
 Expected: PASS.
 
-- [ ] **Step 8: Run CUDA CR 1-view comparison**
+- [x] **Step 8: Run CUDA CR 1-view comparison**
 
 Run:
 
@@ -524,7 +544,7 @@ generated/rtgs_cr_1view/jumpingjacks/jumpingjacks_test0_cr_1view/rtgs_cr_render.
 generated/rtgs_cr_1view/jumpingjacks/jumpingjacks_test0_cr_1view/metrics.json
 ```
 
-- [ ] **Step 9: Run CUDA CR 1-view comparison for N3DV**
+- [x] **Step 9: Run CUDA CR 1-view comparison for N3DV**
 
 Run:
 
@@ -549,7 +569,7 @@ generated/rtgs_cr_1view/coffee_martini/coffee_martini_cam00_0000_cr_1view/rtgs_c
 generated/rtgs_cr_1view/coffee_martini/coffee_martini_cam00_0000_cr_1view/metrics.json
 ```
 
-- [ ] **Step 10: Gate Task 3 completion**
+- [x] **Step 10: Gate Task 3 completion**
 
 Task 3 is complete only when:
 
@@ -565,6 +585,15 @@ the difference source is documented if CR and official do not match
 ```
 
 Stop after reporting Task 3 status. Do not start Task 4 without user confirmation.
+
+**Milestone 3 Complete, 2026-06-29:** dnerf and N3DV both produce valid 1-view CR renders under the external generated directory. The latest verification command was:
+
+```bash
+cd experiment
+PYTHONPATH=src python -m unittest tests.test_rtgs_official_1view tests.test_rtgs_cr_1view -v
+```
+
+Result: 31 tests passed. The user visually confirmed the N3DV `rtgscompat` output is normal. Task 4 remains gated until explicit user confirmation.
 
 ---
 
@@ -689,9 +718,9 @@ Stop after reporting Task 4 status and ask whether to commit or open a PR.
 
 ## Review Checklist
 
-- [ ] Task 1 establishes a commit-able RTGS official 1-view baseline.
-- [ ] Task 2 contains no code changes.
-- [ ] Task 3 keeps RTGS + CR 1-view separate from official RTGS 1-view.
+- [x] Task 1 establishes a commit-able RTGS official 1-view baseline.
+- [x] Task 2 contains no code changes.
+- [x] Task 3 keeps RTGS + CR 1-view separate from official RTGS 1-view.
 - [ ] Task 4 starts only after Task 3 is visually and metrically acceptable.
-- [ ] No phase overwrites another phase's generated output directory.
-- [ ] Every phase has a stop point for user review.
+- [x] No phase overwrites another phase's generated output directory.
+- [x] Every phase has a stop point for user review.

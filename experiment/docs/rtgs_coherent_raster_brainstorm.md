@@ -378,6 +378,8 @@ N3DV coffee_martini cam0 frame0: snapshot_vs_cr=54.001 dB, official_vs_cr=49.560
 
 Outputs are written under `/data/ysj/result/coherent-raster/generated/rtgs_cr_1view/...`, and each manifest records `camera_fov_normalization` plus `cr_projection_adapter` so this convention remains auditable.
 
+Task 3 is accepted as of 2026-06-29. The decisive N3DV check is the `rtgscompat` path: `FoVx/FoVy` remain `-1.0`, explicit FoV normalization remains disabled, and `cr_projection_adapter.applied=true`. The FoV-normalized diagnostic path intentionally reproduces the previous bad N3DV rendering and is not an acceptance configuration.
+
 ### Task 4A: Promote snapshot path into `views66.py`
 
 Replace the old RTGS wrapper loading path in `views66.py` with the same official runtime/snapshot path validated by Task 3.
