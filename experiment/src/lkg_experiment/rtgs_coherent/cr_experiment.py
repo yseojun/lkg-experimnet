@@ -335,80 +335,9 @@ def time_clustered_renderer(
 
 
 def render_clustered_interlaced_once(context: cr_66views.RtgsCr66RenderContext, *, variant: Any):
-    import torch
-    from lkg_experiment.coherent_default.coherent_gsplat_bridge import build_cr_lookup_arrays, lookup_arrays_to_torch
-    from lkg_experiment.rtgs_coherent.views66 import synthesize_grouped_viewmats
-    from gsplat.rendering_coherent_raster import rasterization_CR
-    from coherent_raster.utils.utils_coherent_raster import unpad, unpatchify_image_shape_matrix
+    from lkg_experiment.rtgs_coherent import cr_one_shot
 
-    lookup = build_cr_lookup_arrays(context.viewpoint_index, tile_size=int(context.args.tile_size), use_remapping=bool(variant.use_remapping))
-    view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=str(context.args.device))
-    view_labels = np.arange(int(context.source_view_count), dtype=np.int32)
-    adjacent_viewmats = synthesize_grouped_viewmats(
-        c2w=context.anchor_c2w,
-        orbit_center=context.orbit_center,
-        view_labels=view_labels,
-        source_view_count=int(context.source_view_count),
-        cluster_size=int(variant.cluster_size) if bool(variant.reuse_enabled) else 1,
-        view_degree=float(context.view_degree),
-        orbit_direction=int(context.orbit_direction),
-        device=str(context.args.device),
-    )
-    ref_idx = int(adjacent_viewmats.shape[1]) // 2
-    reference_centers = torch.linalg.inv(adjacent_viewmats[:, ref_idx])[:, :3, 3]
-    colors = [
-        cr_66views.evaluate_rtgs_colors(
-            context.runtime.official.gaussians,
-            timestamp=float(context.timestamp),
-            camera_center=center,
-            mask=context.geometry.mask,
-        )
-        for center in reference_centers
-    ]
-    snapshot = cr_66views.snapshot_from_geometry(context.geometry, colors=torch.stack(colors, dim=0).contiguous())
-    anchor_camera = cr_66views.synthetic_camera_from_viewmat_preserving_rtgs_contract(
-        context.cr_anchor_camera_cuda,
-        torch.linalg.inv(context.anchor_c2w),
-        uid=0,
-        image_name="clustered_anchor",
-        timestamp=float(context.timestamp),
-        device=str(context.args.device),
-        width=int(context.panel_width),
-        height=int(context.panel_height),
-        crop_to_fill=bool(context.crop_to_fill),
-    ).cuda()
-    _, K = cr_66views.rtgs_camera_to_gsplat_inputs(anchor_camera, device=str(context.args.device))
-    backgrounds = None if context.runtime.background is None else context.runtime.background.contiguous()
-    if _cuda_available():
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    with torch.no_grad():
-        rendered, _, _ = rasterization_CR(
-            means=snapshot.means,
-            quats=None,
-            scales=None,
-            opacities=snapshot.opacities,
-            colors=snapshot.colors,
-            adjacent_viewmats=adjacent_viewmats,
-            Ks=K.unsqueeze(0).contiguous(),
-            view_idx_matrix=view_idx_matrix,
-            subpixel_coord_matrix=subpixel_coord_matrix,
-            width=int(context.panel_width),
-            height=int(context.panel_height),
-            sh_degree=None,
-            near_plane=float(context.args.near_plane),
-            far_plane=float(context.args.far_plane),
-            backgrounds=backgrounds,
-            camera_model=str(context.args.camera_model),
-            tile_size=int(context.args.tile_size),
-            is_debug=bool(context.args.debug_cr),
-            covars=snapshot.covars,
-        )
-        image = unpatchify_image_shape_matrix(rendered)
-        image = unpad(image, int(context.panel_height), int(context.panel_width)).clamp(0.0, 1.0).contiguous()
-    if _cuda_available():
-        torch.cuda.synchronize()
-    return image, (time.perf_counter() - start) * 1000.0
+    return cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(context, variant=variant)
 
 
 def compute_compose_metric_stats(
@@ -561,19 +490,6 @@ def ensure_clustered_engine_supported(context: Any) -> None:
             "clustered engine cannot use view-dependent RTGS projection adapter; "
             "use --engine compose for N3DV/sentinel-FoV cameras"
         )
-    viewport = getattr(context, "viewport", None)
-    if viewport is not None:
-        full_panel = (
-            int(getattr(viewport, "offset_x", 0)) == 0
-            and int(getattr(viewport, "offset_y", 0)) == 0
-            and int(getattr(viewport, "render_width", 0)) == int(getattr(viewport, "panel_width", 0))
-            and int(getattr(viewport, "render_height", 0)) == int(getattr(viewport, "panel_height", 0))
-        )
-        if not full_panel:
-            raise ValueError(
-                "clustered engine currently requires a full-panel viewport; "
-                "use --engine compose for aspect_fit=contain/letterboxed renders"
-            )
 
 
 def build_manifest(

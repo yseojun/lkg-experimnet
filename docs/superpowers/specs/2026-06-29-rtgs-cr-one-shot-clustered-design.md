@@ -491,6 +491,16 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
 7. Validate N3DV `cluster_size=1` against compose and official sampled views.
 8. Run cluster-size sweep and compare FPS/PSNR/VRAM.
 
+## Implementation Progress
+
+- 2026-06-29: Added `lkg_experiment.rtgs_coherent.cr_one_shot` for viewport-cropped CR lookup construction, one-shot clustered rendering, and panel reinsertion.
+- 2026-06-29: Wired `cr_experiment.py --engine clustered` to delegate rendering through the new one-shot module.
+- 2026-06-29: Removed the positive-FoV letterbox guard because one-shot now renders the content viewport instead of the full panel.
+- 2026-06-29: Validated a 64x64 dnerf `jumpingjacks` smoke run. `cluster_size=1` one-shot and compose interlaced PNGs matched exactly (`MSE=0`, `MAE=0`, `PSNR=inf`).
+- 2026-06-29: Validated a 64x112 N3DV `coffee_martini` compose smoke run. The content viewport resolved to `64x48+0+32`, confirming the letterboxed N3DV compose path still works.
+- 2026-06-29: Confirmed N3DV clustered with `rtgs_compat_projection=True` stops at the intended sentinel-FoV guard. A diagnostic `--no-rtgs-compat-projection` clustered run executed and produced a 64x112 image; versus compose it measured `MSE=0.00021566`, `MAE=0.00593724`, `PSNR=36.662 dB`. This is diagnostic only and does not replace Phase C kernel adapter acceptance.
+- 2026-06-29: Kept the sentinel-FoV RTGS projection adapter guard in place. N3DV clustered acceptance still requires the kernel-level adapter work described in Phase C.
+
 ## Sub-Agent Review Notes
 
 Sub-agent `Avicenna` reviewed the draft by static code reading. The review agreed that the compose-vs-one-shot execution model was correctly described, and identified four required corrections that are now incorporated:

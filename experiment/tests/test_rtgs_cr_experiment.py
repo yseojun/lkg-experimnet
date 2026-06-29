@@ -145,6 +145,20 @@ class RtgsCrExperimentTest(unittest.TestCase):
         self.assertIn("compose/cluster_2 timing 1/2 warmup", output)
         self.assertIn("compose/cluster_2 timing 2/2 measure", output)
 
+    def test_render_clustered_interlaced_once_delegates_to_one_shot_module(self):
+        context = SimpleNamespace(name="context")
+        variant = SimpleNamespace(name="cluster_2")
+        expected = (torch.zeros((3, 2, 2), dtype=torch.float32), 3.5)
+
+        with mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_one_shot.render_rtgs_cr_one_shot_interlaced_once",
+            return_value=expected,
+        ) as render:
+            actual = cr_experiment.render_clustered_interlaced_once(context, variant=variant)
+
+        self.assertIs(actual, expected)
+        render.assert_called_once_with(context, variant=variant)
+
     def test_clustered_engine_rejects_rtgs_projection_adapter_context(self):
         context = SimpleNamespace(
             fov_normalization={"applied": False},
@@ -156,7 +170,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "clustered engine cannot use view-dependent RTGS projection adapter"):
             cr_experiment.ensure_clustered_engine_supported(context)
 
-    def test_clustered_engine_rejects_letterboxed_viewport(self):
+    def test_clustered_engine_allows_letterboxed_viewport_for_positive_fov(self):
         context = SimpleNamespace(
             fov_normalization={"applied": False},
             cr_anchor_camera_cuda=SimpleNamespace(FoVx=0.7, FoVy=0.7, fl_x=-1.0, fl_y=-1.0),
@@ -164,8 +178,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
             viewport=SimpleNamespace(offset_x=0, offset_y=560, render_width=1440, render_height=1440, panel_width=1440, panel_height=2560),
         )
 
-        with self.assertRaisesRegex(ValueError, "clustered engine currently requires a full-panel viewport"):
-            cr_experiment.ensure_clustered_engine_supported(context)
+        cr_experiment.ensure_clustered_engine_supported(context)
 
     def test_main_dispatches_to_runner(self):
         with mock.patch.object(cr_experiment, "run_rtgs_cr_experiment", return_value=0) as run:
