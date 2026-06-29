@@ -220,6 +220,30 @@ def camera_crop_to_fill_for_viewport(viewport: AspectViewport, *, no_crop_to_fil
     return False
 
 
+@dataclass(frozen=True)
+class RtgsCr66RenderContext:
+    args: argparse.Namespace
+    runtime: Any
+    cr_anchor_camera_cuda: Any
+    fov_normalization: Mapping[str, Any]
+    timestamp: float
+    panel_width: int
+    panel_height: int
+    render_width: int
+    render_height: int
+    viewport: AspectViewport
+    crop_to_fill: bool
+    source_view_count: int
+    viewpoint_index: np.ndarray
+    viewpoint_index_t: Any
+    view_index_stats: Mapping[str, Any]
+    geometry: Any
+    anchor_c2w: Any
+    orbit_center: Any
+    view_degree: float
+    orbit_direction: int
+
+
 def resolve_sample_view_indices(views: int, sample_save_views: int, explicit: str | None) -> list[int]:
     view_count = int(views)
     if view_count <= 0:
@@ -380,6 +404,201 @@ def synthetic_camera_from_viewmat_preserving_rtgs_contract(
         resolution=(target_width, target_height),
         data_device=device,
     )
+
+
+def prepare_rtgs_cr_66_context(args: argparse.Namespace) -> RtgsCr66RenderContext:
+    import torch
+
+    if str(args.interlace_mode) != "compose":
+        raise ValueError("only --interlace-mode compose is currently supported")
+    if int(args.views) <= 0:
+        raise ValueError("--views must be positive")
+    if int(args.width) <= 0 or int(args.height) <= 0:
+        raise ValueError("--width and --height must be positive")
+    if not str(args.device).startswith("cuda"):
+        raise RuntimeError("RTGS + CR 66-view rendering requires CUDA")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; cannot run RTGS + CR 66-view rendering")
+
+    _install_gsplat_root(args.gsplat_root)
+    runtime = prepare_official_rtgs_1view(args)
+    official_camera_cuda = runtime.camera.cuda()
+    cr_anchor_camera_cuda, fov_normalization = normalize_explicit_intrinsics_fov(
+        official_camera_cuda,
+        enabled=bool(args.normalize_explicit_intrinsics_fov),
+    )
+    timestamp = float(getattr(cr_anchor_camera_cuda, "timestamp", 0.0))
+    panel_width = int(args.width)
+    panel_height = int(args.height)
+    viewport = resolve_aspect_viewport(
+        source_width=int(cr_anchor_camera_cuda.image_width),
+        source_height=int(cr_anchor_camera_cuda.image_height),
+        target_width=panel_width,
+        target_height=panel_height,
+        aspect_fit=str(args.aspect_fit),
+    )
+    crop_to_fill = camera_crop_to_fill_for_viewport(viewport, no_crop_to_fill=bool(args.no_crop_to_fill))
+    source_view_count = int(args.views)
+    viewpoint_index, _map_metadata = build_66view_viewpoint_index(
+        args,
+        width=panel_width,
+        height=panel_height,
+        source_view_count=source_view_count,
+    )
+    view_index_stats = validate_viewpoint_index(viewpoint_index, source_view_count=source_view_count)
+    anchor_viewmat, _ = rtgs_camera_to_gsplat_inputs(cr_anchor_camera_cuda, device=args.device)
+    geometry = materialize_rtgs_geometry(runtime.official.gaussians, timestamp=timestamp)
+    anchor_c2w = torch.linalg.inv(anchor_viewmat)
+    orbit_center = estimate_orbit_center(
+        c2w=anchor_c2w,
+        snapshot_means=geometry.means,
+        orbit_center_distance=float(args.orbit_center_distance),
+    )
+    viewpoint_index_t = torch.as_tensor(viewpoint_index, dtype=torch.long, device=args.device)
+    return RtgsCr66RenderContext(
+        args=args,
+        runtime=runtime,
+        cr_anchor_camera_cuda=cr_anchor_camera_cuda,
+        fov_normalization=fov_normalization,
+        timestamp=timestamp,
+        panel_width=panel_width,
+        panel_height=panel_height,
+        render_width=int(viewport.render_width),
+        render_height=int(viewport.render_height),
+        viewport=viewport,
+        crop_to_fill=crop_to_fill,
+        source_view_count=source_view_count,
+        viewpoint_index=viewpoint_index,
+        viewpoint_index_t=viewpoint_index_t,
+        view_index_stats=view_index_stats,
+        geometry=geometry,
+        anchor_c2w=anchor_c2w,
+        orbit_center=orbit_center,
+        view_degree=float(args.view_degree),
+        orbit_direction=int(args.orbit_direction),
+    )
+
+
+def apply_orbit_state_to_c2w(c2w: Any, orbit_center: Any, orbit_state: Any) -> tuple[Any, Any]:
+    import torch
+
+    c2w_t = torch.as_tensor(c2w).clone()
+    center = torch.as_tensor(orbit_center, dtype=c2w_t.dtype, device=c2w_t.device).clone()
+    yaw_deg = float(getattr(orbit_state, "yaw_deg", 0.0) or 0.0)
+    pitch_deg = float(getattr(orbit_state, "pitch_deg", 0.0) or 0.0)
+    pan_x = float(getattr(orbit_state, "pan_x", 0.0) or 0.0)
+    pan_y = float(getattr(orbit_state, "pan_y", 0.0) or 0.0)
+    distance_scale = float(getattr(orbit_state, "distance_scale", 1.0) or 1.0)
+    if yaw_deg == 0.0 and pitch_deg == 0.0 and pan_x == 0.0 and pan_y == 0.0 and distance_scale == 1.0:
+        return c2w_t, center
+
+    right = c2w_t[:3, 0]
+    up = c2w_t[:3, 1]
+    distance = torch.linalg.norm(c2w_t[:3, 3] - center).clamp_min(1e-4)
+    center = center + right * (pan_x * distance) + up * (pan_y * distance)
+    yaw = _axis_angle_matrix(up, math.radians(yaw_deg))
+    pitch = _axis_angle_matrix(right, math.radians(pitch_deg))
+    rotation_delta = yaw @ pitch
+    offset = c2w_t[:3, 3] - torch.as_tensor(orbit_center, dtype=c2w_t.dtype, device=c2w_t.device)
+    c2w_t[:3, :3] = rotation_delta @ c2w_t[:3, :3]
+    c2w_t[:3, 3] = center + (rotation_delta @ offset) * distance_scale
+    return c2w_t.contiguous(), center.contiguous()
+
+
+def _axis_angle_matrix(axis: Any, angle: float):
+    import torch
+
+    axis_t = torch.as_tensor(axis)
+    norm = torch.linalg.norm(axis_t).clamp_min(1e-8)
+    x, y, z = axis_t / norm
+    c = math.cos(float(angle))
+    s = math.sin(float(angle))
+    one_c = 1.0 - c
+    return torch.stack(
+        [
+            torch.stack([c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s]),
+            torch.stack([y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s]),
+            torch.stack([z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c]),
+        ]
+    ).to(dtype=axis_t.dtype, device=axis_t.device)
+
+
+def render_rtgs_cr_66_interlaced_frame(
+    context: RtgsCr66RenderContext,
+    *,
+    orbit_state: Any | None = None,
+    debug: bool = False,
+) -> tuple[Any, float]:
+    import torch
+
+    args = context.args
+    if orbit_state is None:
+        c2w = context.anchor_c2w
+        orbit_center = context.orbit_center
+    else:
+        c2w, orbit_center = apply_orbit_state_to_c2w(context.anchor_c2w, context.orbit_center, orbit_state)
+    flat_viewmats = synthesize_flat_viewmats(
+        c2w=c2w,
+        orbit_center=orbit_center,
+        source_view_count=int(context.source_view_count),
+        view_degree=float(context.view_degree),
+        orbit_direction=int(context.orbit_direction),
+        device=str(args.device),
+    )
+    interlaced = torch.zeros(
+        (3, int(context.panel_height), int(context.panel_width)),
+        dtype=torch.float32,
+        device=context.viewpoint_index_t.device,
+    )
+    should_sync = str(args.device).startswith("cuda") and torch.cuda.is_available()
+    if should_sync:
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for view_id in range(int(context.source_view_count)):
+        synthetic_camera = synthetic_camera_from_viewmat_preserving_rtgs_contract(
+            context.cr_anchor_camera_cuda,
+            flat_viewmats[view_id],
+            uid=view_id,
+            image_name=f"view_{view_id:03d}",
+            timestamp=float(context.timestamp),
+            device=str(args.device),
+            width=int(context.render_width),
+            height=int(context.render_height),
+            crop_to_fill=bool(context.crop_to_fill),
+        ).cuda()
+        viewmat, K = rtgs_camera_to_gsplat_inputs(synthetic_camera, device=str(args.device))
+        colors = evaluate_rtgs_colors(
+            context.runtime.official.gaussians,
+            timestamp=float(context.timestamp),
+            camera_center=synthetic_camera.camera_center,
+            mask=context.geometry.mask,
+        )
+        snapshot = snapshot_from_geometry(context.geometry, colors=colors)
+        cr_snapshot, cr_K, _cr_projection_adapter = adapt_snapshot_for_rtgs_compat_projection(
+            snapshot,
+            camera=synthetic_camera,
+            viewmat=viewmat,
+            K=K,
+            enabled=bool(args.rtgs_compat_projection) and not bool(context.fov_normalization["applied"]),
+        )
+        cr_image = render_rtgs_coherent(
+            snapshot=cr_snapshot,
+            viewmat=viewmat,
+            K=cr_K,
+            width=int(context.render_width),
+            height=int(context.render_height),
+            tile_size=int(args.tile_size),
+            near_plane=float(args.near_plane),
+            far_plane=float(args.far_plane),
+            camera_model=str(args.camera_model),
+            background=context.runtime.background,
+            debug=bool(debug),
+        )
+        accumulate_interlaced_view(interlaced, cr_image, context.viewpoint_index_t, view_id=view_id, viewport=context.viewport)
+    if should_sync:
+        torch.cuda.synchronize()
+    render_ms = (time.perf_counter() - start) * 1000.0
+    return interlaced.clamp(0.0, 1.0).contiguous(), render_ms
 
 
 def render_rtgs_cr_66views(args: argparse.Namespace) -> int:

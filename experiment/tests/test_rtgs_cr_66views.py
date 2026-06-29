@@ -182,6 +182,86 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertIsNone(summary["psnr_mean"])
         self.assertEqual(cr_66views.format_optional_metric(summary["psnr_mean"]), "n/a")
 
+    def test_apply_orbit_state_to_c2w_changes_pose_without_moving_center_when_default(self):
+        c2w = torch.eye(4)
+        orbit_center = torch.tensor([0.0, 0.0, 2.0], dtype=torch.float32)
+        orbit = SimpleNamespace(yaw_deg=0.0, pitch_deg=0.0, pan_x=0.0, pan_y=0.0, distance_scale=1.0)
+
+        updated_c2w, updated_center = cr_66views.apply_orbit_state_to_c2w(c2w, orbit_center, orbit)
+
+        self.assertTrue(torch.allclose(updated_c2w, c2w))
+        self.assertTrue(torch.allclose(updated_center, orbit_center))
+
+    def test_render_interlaced_frame_compose_api_uses_viewpoint_index(self):
+        viewpoint_index = torch.zeros((2, 2, 3), dtype=torch.long)
+        viewpoint_index[:, :, 1] = 1
+        context = cr_66views.RtgsCr66RenderContext(
+            args=SimpleNamespace(
+                device="cpu",
+                tile_size=16,
+                near_plane=0.01,
+                far_plane=100.0,
+                camera_model="pinhole",
+                rtgs_compat_projection=True,
+            ),
+            runtime=SimpleNamespace(official=SimpleNamespace(gaussians=object()), background=None),
+            cr_anchor_camera_cuda=SimpleNamespace(camera_center=torch.zeros(3)),
+            fov_normalization={"applied": False},
+            timestamp=0.0,
+            panel_width=2,
+            panel_height=2,
+            render_width=2,
+            render_height=2,
+            viewport=cr_66views.AspectViewport(
+                source_width=2,
+                source_height=2,
+                panel_width=2,
+                panel_height=2,
+                render_width=2,
+                render_height=2,
+                offset_x=0,
+                offset_y=0,
+                scale=1.0,
+                aspect_fit="contain",
+            ),
+            crop_to_fill=False,
+            source_view_count=2,
+            viewpoint_index=np.zeros((2, 2, 3), dtype=np.int32),
+            viewpoint_index_t=viewpoint_index,
+            view_index_stats={},
+            geometry=SimpleNamespace(mask=None),
+            anchor_c2w=torch.eye(4),
+            orbit_center=torch.tensor([0.0, 0.0, 1.0]),
+            view_degree=10.0,
+            orbit_direction=-1,
+        )
+        rendered_values = [0.25, 0.75]
+
+        def fake_render_rtgs_coherent(**_kwargs):
+            value = rendered_values.pop(0)
+            return torch.full((3, 2, 2), value, dtype=torch.float32)
+
+        with (
+            mock.patch.object(cr_66views, "synthesize_flat_viewmats", return_value=torch.eye(4).repeat(2, 1, 1)),
+            mock.patch.object(cr_66views, "synthetic_camera_from_viewmat_preserving_rtgs_contract") as make_camera,
+            mock.patch.object(cr_66views, "rtgs_camera_to_gsplat_inputs", return_value=(torch.eye(4), torch.eye(3))),
+            mock.patch.object(cr_66views, "evaluate_rtgs_colors", return_value=torch.zeros((1, 3))),
+            mock.patch.object(cr_66views, "snapshot_from_geometry", return_value=SimpleNamespace()),
+            mock.patch.object(
+                cr_66views,
+                "adapt_snapshot_for_rtgs_compat_projection",
+                return_value=(SimpleNamespace(), torch.eye(3), {"applied": False}),
+            ),
+            mock.patch.object(cr_66views, "render_rtgs_coherent", side_effect=fake_render_rtgs_coherent),
+        ):
+            make_camera.return_value.cuda.return_value = SimpleNamespace(camera_center=torch.zeros(3))
+            image, render_ms = cr_66views.render_rtgs_cr_66_interlaced_frame(context)
+
+        self.assertGreaterEqual(render_ms, 0.0)
+        self.assertTrue(torch.allclose(image[0], torch.full((2, 2), 0.25)))
+        self.assertTrue(torch.allclose(image[1], torch.full((2, 2), 0.75)))
+        self.assertTrue(torch.allclose(image[2], torch.full((2, 2), 0.25)))
+
 
 if __name__ == "__main__":
     unittest.main()
