@@ -628,7 +628,68 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(camera.fl_y, 730.0)
         self.assertEqual(camera.cx, 676.0)
         self.assertEqual(camera.cy, 507.0)
+        self.assertEqual(camera.FoVx, -1.0)
+        self.assertEqual(camera.FoVy, -1.0)
         torch.testing.assert_close(camera.camera_center, torch.tensor([3.0, 4.0, 5.0]), atol=1e-5, rtol=1e-5)
+
+    def test_n3dv_dynamic_loader_ignores_missing_images_outside_selected_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "model"
+            source_path = root / "flame_salmon_1"
+            image_path = source_path / "cam00" / "images"
+            model_path.mkdir()
+            image_path.mkdir(parents=True)
+            from PIL import Image
+
+            Image.new("RGB", (64, 48), color=(64, 128, 192)).save(image_path / "0000.png")
+            cameras = [
+                {
+                    "id": 0,
+                    "img_name": "cam00_0000",
+                    "width": 64,
+                    "height": 48,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": np.eye(3).tolist(),
+                },
+                {
+                    "id": 1,
+                    "img_name": "cam00_0300",
+                    "width": 64,
+                    "height": 48,
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": np.eye(3).tolist(),
+                },
+            ]
+            (model_path / "cameras.json").write_text(json.dumps(cameras), encoding="utf-8")
+            poses_bounds = np.zeros((1, 17), dtype=np.float64)
+            poses_bounds[0, :15] = np.array(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 48.0],
+                    [0.0, 1.0, 0.0, 0.0, 64.0],
+                    [0.0, 0.0, 1.0, 0.0, 32.0],
+                ]
+            ).reshape(-1)
+            np.save(source_path / "poses_bounds.npy", poses_bounds)
+            args = types.SimpleNamespace(
+                source_path=str(source_path),
+                model_path=str(model_path),
+                resolution=1,
+                white_background=False,
+                data_device="cpu",
+                n3dv_frame_index=0,
+            )
+
+            gt, camera = _load_rtgs_n3dv_dynamic_camera(
+                args=args,
+                split="test",
+                camera_index=0,
+                time_duration=[0.0, 10.0],
+                device="cpu",
+            )
+
+        self.assertEqual(camera.image_name, "cam00_0000")
+        self.assertEqual(tuple(gt.shape), (3, 48, 64))
 
     def test_camera_manifest_fields_include_n3dv_frame_identity(self):
         camera = types.SimpleNamespace(

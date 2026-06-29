@@ -312,3 +312,38 @@ conda run -n rtgs-coherent-cu121 bash -lc 'cd experiment && PYTHONPATH=src pytho
 - `experiment/generated/rtgs_official_1view/coffee_martini/coffee_martini_cam00_0000_official/gt.png`
 - `experiment/generated/rtgs_official_1view/coffee_martini/coffee_martini_cam00_0000_official/comparison.png`
 - `experiment/generated/rtgs_official_1view/coffee_martini/coffee_martini_cam00_0000_official/metrics.json`
+
+## Task 1 Re-analysis: Official Flow Input Contract
+
+2026-06-29에 official 1-view harness를 다시 검증했다.
+
+확정한 내용:
+
+- dnerf `jumpingjacks`는 dirty RTGS checkout 대신 clean HEAD snapshot을 사용할 때 saved official reference와 렌더가 일치한다. `rtgs_official_render.png` vs official `renders/00000.png`는 약 61.6 dB다.
+- `4d-gaussian-splatting` working tree에는 CUDA rasterizer/general utility local edit가 있다. 기본 `--rtgs-code-policy clean`은 이 dirty tree를 직접 쓰지 않고 `/tmp/lkg_rtgs_official_code/...` 아래 clean archive snapshot을 사용한다.
+- N3DV `coffee_martini`는 local RTGS `Scene`만 사용하면 static colmap camera가 선택된다. 올바른 dynamic frame 검증에는 `model_path/cameras.json`과 raw `poses_bounds.npy` 기반 camera가 필요하다.
+- N3DV dynamic loader는 `cam00_0000` GT를 선택하며, 이 GT는 saved official `gt/00196.png`와 가장 가깝다. raw frame과 harness GT는 동일하고, official GT와의 차이는 원본 full-resolution/downsample artifact 차이로 보인다.
+- checkpoint `chkpnt_best.pth`와 `point_cloud/iteration_best/point_cloud.ply`는 sampled field 기준으로 같은 model artifact다. `f_rest`는 PLY flatten order만 다르며 transpose하면 일치한다.
+
+Resolved N3DV render mismatch:
+
+- Root cause: N3DV dynamic loader recomputed positive `FoVx/FoVy` from focal length. RTGS official `readCamerasFromTransforms()` keeps `FovX=FovY=-1.0` when explicit intrinsics are available, while `fl_x/fl_y/cx/cy` drive `getProjectionMatrixCenterShift()`. The rasterizer still receives `tan(FoVx/2)`, so this sentinel is part of the official render contract.
+- Harness before fix: `cam00_0000`, `rtgs_vs_gt_psnr` 약 20.1 dB.
+- Harness after fix: `coffee_martini_fov_sentinel_fix`, `rtgs_vs_gt_psnr` 약 27.52 dB; saved PNG render vs official `renders/00196.png` 약 51.2 dB.
+- Tested and rejected as primary causes before finding the FoV contract issue: `chkpnt_best` vs `chkpnt_30000`, env map (`env_map` is `None` in checkpoint), focal scaling, `compute_cov3D_python=True`, `force_sh_3d=True`, `scaling_modifier`, RTGS `d61f57d`, and RTGS pre-flip `5094ca8`.
+
+1단계 완료 판정:
+
+- RTGS official 1-view render baseline is now fixed as the return point for later coherent-raster experiments.
+- dnerf and N3DV are selected explicitly with `--dataset-kind`; N3DV uses dynamic `cameras.json` plus raw `poses_bounds.npy`, while dnerf continues to use the official `Scene` camera dataset.
+- The LKG display path is intentionally not exercised in this milestone because no display is connected; validation is by saved image artifacts and manifest metrics.
+- Final 1-view sweep passed for all configured RTGS scenes: 8 dnerf scenes and 6 N3DV scenes.
+- `flame_salmon` exposed an edge case where `cameras.json` contains frame 300 but raw `cam00/images` ends at `0299.png`; the N3DV dynamic loader now skips unrequested frame indices before validating image files.
+- `experiment/scripts/run_rtgs_1view_videos_all.sh` can generate per-scene 1-view videos by rendering official 1-view frame sequences and encoding them with ffmpeg.
+
+Manifest additions:
+
+- `render_contract_tensor_shapes` now includes `env_map`.
+- `camera_render_contract` records width, height, FoV, focal, principal point, near/far, and timestamp.
+- `gaussian_model_constructor_kwargs` records the exact constructor kwargs used for `GaussianModel`.
+- The harness adapts to older RTGS commits whose `GaussianModel.__init__` does not accept `prefilter_var`.

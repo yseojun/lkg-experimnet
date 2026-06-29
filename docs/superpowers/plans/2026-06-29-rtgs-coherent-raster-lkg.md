@@ -20,6 +20,7 @@ Task 1은 "RTGS official 1-view render가 LKG display에 들어갈 단일 view �
 
 - `4d-gaussian-splatting` checkout에는 현재 top-level `render.py`가 없다.
 - 로컬 RTGS official-flow 기준은 `4d-gaussian-splatting/arguments/__init__.py`, `4d-gaussian-splatting/scene/__init__.py`, `4d-gaussian-splatting/scene/gaussian_model.py`, `4d-gaussian-splatting/gaussian_renderer/__init__.py`를 직접 사용하는 것으로 정의한다.
+- 로컬 RTGS `Scene`은 N3DV raw dynamic frames를 직접 읽지 못하고 `colmap/sparse` static camera만 읽는다. N3DV 1-view baseline은 RTGS model output의 `cameras.json`과 raw `poses_bounds.npy`를 사용해 dynamic camera를 구성한다.
 - 현재 실패 기록과 재설계 결정은 `experiment/docs/rtgs_original_render_rewrite_decision.md`에 있다.
 - 기존 wrapper entrypoint는 `experiment/rtgs_basic_1view.py`이고 실제 구현은 `experiment/src/lkg_experiment/rtgs_coherent/basic_1view.py`와 `experiment/src/lkg_experiment/rtgs_coherent/cli.py`에 있다.
 - 기존 RTGS + CR multi-view 후보 구현은 `experiment/src/lkg_experiment/rtgs_coherent/views66.py`에 있다.
@@ -43,8 +44,9 @@ Task 1은 "RTGS official 1-view render가 LKG display에 들어갈 단일 view �
 ## Baseline Invariants
 
 - Official baseline에는 `RtgsLiteGaussianModel`을 사용하지 않는다.
-- Official baseline에는 custom camera loader를 사용하지 않는다.
-- Official baseline camera는 RTGS `Scene(...).getTrainCameras()` 또는 `Scene(...).getTestCameras()`에서 나온 camera를 사용한다.
+- dnerf official baseline에는 custom camera loader를 사용하지 않는다.
+- dnerf official baseline camera는 RTGS `Scene(...).getTrainCameras()` 또는 `Scene(...).getTestCameras()`에서 나온 camera를 사용한다.
+- N3DV official baseline camera는 local RTGS `Scene`의 static colmap camera가 아니라 `model_path/cameras.json`과 `n3dv_root/<scene>/poses_bounds.npy`로 만든 dynamic camera를 사용한다.
 - Official baseline model은 RTGS `GaussianModel.restore(model_params, opt)` 또는 RTGS `Scene`의 PLY loading path 중 하나로만 로드한다.
 - Official baseline render call은 `gaussian_renderer.render(camera.cuda(), gaussians, pipe, background)["render"]` 형태를 유지한다.
 - dnerf와 N3DV dataset root는 CLI에서 명시적으로 분리한다.
@@ -64,6 +66,12 @@ Task 1은 "RTGS official 1-view render가 LKG display에 들어갈 단일 view �
 - Modify: `experiment/docs/rtgs_original_render_rewrite_decision.md`
 
 **Current Status, 2026-06-29:** Steps 1-9 are implemented and verified. Regular Codex sandbox execution does not expose `/dev/nvidia*`, but escalated execution sees the GPUs and produced dnerf/N3DV image artifacts. Since the LKG display is not connected, Step 9 is scoped to saved image artifacts and `metrics.json` manifest records. The loader now follows the official RTGS flat argparse flow: instantiate `ModelParams`, `OptimizationParams`, `PipelineParams`; add train.py top-level args; recursively merge YAML leaf values into the same namespace; then call each group `extract()`.
+
+**Re-analysis, 2026-06-29:** dnerf `jumpingjacks` matches the saved official reference when the dirty RTGS checkout is isolated through a clean HEAD snapshot: render vs reference render is about 61.6 dB. N3DV `coffee_martini` now selects the correct dynamic GT/order (`cam00_0000` maps closest to official `gt/00196.png`) and reproduces the saved official render after preserving the original RTGS explicit-intrinsics camera contract: `FoVx=FoVy=-1.0` while `fl_x/fl_y/cx/cy` drive the center-shift projection matrix. Before this fix, recomputing positive FoV values from focal length produced about 20.1 dB vs GT; with the sentinel FoV contract, `rtgs_vs_gt_psnr` is about 27.52 dB and saved PNG render vs official `renders/00196.png` is about 51.2 dB.
+
+**Milestone 1 Complete, 2026-06-29:** Initial plan item 1 is complete: RTGS model loading plus official RTGS 1-view rendering is fixed for both dnerf and N3DV as image artifacts, with LKG display output intentionally deferred because no display is connected. This commit is the restore point before brainstorming and implementing RTGS + coherent-raster rendering.
+
+**Final 1-view sweep, 2026-06-29:** The official 1-view renderer completed on all configured RTGS scenes: dnerf `bouncingballs`, `hellwarrior`, `hook`, `jumpingjacks`, `lego`, `mutant`, `standup`, `trex`, and N3DV `coffee_martini`, `cook_spinach`, `cut_roasted_beef`, `flame_salmon`, `flame_steak`, `sear_steak`. `flame_salmon` required one loader robustness fix because its `cameras.json` includes frame 300 while raw `cam00/images` ends at 299; the loader now validates only the requested `--n3dv-frame-index` unless all frames are requested. A batch helper for user-run video generation is available at `experiment/scripts/run_rtgs_1view_videos_all.sh`.
 
 - [x] **Step 1: Define official baseline CLI contract**
 

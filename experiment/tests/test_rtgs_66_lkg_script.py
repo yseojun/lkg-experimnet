@@ -192,6 +192,66 @@ class RtgsSixtySixLkgScriptTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(f"DRY RUN: {coherent_python}", proc.stderr)
 
+    def test_1view_video_script_emits_render_frames_and_ffmpeg_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_root = root / "result" / "RTGS"
+            output_root = root / "generated" / "rtgs_official_1view_videos"
+            dnerf_root = root / "dataset" / "dnerf"
+            n3dv_root = root / "dataset" / "N3DV"
+
+            for scene in ("jumpingjacks", "coffee_martini"):
+                checkpoint = model_root / scene / "checkpoints" / "chkpnt_best.pth"
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_bytes(b"checkpoint")
+
+            dnerf_scene = dnerf_root / "jumpingjacks"
+            dnerf_scene.mkdir(parents=True)
+            (dnerf_scene / "transforms_test.json").write_text(
+                '{"frames": [{"file_path": "r_000"}, {"file_path": "r_001"}]}',
+                encoding="utf-8",
+            )
+            n3dv_images = n3dv_root / "coffee_martini" / "cam00" / "images"
+            n3dv_images.mkdir(parents=True)
+            (n3dv_images / "0000.png").write_bytes(b"png")
+            (n3dv_images / "0001.png").write_bytes(b"png")
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "MODEL_ROOT": str(model_root),
+                    "OUTPUT_ROOT": str(output_root),
+                    "PYTHON_BIN": sys.executable,
+                    "DNERF_ROOT": str(dnerf_root),
+                    "N3DV_ROOT": str(n3dv_root),
+                    "DNERF_SCENES": "jumpingjacks",
+                    "N3DV_SCENES": "coffee_martini",
+                    "RUN_GROUP": "video_test",
+                    "FPS": "12",
+                }
+            )
+
+            proc = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "scripts" / "run_rtgs_1view_videos_all.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("rtgs_official_1view.py", proc.stderr)
+            self.assertIn("--dataset-kind dnerf", proc.stderr)
+            self.assertIn("--dataset-kind n3dv", proc.stderr)
+            self.assertIn("--camera-index 0", proc.stderr)
+            self.assertIn("--camera-index 1", proc.stderr)
+            self.assertIn("--n3dv-frame-index 0", proc.stderr)
+            self.assertIn("--n3dv-frame-index 1", proc.stderr)
+            self.assertIn("ffmpeg", proc.stderr)
+            self.assertIn("-framerate 12", proc.stderr)
+            self.assertIn(str(output_root / "video_test" / "jumpingjacks" / "jumpingjacks_1view.mp4"), proc.stderr)
+            self.assertIn(str(output_root / "video_test" / "coffee_martini" / "coffee_martini_1view.mp4"), proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

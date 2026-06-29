@@ -1157,8 +1157,8 @@ def _load_rtgs_n3dv_dynamic_camera(
     camera = RtgsSimpleCamera(
         R=selected["R"],
         T=selected["T"],
-        FoVx=_focal_to_fov(fl_x, resolution[0]),
-        FoVy=_focal_to_fov(fl_y, resolution[1]),
+        FoVx=-1.0,
+        FoVy=-1.0,
         image=gt,
         image_name=selected["image_name"],
         uid=int(camera_index),
@@ -1193,12 +1193,15 @@ def _read_rtgs_n3dv_dynamic_cameras(args: Any, *, time_duration: list[float]) ->
     duration_start = float(time_duration[0]) if time_duration else 0.0
     duration_end = float(time_duration[1]) if time_duration else float(frame_count)
     duration = duration_end - duration_start
+    requested_frame_index = int(getattr(args, "n3dv_frame_index", 0))
 
     cameras = []
     for camera in cameras_json:
         image_name = str(camera["img_name"])
         camera_label = _n3dv_camera_label(image_name)
         frame_index = _n3dv_frame_index(image_name)
+        if requested_frame_index >= 0 and frame_index != requested_frame_index:
+            continue
         image_path = source_path / camera_label / "images" / f"{frame_index:04d}.png"
         if not image_path.is_file():
             raise FileNotFoundError(f"N3DV frame image not found for {image_name}: {image_path}")
