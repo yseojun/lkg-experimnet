@@ -4,9 +4,11 @@ Created: 2026-06-29
 
 ## Decision
 
-Task 4 will add a new RTGS + CoherentRaster 66-view entrypoint instead of rewriting the existing `views66.py` path in place. The renderer will use all 66 synthesized views for the LKG interlaced output, but it will save only a small sampled set of full-frame views for visual/debug inspection.
+Task 4 will add a new RTGS + CoherentRaster 66-view entrypoint instead of rewriting the existing `views66.py` path in place. The correctness renderer will use all 66 synthesized views for the LKG interlaced output, but it will save only a small sampled set of full-frame views for visual/debug inspection.
 
 This keeps the previously implemented 3DGS/RTGS 66-view experiment code available as reference while allowing the new path to strictly preserve the Task 3 official RTGS runtime and N3DV `rtgscompat` projection contract.
+
+The initial implementation uses `--interlace-mode compose`: render each CR view with the per-view Task 3 adapter in memory, then compose the LKG interlaced image from the 66 rendered views. A single direct multi-view CR kernel call remains a later optimization because the current N3DV `rtgscompat` adapter is view-dependent and cannot be represented as one global mean/covariance transform without kernel changes.
 
 ## Goals
 
@@ -26,6 +28,7 @@ This keeps the previously implemented 3DGS/RTGS 66-view experiment code availabl
 - Do not physically validate on the LKG display while the display is disconnected.
 - Do not tune CoherentRaster cluster reuse for performance before `cluster_size=1` correctness is validated.
 - Do not use the older lightweight RTGS checkpoint loader as acceptance evidence for this path.
+- Do not treat the `compose` interlacing baseline as a final CoherentRaster speed benchmark. It is a correctness baseline that preserves N3DV `rtgscompat`.
 
 ## New Files
 
@@ -73,6 +76,7 @@ Required additional options:
 --map-mode {file,linear}
 --cluster-size
 --cr-remapping {on,off}
+--interlace-mode {compose}
 --compare-official-sampled / --no-compare-official-sampled
 --write-interlaced / --no-write-interlaced
 ```
@@ -87,6 +91,7 @@ width: 1440
 height: 2560
 cluster_size: 1 for correctness smoke
 cr_remapping: on
+interlace_mode: compose
 write_interlaced: true
 compare_official_sampled: true
 output root: /data/ysj/result/coherent-raster/generated/rtgs_cr_66views
@@ -113,7 +118,7 @@ GaussianModel + timestamp
 7. For the LKG interlaced image:
    - build the 66-view viewpoint-index map from the calibration NPZ or linear debug map;
    - validate `viewpoint_index.min() >= 0` and `viewpoint_index.max() < 66`;
-   - call CoherentRaster once using all synthesized views and the selected cluster size;
+   - use all 66 in-memory CR renders to fill the subpixels selected by the viewpoint-index map;
    - save one interlaced image.
 
 ## Output Layout

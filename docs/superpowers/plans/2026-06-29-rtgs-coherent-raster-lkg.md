@@ -606,21 +606,23 @@ Result: 31 tests passed. The user visually confirmed the N3DV `rtgscompat` outpu
 - Optional create after smoke validation: `experiment/scripts/run_rtgs_cr_66views_all.sh`
 - Modify: `experiment/docs/rtgs_coherent_raster_brainstorm.md`
 
-**Design Status, 2026-06-29:** The Task 4 design is documented in `docs/superpowers/specs/2026-06-29-rtgs-cr-66view-design.md`. The implementation should create a new RTGS + CR 66-view entrypoint instead of rewriting the existing `views66.py` path in place. The new renderer uses all 66 synthesized views for the LKG interlaced image, but saves only 5 sampled full-frame CR views by default for visual/debug inspection.
+**Design Status, 2026-06-29:** The Task 4 design is documented in `docs/superpowers/specs/2026-06-29-rtgs-cr-66view-design.md`. The implementation should create a new RTGS + CR 66-view entrypoint instead of rewriting the existing `views66.py` path in place. The new correctness renderer uses all 66 synthesized views for the LKG interlaced image, but saves only 5 sampled full-frame CR views by default for visual/debug inspection. The initial implementation uses `--interlace-mode compose` because the N3DV Task 3 `rtgscompat` adapter is view-dependent; a single direct multi-view CR kernel call is deferred until that adapter can be represented in the kernel.
 
-- [ ] **Step 1: Create a separate RTGS + CR 66-view entrypoint**
+**Implementation Status, 2026-06-29:** `experiment/rtgs_cr_66views.py` and `experiment/src/lkg_experiment/rtgs_coherent/cr_66views.py` implement the compose-mode correctness path. Non-CUDA test discovery passes with 131 tests. Low-resolution CUDA smoke passed for dnerf `jumpingjacks` at 160x160 with sampled mean PSNR 79.762 dB, and N3DV `coffee_martini` at 338x254 with sampled mean PSNR 57.394 dB. The N3DV manifest records `camera_fov_normalization.applied=false` and `cr_projection_adapter_summary.applied_count=66/66`.
+
+- [x] **Step 1: Create a separate RTGS + CR 66-view entrypoint**
 
 `cr_66views.py` must use the same model, camera, timestamp, color, covariance, opacity, background, and RTGS-compatible projection path validated by Task 3. The only new variables in Task 4 are synthetic view generation, sampled-view saving, LKG viewpoint indexing, remapping, and cluster grouping. Do not use metrics from the current `load_rtgs_checkpoint()` / lightweight wrapper path as Task 4 acceptance evidence.
 
-- [ ] **Step 2: Save only sampled full-frame views**
+- [x] **Step 2: Save only sampled full-frame views**
 
 Render all 66 synthetic views internally, but save only 5 sampled full-frame CR views by default. The default sampled indices are evenly spaced across `[0, views - 1]`; for 66 views this is expected to be equivalent to indices such as `0, 16, 32, 49, 65`. Add `--sample-save-views` and `--sample-view-indices` so this can be changed without editing code.
 
-- [ ] **Step 3: Preserve N3DV synthetic camera sentinel**
+- [x] **Step 3: Preserve N3DV synthetic camera sentinel**
 
 When creating sampled official comparison cameras from an N3DV anchor, preserve `FoVx=FoVy=-1.0` and use `fl_x/fl_y/cx/cy` for projection. CR inputs must apply the Task 3 RTGS-compatible projection adapter, while explicit-intrinsics FoV normalization remains disabled. Add manifest assertions and unit tests before trusting sampled N3DV comparisons.
 
-- [ ] **Step 4: Add remapping control and cluster map validation**
+- [x] **Step 4: Add remapping control and cluster map validation**
 
 Expose a CR remapping switch instead of hardcoding `use_remapping=True`. Use this CLI shape unless implementation discovers a better local convention:
 
@@ -637,7 +639,7 @@ non-divisible cluster tails are deterministic
 color-coded view-index debug render matches expected subpixel placement
 ```
 
-- [ ] **Step 5: Compare sampled views against official RTGS**
+- [x] **Step 5: Compare sampled views against official RTGS**
 
 Keep sampled official comparison enabled by default. Each sampled view must save:
 
@@ -648,9 +650,9 @@ comparison.png
 metrics.json
 ```
 
-- [ ] **Step 6: Render LKG interlaced output from all 66 views**
+- [x] **Step 6: Render LKG interlaced output from all 66 views**
 
-Use all 66 synthetic views for the interlaced image even though only 5 full-frame views are saved. The expected primary output is:
+Use all 66 synthetic views for the interlaced image even though only 5 full-frame views are saved. In the initial correctness implementation, this is done by rendering 66 per-view CR images in memory and composing the LKG subpixels from the viewpoint-index map. The expected primary output is:
 
 ```text
 /data/ysj/result/coherent-raster/generated/rtgs_cr_66views/<scene>/<run_label>/rtgs_cr_lkg_interlaced.png
@@ -664,8 +666,8 @@ Run in this order:
 first: cluster_size=1, remapping disabled, linear debug map, sampled full-frame comparisons only
 second: cluster_size=1, remapping enabled, linear debug map, sampled full-frame comparisons only
 third: cluster_size=1, remapping enabled, real LKG map, sampled comparisons plus interlaced output
-fourth: cluster_size=2 or 4, remapping enabled, sampled comparisons
-fifth: cluster_size=8, remapping enabled, sampled comparisons plus interlaced output
+fourth: direct multi-view CR kernel experiment only after compose-mode correctness passes
+fifth: cluster_size=2/4/8 reuse experiments only after direct-kernel N3DV projection compatibility is solved
 ```
 
 - [ ] **Step 8: Use the LKG calibration artifact**
@@ -712,6 +714,7 @@ PYTHONPATH=src python rtgs_cr_66views.py \
   --views 66 \
   --sample-save-views 5 \
   --cluster-size 1 \
+  --interlace-mode compose \
   --viewpoint-index-path /data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz \
   --run-label coffee_martini_cam00_frame0000_cr66
 ```
@@ -732,6 +735,7 @@ PYTHONPATH=src python rtgs_cr_66views.py \
   --views 66 \
   --sample-save-views 5 \
   --cluster-size 1 \
+  --interlace-mode compose \
   --viewpoint-index-path /data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz \
   --run-label jumpingjacks_cam00_cr66
 ```
