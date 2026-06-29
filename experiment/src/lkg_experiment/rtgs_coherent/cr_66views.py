@@ -528,6 +528,8 @@ def render_rtgs_cr_66_interlaced_frame(
     *,
     orbit_state: Any | None = None,
     debug: bool = False,
+    progress_label: str | None = None,
+    progress_every_views: int = 0,
 ) -> tuple[Any, float]:
     import torch
 
@@ -555,6 +557,16 @@ def render_rtgs_cr_66_interlaced_frame(
         torch.cuda.synchronize()
     start = time.perf_counter()
     for view_id in range(int(context.source_view_count)):
+        if progress_label and _should_report_view_progress(
+            view_id,
+            source_view_count=int(context.source_view_count),
+            every=int(progress_every_views),
+        ):
+            print(
+                f"{progress_label} view {view_id + 1}/{int(context.source_view_count)}",
+                file=sys.stderr,
+                flush=True,
+            )
         synthetic_camera = synthetic_camera_from_viewmat_preserving_rtgs_contract(
             context.cr_anchor_camera_cuda,
             flat_viewmats[view_id],
@@ -599,6 +611,14 @@ def render_rtgs_cr_66_interlaced_frame(
         torch.cuda.synchronize()
     render_ms = (time.perf_counter() - start) * 1000.0
     return interlaced.clamp(0.0, 1.0).contiguous(), render_ms
+
+
+def _should_report_view_progress(view_id: int, *, source_view_count: int, every: int) -> bool:
+    if int(source_view_count) <= 0:
+        return False
+    if int(view_id) == 0 or int(view_id) == int(source_view_count) - 1:
+        return True
+    return int(every) > 0 and (int(view_id) + 1) % int(every) == 0
 
 
 def render_rtgs_cr_66views(args: argparse.Namespace) -> int:

@@ -7,6 +7,55 @@ from pathlib import Path
 
 
 class RtgsSixtySixLkgScriptTest(unittest.TestCase):
+    def test_cr_experiment_script_emits_experiment_command_for_each_rtgs_scene(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_root = root / "result" / "RTGS"
+            artifact_root = root / "generated" / "rtgs_cr_experiments"
+            viewpoint_index = root / "lut.npz"
+            for scene in ("jumpingjacks", "coffee_martini"):
+                checkpoint = model_root / scene / "checkpoints" / "chkpnt_best.pth"
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_bytes(b"checkpoint")
+            viewpoint_index.write_bytes(b"lut")
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "GENERATED_ROOT": str(root / "generated"),
+                    "MODEL_ROOT": str(model_root),
+                    "ARTIFACT_ROOT": str(artifact_root),
+                    "PYTHON_BIN": sys.executable,
+                    "RTGS_SCENES": "jumpingjacks coffee_martini",
+                    "RUN_GROUP": "rtgs_cr_exp_test",
+                    "VIEWPOINT_INDEX_PATH": str(viewpoint_index),
+                    "CLUSTERS": "2,4",
+                    "WARMUP_ITERS": "0",
+                    "MEASURE_ITERS": "1",
+                    "MAX_METRIC_VIEWS": "1",
+                }
+            )
+
+            proc = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "scripts" / "run_rtgs_cr_experiments_all.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("rtgs_cr_experiment.py", proc.stderr)
+            self.assertIn("--engine compose", proc.stderr)
+            self.assertIn(f"--torch-extensions-dir {root / 'generated' / 'torch_extensions_lkg_rtgs' / 'rtgs_official'}", proc.stderr)
+            self.assertIn("--clusters 2\\,4", proc.stderr)
+            self.assertIn("--warmup-iters 0", proc.stderr)
+            self.assertIn("--measure-iters 1", proc.stderr)
+            self.assertIn("--max-metric-views 1", proc.stderr)
+            self.assertIn(f"--model-path {model_root / 'jumpingjacks'}", proc.stderr)
+            self.assertIn(f"--model-path {model_root / 'coffee_martini'}", proc.stderr)
+            self.assertIn(f"--artifact-dir {artifact_root / 'rtgs_cr_exp_test'}", proc.stderr)
+
     def test_dry_run_emits_lkg_only_command_for_each_rtgs_scene(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
