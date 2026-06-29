@@ -16,10 +16,10 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import tensor_to
 from lkg_experiment.rtgs_coherent.cli import (
     DEFAULT_CHECKPOINT,
     DEFAULT_DNERF_ROOT,
+    DEFAULT_GENERATED_ROOT,
     DEFAULT_MODEL_PATH,
     DEFAULT_N3DV_ROOT,
     DEFAULT_RTGS_CODE_ROOT,
-    EXPERIMENT_ROOT,
     _background_tensor,
     _camera_manifest_fields,
     _json_ready,
@@ -33,7 +33,7 @@ from lkg_experiment.rtgs_coherent.cli import (
 )
 
 
-DEFAULT_BASIC_OUTPUT_ROOT = EXPERIMENT_ROOT / "generated" / "rtgs_basic_1view"
+DEFAULT_BASIC_OUTPUT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_basic_1view"
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional RTGS-converted dataset path with transforms_train/test.json; useful for checking official N3DV camera loading",
     )
     parser.add_argument("--config", default=None, help="RTGS YAML config override")
-    parser.add_argument("--output-dir", default=None, help="Output directory; defaults under experiment/generated/rtgs_basic_1view")
+    parser.add_argument("--output-dir", default=None, help=f"Output directory; defaults under {DEFAULT_BASIC_OUTPUT_ROOT}")
     parser.add_argument("--split", choices=("train", "test", "all"), default="test")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--n3dv-frame-index", type=int, default=0, help="N3DV dynamic frame index used with cameras.json")

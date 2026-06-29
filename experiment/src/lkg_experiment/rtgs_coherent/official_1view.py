@@ -27,6 +27,7 @@ from lkg_experiment.rtgs_coherent.cli import (
     DEFAULT_DNERF_ROOT,
     DEFAULT_MODEL_PATH,
     DEFAULT_N3DV_ROOT,
+    DEFAULT_GENERATED_ROOT,
     DEFAULT_RTGS_CODE_ROOT,
     EXPERIMENT_ROOT,
     RtgsScenePaths,
@@ -46,7 +47,7 @@ from lkg_experiment.rtgs_coherent.cli import (
 )
 
 
-DEFAULT_OFFICIAL_OUTPUT_ROOT = EXPERIMENT_ROOT / "generated" / "rtgs_official_1view"
+DEFAULT_OFFICIAL_OUTPUT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_official_1view"
 DEFAULT_RTGS_CLEAN_CACHE_ROOT = Path("/tmp") / "lkg_rtgs_official_code"
 DEFAULT_TORCH_EXTENSIONS_ROOT = Path("/tmp") / "torch_extensions_lkg_rtgs"
 
@@ -82,6 +83,17 @@ class OfficialRtgsScene:
     time_duration: list[float]
 
 
+@dataclass(frozen=True)
+class OfficialRtgsRuntime:
+    official: OfficialRtgsScene
+    gt: Any
+    camera: Any
+    camera_source: str
+    pipe: Any
+    background: Any
+    ssim_metric: Any
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render one view through the official RTGS Scene/GaussianModel/render flow")
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH), help="RTGS scene output directory")
@@ -100,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n3dv-root", default=str(DEFAULT_N3DV_ROOT), help="N3DV dataset root")
     parser.add_argument("--source-path", default=None, help="Explicit RTGS source_path override for Scene construction")
     parser.add_argument("--config", default=None, help="RTGS YAML config override")
-    parser.add_argument("--output-dir", default=None, help="Output directory; defaults under experiment/generated/rtgs_official_1view")
+    parser.add_argument("--output-dir", default=None, help=f"Output directory; defaults under {DEFAULT_OFFICIAL_OUTPUT_ROOT}")
     parser.add_argument("--run-label", default=None, help="Stable output leaf name; omitted labels get a timestamp suffix")
     parser.add_argument("--split", choices=("train", "test"), default="test")
     parser.add_argument("--camera-index", type=int, default=0)
@@ -648,24 +660,20 @@ def render_official_rtgs_1view(args: argparse.Namespace) -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; cannot run RTGS official renderer")
 
-    official = load_official_rtgs_scene(args)
+    runtime = prepare_official_rtgs_1view(args)
     from gaussian_renderer import render
 
-    gt, camera, camera_source = load_official_rtgs_camera(args=args, official=official)
-    gt = gt.to(device=args.device, non_blocking=True).contiguous()
-    camera_cuda = camera.cuda()
-    pipe = _pipeline_namespace_for_model(vars(official.pipeline_args), official.gaussians)
-    background = _background_tensor(args.background, official.model_args, args.device)
-    ssim_metric = None if args.no_ssim else _make_ssim_metric(args.device)
+    gt = runtime.gt.to(device=args.device, non_blocking=True).contiguous()
+    camera_cuda = runtime.camera.cuda()
 
     torch.cuda.synchronize()
     start = time.perf_counter()
     with torch.no_grad():
-        rtgs_render = render(camera_cuda, official.gaussians, pipe, background)["render"].detach().clamp(0.0, 1.0).contiguous()
+        rtgs_render = render(camera_cuda, runtime.official.gaussians, runtime.pipe, runtime.background)["render"].detach().clamp(0.0, 1.0).contiguous()
     torch.cuda.synchronize()
     render_ms = (time.perf_counter() - start) * 1000.0
 
-    timestamp = float(getattr(camera, "timestamp", 0.0))
+    timestamp = float(getattr(runtime.camera, "timestamp", 0.0))
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else default_official_output_path(
         args.model_path,
         split=args.split,
@@ -676,24 +684,41 @@ def render_official_rtgs_1view(args: argparse.Namespace) -> int:
     render_path = output_dir / "rtgs_official_render.png"
     manifest = _build_manifest(
         args=args,
-        official=official,
-        camera=camera,
-        camera_source=camera_source,
-        pipe=pipe,
+        official=runtime.official,
+        camera=runtime.camera,
+        camera_source=runtime.camera_source,
+        pipe=runtime.pipe,
         gt=gt,
         rtgs_render=rtgs_render,
         render_ms=render_ms,
-        ssim_metric=ssim_metric,
-        background=background,
+        ssim_metric=runtime.ssim_metric,
+        background=runtime.background,
         render_path=render_path,
     )
     save_official_outputs(output_dir=output_dir, gt=gt, rtgs_render=rtgs_render, manifest=manifest)
     print(
-        f"Wrote {output_dir} ({int(camera.image_width)}x{int(camera.image_height)}, "
+        f"Wrote {output_dir} ({int(runtime.camera.image_width)}x{int(runtime.camera.image_height)}, "
         f"rtgs_vs_gt_psnr={manifest['metrics']['rtgs_vs_gt']['psnr']:.3f})",
         file=sys.stderr,
     )
     return 0
+
+
+def prepare_official_rtgs_1view(args: argparse.Namespace) -> OfficialRtgsRuntime:
+    official = load_official_rtgs_scene(args)
+    gt, camera, camera_source = load_official_rtgs_camera(args=args, official=official)
+    pipe = _pipeline_namespace_for_model(vars(official.pipeline_args), official.gaussians)
+    background = _background_tensor(args.background, official.model_args, args.device)
+    ssim_metric = None if args.no_ssim else _make_ssim_metric(args.device)
+    return OfficialRtgsRuntime(
+        official=official,
+        gt=gt.contiguous() if hasattr(gt, "contiguous") else gt,
+        camera=camera,
+        camera_source=str(camera_source),
+        pipe=pipe,
+        background=background,
+        ssim_metric=ssim_metric,
+    )
 
 
 def load_official_rtgs_camera(*, args: argparse.Namespace, official: OfficialRtgsScene):

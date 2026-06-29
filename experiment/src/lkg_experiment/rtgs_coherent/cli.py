@@ -33,8 +33,9 @@ DEFAULT_RTGS_CODE_ROOT = REPO_ROOT / "4d-gaussian-splatting"
 DEFAULT_GSPLAT_ROOT = REPO_ROOT / "gsplat"
 DEFAULT_DNERF_ROOT = Path("/data/ysj/dataset/dnerf")
 DEFAULT_N3DV_ROOT = Path("/data/ysj/dataset/N3DV")
-DEFAULT_OUTPUT_ROOT = EXPERIMENT_ROOT / "generated" / "rtgs_coherent"
-DEFAULT_VIEWPOINT_INDEX_PATH = EXPERIMENT_ROOT / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
+DEFAULT_GENERATED_ROOT = Path("/data/ysj/result/coherent-raster/generated")
+DEFAULT_OUTPUT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_coherent"
+DEFAULT_VIEWPOINT_INDEX_PATH = DEFAULT_GENERATED_ROOT / "lkg_go_1440x2560_66_views_lkg_calibration.npz"
 
 _N3DV_SCENE_ALIASES = {
     "flame_salmon": "flame_salmon_1",
@@ -332,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", default=str(DEFAULT_DNERF_ROOT), help="dnerf dataset root")
     parser.add_argument("--n3dv-root", default=str(DEFAULT_N3DV_ROOT), help="N3DV dataset root")
     parser.add_argument("--config", default=None, help="RTGS YAML config override")
-    parser.add_argument("--output-dir", default=None, help="Output directory; defaults under experiment/generated/rtgs_coherent")
+    parser.add_argument("--output-dir", default=None, help=f"Output directory; defaults under {DEFAULT_OUTPUT_ROOT}")
     parser.add_argument("--render-mode", choices=("single", "single-all-cams", "views66"), default="single")
     parser.add_argument("--split", choices=("train", "test", "all"), default="test")
     parser.add_argument("--camera-index", type=int, default=0)
@@ -742,6 +743,7 @@ def materialize_rtgs_snapshot(
             timestamp=float(timestamp),
             camera_center=centers,
             mask=geometry.mask,
+            means_for_color=geometry.means,
             eval_shfs_4d_fn=eval_shfs_4d_fn,
             eval_sh_fn=eval_sh_fn,
         )
@@ -751,6 +753,7 @@ def materialize_rtgs_snapshot(
             timestamp=float(timestamp),
             camera_centers=centers,
             mask=geometry.mask,
+            means_for_color=geometry.means,
             eval_shfs_4d_fn=eval_shfs_4d_fn,
             eval_sh_fn=eval_sh_fn,
         )
@@ -818,6 +821,7 @@ def evaluate_rtgs_colors_for_centers(
     timestamp: float,
     camera_centers: Any,
     mask: Any,
+    means_for_color: Any = None,
     eval_shfs_4d_fn: Optional[Callable[..., Any]] = None,
     eval_sh_fn: Optional[Callable[..., Any]] = None,
 ):
@@ -834,6 +838,7 @@ def evaluate_rtgs_colors_for_centers(
             timestamp=timestamp,
             camera_center=center,
             mask=mask,
+            means_for_color=means_for_color,
             eval_shfs_4d_fn=eval_shfs_4d_fn,
             eval_sh_fn=eval_sh_fn,
         )
@@ -848,12 +853,16 @@ def evaluate_rtgs_colors(
     timestamp: float,
     camera_center: Any,
     mask: Any,
+    means_for_color: Any = None,
     eval_shfs_4d_fn: Optional[Callable[..., Any]] = None,
     eval_sh_fn: Optional[Callable[..., Any]] = None,
 ):
     import torch
 
-    means_for_color = pc.get_xyz[mask]
+    if means_for_color is None:
+        means_for_color = pc.get_xyz[mask]
+    else:
+        means_for_color = torch.as_tensor(means_for_color, dtype=pc.get_xyz.dtype, device=pc.get_xyz.device)
     camera_center = torch.as_tensor(camera_center, dtype=means_for_color.dtype, device=means_for_color.device)
     dir_pp = (means_for_color - camera_center.reshape(1, 3)).detach()
     dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True).clamp_min(1e-12)

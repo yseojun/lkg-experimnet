@@ -16,8 +16,9 @@ lkg_66_views_init() {
 
     DATADIR="${DATADIR:-${DATA_DIR_ROOT:-$HOME/Data/datasets}}"
     RESULTDIR="${RESULTDIR:-${RESULT_DIR_ROOT:-$HOME/Data/results}}"
-    ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/generated/coherent_raster_experiments}"
-    VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$ROOT_DIR/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
+    GENERATED_ROOT="${GENERATED_ROOT:-/data/ysj/result/coherent-raster/generated}"
+    ARTIFACT_DIR="${ARTIFACT_DIR:-$GENERATED_ROOT/coherent_raster_experiments}"
+    VIEWPOINT_INDEX_PATH="${VIEWPOINT_INDEX_PATH:-$GENERATED_ROOT/lkg_go_1440x2560_66_views_lkg_calibration.npz}"
 
     RUN_GROUP="${RUN_GROUP:-$default_run_group}"
     SUMMARY_TXT="${SUMMARY_TXT:-$ARTIFACT_DIR/${RUN_GROUP}_metrics.txt}"

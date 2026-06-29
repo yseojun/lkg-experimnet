@@ -35,6 +35,9 @@ from lkg_experiment.rtgs_coherent.views66 import (
 
 
 class RtgsCoherentTest(unittest.TestCase):
+    def test_generated_root_defaults_to_external_result_directory(self):
+        self.assertEqual(rtgs_cli.DEFAULT_GENERATED_ROOT, Path("/data/ysj/result/coherent-raster/generated"))
+
     def test_parser_defaults_to_rtgs_paths_and_jumpingjacks(self):
         args = build_parser().parse_args([])
 
@@ -51,6 +54,11 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(args.views, 66)
         self.assertEqual(args.cluster_size, 8)
         self.assertEqual(args.compare_original_views, 5)
+        self.assertEqual(args.output_dir, None)
+        self.assertEqual(
+            args.viewpoint_index_path,
+            "/data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz",
+        )
         self.assertEqual(args.width, 1440)
         self.assertEqual(args.height, 2560)
         self.assertEqual(args.rtgs_rotation_convention, "current")
@@ -114,6 +122,7 @@ class RtgsCoherentTest(unittest.TestCase):
         )
 
         self.assertEqual(path.name, "jumpingjacks_t0.125000_test_2")
+        self.assertEqual(path.parts[:5], ("/", "data", "ysj", "result", "coherent-raster"))
 
     def test_default_views66_output_path_suffixes_view_count(self):
         path = default_views66_output_path(
@@ -125,6 +134,7 @@ class RtgsCoherentTest(unittest.TestCase):
         )
 
         self.assertEqual(path.name, "jumpingjacks_t0.125000_test_2_views66")
+        self.assertEqual(path.parts[:5], ("/", "data", "ysj", "result", "coherent-raster"))
 
     def test_sample_evenly_spaced_view_indices_includes_edges(self):
         self.assertEqual(sample_evenly_spaced_view_indices(66, 5), [0, 16, 32, 48, 65])
@@ -200,7 +210,7 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(paths.dataset_path, dataset_path)
         self.assertEqual(paths.dataset_kind, "n3dv")
 
-    def test_materialize_snapshot_filters_time_and_uses_original_xyz_for_color(self):
+    def test_materialize_snapshot_filters_time_and_uses_timestamp_conditioned_mean_for_color(self):
         pc = _FakeRtgsModel()
         captured = {}
 
@@ -225,7 +235,9 @@ class RtgsCoherentTest(unittest.TestCase):
         torch.testing.assert_close(snapshot.means[0], torch.tensor([1.0, 10.0, 0.0]))
         torch.testing.assert_close(snapshot.opacities, torch.tensor([0.8]))
         torch.testing.assert_close(snapshot.mask, torch.tensor([True, False]))
-        torch.testing.assert_close(captured["dirs"][0], torch.tensor([1.0, 0.0, 0.0]))
+        expected_dir = torch.tensor([1.0, 10.0, 0.0])
+        expected_dir = expected_dir / expected_dir.norm()
+        torch.testing.assert_close(captured["dirs"][0], expected_dir)
         torch.testing.assert_close(captured["dirs_t"], torch.tensor([[-0.25]]))
         self.assertEqual(captured["deg"], 0)
         self.assertEqual(captured["deg_t"], 0)
@@ -249,8 +261,12 @@ class RtgsCoherentTest(unittest.TestCase):
 
         self.assertEqual(tuple(snapshot.colors.shape), (2, 1, 3))
         self.assertEqual(len(seen_dirs), 2)
-        torch.testing.assert_close(snapshot.colors[0, 0], torch.tensor([0.5, 1.5, 0.5]))
-        torch.testing.assert_close(snapshot.colors[1, 0], torch.tensor([0.5, 0.0, 0.5]))
+        first_dir = torch.tensor([1.0, 10.0, 0.0])
+        first_dir = first_dir / first_dir.norm()
+        second_dir = torch.tensor([-1.0, 10.0, 0.0])
+        second_dir = second_dir / second_dir.norm()
+        torch.testing.assert_close(snapshot.colors[0, 0], torch.tensor([0.5, 0.5 + first_dir[0], 0.5 + first_dir[1]]))
+        torch.testing.assert_close(snapshot.colors[1, 0], torch.tensor([0.5, 0.5 + second_dir[0], 0.5 + second_dir[1]]))
 
     def test_rtgs_camera_to_gsplat_inputs_uses_transposed_world_view_transform(self):
         camera = _FakeCamera()

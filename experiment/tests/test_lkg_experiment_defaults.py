@@ -20,6 +20,7 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
     def test_parser_defaults_match_clean_server_layout(self):
         experiment_root = Path(__file__).resolve().parents[1]
         workspace_root = experiment_root.parent
+        generated_root = Path("/data/ysj/result/coherent-raster/generated")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_root = root / "datasets"
@@ -43,9 +44,9 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertTrue((gsplat_root / "gsplat").is_dir(), gsplat_root)
         self.assertEqual(bridge_sdk_root, workspace_root / "Bridge-Python-SDK-Lab")
         self.assertTrue((bridge_sdk_root / "src/bridge_python_sdk").is_dir(), bridge_sdk_root)
-        self.assertEqual(viewpoint_index, experiment_root / "generated" / "lkg_go_1440x2560_66_views_lkg_calibration.npz")
+        self.assertEqual(viewpoint_index, generated_root / "lkg_go_1440x2560_66_views_lkg_calibration.npz")
         self.assertTrue(viewpoint_index.is_file(), viewpoint_index)
-        self.assertEqual(artifact_dir, experiment_root / "generated" / "coherent_raster_experiments")
+        self.assertEqual(artifact_dir, generated_root / "coherent_raster_experiments")
         self.assertEqual(args.width, 1440)
         self.assertEqual(args.height, 2560)
         self.assertEqual(args.views, 66)
@@ -138,11 +139,10 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
             Path("images/cluster_8/looking_glass_tensor.png"),
         )
 
-    def test_web_index_parser_defaults_to_experiment_generated_root(self):
-        experiment_root = Path(__file__).resolve().parents[1]
+    def test_web_index_parser_defaults_to_external_generated_root(self):
         args = build_web_index_parser().parse_args([])
 
-        self.assertEqual(args.experiments_root, str(experiment_root / "generated" / "coherent_raster_experiments"))
+        self.assertEqual(args.experiments_root, "/data/ysj/result/coherent-raster/generated/coherent_raster_experiments")
         self.assertFalse(args.no_regenerate_previews)
 
     def test_open_experiment_resolves_run_and_builds_url(self):

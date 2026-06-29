@@ -4,13 +4,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = THIS_FILE.parents[3]
-
 from lkg_experiment.coherent_default.coherent_raster_experiment import build_experiment_web_assets
 
 
-DEFAULT_EXPERIMENTS_ROOT = REPO_ROOT / "generated" / "coherent_raster_experiments"
+DEFAULT_EXPERIMENTS_ROOT = Path("/data/ysj/result/coherent-raster/generated/coherent_raster_experiments")
 
 
 def build_parser() -> argparse.ArgumentParser:

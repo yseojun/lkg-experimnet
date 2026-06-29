@@ -19,7 +19,7 @@ THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[3]
 CLEAN_ROOT = THIS_FILE.parents[4]
 DEFAULT_BRIDGE_SDK_ROOT = CLEAN_ROOT / "Bridge-Python-SDK-Lab"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "generated"
+DEFAULT_OUTPUT_DIR = Path("/data/ysj/result/coherent-raster/generated")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         help=(
-            "Output .npz path. Default is generated/lkg_go_<native_width>x<native_height>_"
+            f"Output .npz path. Default is {DEFAULT_OUTPUT_DIR}/lkg_go_<native_width>x<native_height>_"
             "<view_count>_views_<method>.npz"
         ),
     )

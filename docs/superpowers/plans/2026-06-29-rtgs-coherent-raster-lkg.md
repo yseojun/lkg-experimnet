@@ -630,14 +630,14 @@ fifth: cluster_size=8, remapping enabled, sampled comparisons plus interlaced ou
 Use the existing calibration artifact unless a different mapping is explicitly selected:
 
 ```text
-experiment/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz
+/data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz
 ```
 
 Expected output:
 
 ```text
-generated/rtgs_coherent/<scene>/<run_label>/rtgs_coherent_lkg.png
-generated/rtgs_coherent/<scene>/<run_label>/metrics.json
+/data/ysj/result/coherent-raster/generated/rtgs_coherent/<scene>/<run_label>/rtgs_coherent_lkg.png
+/data/ysj/result/coherent-raster/generated/rtgs_coherent/<scene>/<run_label>/metrics.json
 ```
 
 - [ ] **Step 7: Run tests and CUDA smoke**

@@ -2,6 +2,7 @@ import random
 import subprocess
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
@@ -20,6 +21,7 @@ class RtgsOfficial1ViewTest(unittest.TestCase):
         )
 
         self.assertIn("rtgs_official_1view", path.parts)
+        self.assertEqual(path.parts[:5], ("/", "data", "ysj", "result", "coherent-raster"))
         self.assertEqual(path.name, "baseline")
 
     def test_parser_requires_dataset_kind_to_avoid_implicit_fallback(self):
@@ -245,6 +247,34 @@ class RtgsOfficial1ViewTest(unittest.TestCase):
         self.assertEqual(values["fl_x"], 730.377)
         self.assertEqual(values["cx"], 676.0)
         self.assertEqual(values["timestamp"], 0.0)
+
+    def test_prepare_official_runtime_returns_shared_render_inputs_without_rendering(self):
+        import torch
+
+        args = official_1view.build_parser().parse_args(["--dataset-kind", "dnerf"])
+        args.no_ssim = False
+        official = types.SimpleNamespace(pipeline_args=types.SimpleNamespace(debug=False), gaussians=object(), model_args=object())
+        gt = torch.zeros(3, 2, 2)
+        camera = types.SimpleNamespace(image_width=2, image_height=2)
+        pipe = types.SimpleNamespace(debug=False)
+        background = torch.zeros(3)
+
+        with (
+            mock.patch.object(official_1view, "load_official_rtgs_scene", return_value=official),
+            mock.patch.object(official_1view, "load_official_rtgs_camera", return_value=(gt, camera, "camera_source")),
+            mock.patch.object(official_1view, "_pipeline_namespace_for_model", return_value=pipe),
+            mock.patch.object(official_1view, "_background_tensor", return_value=background),
+            mock.patch.object(official_1view, "_make_ssim_metric", return_value="ssim_metric"),
+        ):
+            runtime = official_1view.prepare_official_rtgs_1view(args)
+
+        self.assertIs(runtime.official, official)
+        self.assertIs(runtime.camera, camera)
+        self.assertEqual(runtime.camera_source, "camera_source")
+        self.assertIs(runtime.pipe, pipe)
+        self.assertIs(runtime.background, background)
+        self.assertEqual(runtime.ssim_metric, "ssim_metric")
+        self.assertTrue(runtime.gt.is_contiguous())
 
     def test_gaussian_model_kwargs_omit_prefilter_when_constructor_does_not_support_it(self):
         class GaussianModelWithoutPrefilter:

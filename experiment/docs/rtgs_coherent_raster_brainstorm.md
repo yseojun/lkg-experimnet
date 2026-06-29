@@ -352,6 +352,32 @@ Checks:
 
 After CR 1-view outputs exist, compare metrics and images in gate order. If official-vs-snapshot fails, stop and debug snapshot materialization. If snapshot-vs-CR fails, stop and debug CR rasterizer convention, K, viewmat, background, and lookup shape. If the only remaining mismatch is official-vs-CR and the images are still interpretable, continue only with a clearly documented threshold. If the image has geometric corruption, do not start multi-view.
 
+## Task 3 Implementation Note
+
+The first N3DV CR smoke exposed a renderer-convention mismatch, not a model-load failure:
+
+- dnerf `jumpingjacks` matched immediately (`snapshot_vs_cr_psnr=80.720`, `official_vs_cr_psnr=76.551`).
+- N3DV `coffee_martini` initially matched official snapshot (`official_vs_snapshot=51.485`) but failed CR (`snapshot_vs_cr=20.196`).
+- General gsplat rasterization failed in the same way, so the issue was before CoherentRaster lookup/remap.
+- Root cause: N3DV cameras carry positive `fl_x/fl_y/cx/cy` but keep `FoVx/FoVy=-1.0`. RTGS official uses explicit intrinsics for the projection matrix, while the diff Gaussian covariance path still derives focal from the FoV sentinel. gsplat uses one `K` for both mean and covariance projection, so the naive explicit-K path cannot reproduce the trained RTGS renderer.
+
+The implemented adapter keeps the original official camera for baseline/snapshot comparison, but adapts the CR input for sentinel-FoV explicit-intrinsics cameras:
+
+```text
+K_cr focal = width_or_height / (2 * tan(FoV / 2))
+camera-space mean x/y *= explicit_focal / K_cr_focal
+covariance remains in the original RTGS world convention
+```
+
+With this adapter enabled by default:
+
+```text
+dnerf jumpingjacks cam0: snapshot_vs_cr=80.720 dB, official_vs_cr=76.551 dB
+N3DV coffee_martini cam0 frame0: snapshot_vs_cr=54.001 dB, official_vs_cr=49.560 dB
+```
+
+Outputs are written under `/data/ysj/result/coherent-raster/generated/rtgs_cr_1view/...`, and each manifest records `camera_fov_normalization` plus `cr_projection_adapter` so this convention remains auditable.
+
 ### Task 4A: Promote snapshot path into `views66.py`
 
 Replace the old RTGS wrapper loading path in `views66.py` with the same official runtime/snapshot path validated by Task 3.
