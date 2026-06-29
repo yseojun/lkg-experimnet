@@ -5,6 +5,7 @@ import math
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -43,6 +44,7 @@ from lkg_experiment.rtgs_coherent.official_1view import (
 
 
 DEFAULT_CR66_OUTPUT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_cr_66views"
+ASPECT_FIT_CHOICES = ("contain", "fill", "fit")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-model", choices=("pinhole", "ortho", "fisheye"), default="pinhole")
     parser.add_argument("--width", type=int, default=1440)
     parser.add_argument("--height", type=int, default=2560)
+    parser.add_argument(
+        "--aspect-fit",
+        choices=ASPECT_FIT_CHOICES,
+        default="contain",
+        help=(
+            "How to adapt the source camera aspect ratio to --width/--height. "
+            "contain preserves the source frustum inside a centered viewport; "
+            "fill keeps the legacy full-panel crop-to-fill behavior; "
+            "fit keeps the legacy full-panel fit behavior."
+        ),
+    )
     parser.add_argument("--views", type=int, default=66)
     parser.add_argument("--sample-save-views", type=int, default=5)
     parser.add_argument("--sample-view-indices", default=None)
@@ -110,6 +123,101 @@ def default_cr66_output_path(
         suffix = unique_label or datetime.now().strftime("%Y%m%d_%H%M%S")
         leaf = f"{scene_name}_t{float(timestamp):.6f}_{split}_{int(camera_index)}_{suffix}"
     return DEFAULT_CR66_OUTPUT_ROOT / scene_name / leaf
+
+
+@dataclass(frozen=True)
+class AspectViewport:
+    source_width: int
+    source_height: int
+    panel_width: int
+    panel_height: int
+    render_width: int
+    render_height: int
+    offset_x: int
+    offset_y: int
+    scale: float
+    aspect_fit: str
+
+    @property
+    def x1(self) -> int:
+        return self.offset_x + self.render_width
+
+    @property
+    def y1(self) -> int:
+        return self.offset_y + self.render_height
+
+    def to_manifest(self) -> dict[str, Any]:
+        return {
+            "source_width": int(self.source_width),
+            "source_height": int(self.source_height),
+            "panel_width": int(self.panel_width),
+            "panel_height": int(self.panel_height),
+            "render_width": int(self.render_width),
+            "render_height": int(self.render_height),
+            "offset_x": int(self.offset_x),
+            "offset_y": int(self.offset_y),
+            "scale": float(self.scale),
+            "aspect_fit": str(self.aspect_fit),
+        }
+
+
+def resolve_aspect_viewport(
+    *,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    aspect_fit: str = "contain",
+) -> AspectViewport:
+    source_width = int(source_width)
+    source_height = int(source_height)
+    target_width = int(target_width)
+    target_height = int(target_height)
+    aspect_fit = str(aspect_fit)
+    if min(source_width, source_height, target_width, target_height) <= 0:
+        raise ValueError("source and target dimensions must be positive")
+    if aspect_fit not in ASPECT_FIT_CHOICES:
+        raise ValueError(f"unsupported aspect fit mode: {aspect_fit!r}")
+
+    scale_w = float(target_width) / float(source_width)
+    scale_h = float(target_height) / float(source_height)
+    if aspect_fit == "contain":
+        scale = min(scale_w, scale_h)
+        if scale_w <= scale_h:
+            render_width = target_width
+            render_height = int(round(float(source_height) * scale))
+        else:
+            render_width = int(round(float(source_width) * scale))
+            render_height = target_height
+        render_width = max(1, min(target_width, render_width))
+        render_height = max(1, min(target_height, render_height))
+        offset_x = (target_width - render_width) // 2
+        offset_y = (target_height - render_height) // 2
+    else:
+        scale = max(scale_w, scale_h) if aspect_fit == "fill" else min(scale_w, scale_h)
+        render_width = target_width
+        render_height = target_height
+        offset_x = 0
+        offset_y = 0
+
+    return AspectViewport(
+        source_width=source_width,
+        source_height=source_height,
+        panel_width=target_width,
+        panel_height=target_height,
+        render_width=render_width,
+        render_height=render_height,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        scale=scale,
+        aspect_fit=aspect_fit,
+    )
+
+
+def camera_crop_to_fill_for_viewport(viewport: AspectViewport, *, no_crop_to_fill: bool) -> bool:
+    if viewport.aspect_fit == "fill":
+        return not bool(no_crop_to_fill)
+    return False
 
 
 def resolve_sample_view_indices(views: int, sample_save_views: int, explicit: str | None) -> list[int]:
@@ -298,16 +406,26 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
         enabled=bool(args.normalize_explicit_intrinsics_fov),
     )
     timestamp = float(getattr(cr_anchor_camera_cuda, "timestamp", 0.0))
-    width = int(args.width)
-    height = int(args.height)
+    panel_width = int(args.width)
+    panel_height = int(args.height)
+    viewport = resolve_aspect_viewport(
+        source_width=int(cr_anchor_camera_cuda.image_width),
+        source_height=int(cr_anchor_camera_cuda.image_height),
+        target_width=panel_width,
+        target_height=panel_height,
+        aspect_fit=str(args.aspect_fit),
+    )
+    render_width = int(viewport.render_width)
+    render_height = int(viewport.render_height)
+    crop_to_fill = camera_crop_to_fill_for_viewport(viewport, no_crop_to_fill=bool(args.no_crop_to_fill))
     source_view_count = int(args.views)
     sample_indices = resolve_sample_view_indices(source_view_count, int(args.sample_save_views), args.sample_view_indices)
     sample_set = set(sample_indices)
 
     viewpoint_index, map_metadata = build_66view_viewpoint_index(
         args,
-        width=width,
-        height=height,
+        width=panel_width,
+        height=panel_height,
         source_view_count=source_view_count,
     )
     view_index_stats = validate_viewpoint_index(viewpoint_index, source_view_count=source_view_count)
@@ -345,13 +463,19 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
 
     print(
         f"Rendering RTGS+CR {source_view_count} views for {runtime.official.scene_name} "
-        f"({width}x{height}, sampled={sample_indices}, interlace={bool(args.write_interlaced)})",
+        f"(panel={panel_width}x{panel_height}, render={render_width}x{render_height}"
+        f"+{viewport.offset_x}+{viewport.offset_y}, aspect_fit={viewport.aspect_fit}, "
+        f"sampled={sample_indices}, interlace={bool(args.write_interlaced)})",
         file=sys.stderr,
         flush=True,
     )
 
     viewpoint_index_t = torch.as_tensor(viewpoint_index, dtype=torch.long, device=args.device)
-    interlaced = torch.zeros((3, height, width), dtype=torch.float32, device=args.device) if bool(args.write_interlaced) else None
+    interlaced = (
+        torch.zeros((3, panel_height, panel_width), dtype=torch.float32, device=args.device)
+        if bool(args.write_interlaced)
+        else None
+    )
     sampled_metrics: dict[str, Any] = {}
     sampled_adapter_info: dict[str, Any] = {}
     render_timings: dict[str, Any] = {"views_ms": {}, "official_sampled_ms": {}}
@@ -366,9 +490,9 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
             image_name=f"view_{view_id:03d}",
             timestamp=timestamp,
             device=args.device,
-            width=width,
-            height=height,
-            crop_to_fill=not bool(args.no_crop_to_fill),
+            width=render_width,
+            height=render_height,
+            crop_to_fill=crop_to_fill,
         ).cuda()
         viewmat, K = rtgs_camera_to_gsplat_inputs(synthetic_camera, device=args.device)
         colors = evaluate_rtgs_colors(
@@ -396,8 +520,8 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
             snapshot=cr_snapshot,
             viewmat=viewmat,
             K=cr_K,
-            width=width,
-            height=height,
+            width=render_width,
+            height=render_height,
             tile_size=int(args.tile_size),
             near_plane=float(args.near_plane),
             far_plane=float(args.far_plane),
@@ -409,7 +533,7 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
         render_timings["views_ms"][f"view_{view_id:03d}"] = (time.perf_counter() - start) * 1000.0
 
         if interlaced is not None:
-            accumulate_interlaced_view(interlaced, cr_image, viewpoint_index_t, view_id=view_id)
+            accumulate_interlaced_view(interlaced, cr_image, viewpoint_index_t, view_id=view_id, viewport=viewport)
 
         if view_id in sample_set:
             save_tensor_image(sampled_dir / f"view_{view_id:03d}_cr.png", cr_image)
@@ -460,8 +584,14 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
         "camera_index": int(args.camera_index),
         "n3dv_frame_index": int(args.n3dv_frame_index),
         "timestamp": timestamp,
-        "width": width,
-        "height": height,
+        "width": panel_width,
+        "height": panel_height,
+        "panel_width": panel_width,
+        "panel_height": panel_height,
+        "render_width": render_width,
+        "render_height": render_height,
+        "aspect_fit": str(args.aspect_fit),
+        "content_viewport": viewport.to_manifest(),
         "views": source_view_count,
         "sampled_view_indices": sample_indices,
         "cluster_size": int(args.cluster_size),
@@ -570,12 +700,34 @@ def synthesize_flat_viewmats(
     return synthesizer(c2w, orbit_center).reshape(-1, 4, 4)[: int(source_view_count)].contiguous()
 
 
-def accumulate_interlaced_view(interlaced: Any, image: Any, viewpoint_index_t: Any, *, view_id: int) -> None:
-    if tuple(image.shape) != tuple(interlaced.shape):
-        raise ValueError(f"image shape {tuple(image.shape)} does not match interlaced shape {tuple(interlaced.shape)}")
+def accumulate_interlaced_view(
+    interlaced: Any,
+    image: Any,
+    viewpoint_index_t: Any,
+    *,
+    view_id: int,
+    viewport: AspectViewport | None = None,
+) -> None:
+    if viewport is None:
+        if tuple(image.shape) != tuple(interlaced.shape):
+            raise ValueError(f"image shape {tuple(image.shape)} does not match interlaced shape {tuple(interlaced.shape)}")
+        target = interlaced
+        view_index = viewpoint_index_t
+    else:
+        expected_interlaced_shape = (3, int(viewport.panel_height), int(viewport.panel_width))
+        expected_image_shape = (3, int(viewport.render_height), int(viewport.render_width))
+        if tuple(interlaced.shape) != expected_interlaced_shape:
+            raise ValueError(f"interlaced shape {tuple(interlaced.shape)} does not match {expected_interlaced_shape}")
+        if tuple(image.shape) != expected_image_shape:
+            raise ValueError(f"image shape {tuple(image.shape)} does not match {expected_image_shape}")
+        if tuple(viewpoint_index_t.shape[:2]) != (int(viewport.panel_height), int(viewport.panel_width)):
+            raise ValueError("viewpoint_index_t panel shape does not match viewport panel dimensions")
+        target = interlaced[:, viewport.offset_y : viewport.y1, viewport.offset_x : viewport.x1]
+        view_index = viewpoint_index_t[viewport.offset_y : viewport.y1, viewport.offset_x : viewport.x1, :]
+
     for channel in range(3):
-        mask = viewpoint_index_t[:, :, channel] == int(view_id)
-        interlaced[channel][mask] = image[channel][mask]
+        mask = view_index[:, :, channel] == int(view_id)
+        target[channel][mask] = image[channel][mask]
 
 
 def summarize_sampled_metrics(sampled_metrics: Mapping[str, Mapping[str, float]]) -> dict[str, float | int | None]:

@@ -32,6 +32,7 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertEqual(args.interlace_mode, "compose")
         self.assertTrue(args.write_interlaced)
         self.assertTrue(args.compare_official_sampled)
+        self.assertEqual(args.aspect_fit, "contain")
 
     def test_evenly_spaced_sample_indices_cover_first_middle_last(self):
         self.assertEqual(cr_66views.resolve_sample_view_indices(66, 5, None), [0, 16, 32, 49, 65])
@@ -60,6 +61,83 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertTrue(torch.allclose(image[0], torch.full((2, 2), 0.25)))
         self.assertTrue(torch.allclose(image[1], torch.full((2, 2), 0.75)))
         self.assertTrue(torch.allclose(image[2], torch.full((2, 2), 0.25)))
+
+    def test_resolve_aspect_viewport_contains_n3dv_inside_lkg_panel(self):
+        viewport = cr_66views.resolve_aspect_viewport(
+            source_width=1352,
+            source_height=1014,
+            target_width=1440,
+            target_height=2560,
+            aspect_fit="contain",
+        )
+
+        self.assertEqual(viewport.panel_width, 1440)
+        self.assertEqual(viewport.panel_height, 2560)
+        self.assertEqual(viewport.render_width, 1440)
+        self.assertEqual(viewport.render_height, 1080)
+        self.assertEqual(viewport.offset_x, 0)
+        self.assertEqual(viewport.offset_y, 740)
+        self.assertAlmostEqual(viewport.scale, 1440.0 / 1352.0)
+
+    def test_resolve_aspect_viewport_contains_square_dnerf_inside_lkg_panel(self):
+        viewport = cr_66views.resolve_aspect_viewport(
+            source_width=400,
+            source_height=400,
+            target_width=1440,
+            target_height=2560,
+            aspect_fit="contain",
+        )
+
+        self.assertEqual(viewport.render_width, 1440)
+        self.assertEqual(viewport.render_height, 1440)
+        self.assertEqual(viewport.offset_x, 0)
+        self.assertEqual(viewport.offset_y, 560)
+        self.assertAlmostEqual(viewport.scale, 3.6)
+
+    def test_resolve_aspect_viewport_can_keep_legacy_full_frame_fill_mode(self):
+        viewport = cr_66views.resolve_aspect_viewport(
+            source_width=1352,
+            source_height=1014,
+            target_width=1440,
+            target_height=2560,
+            aspect_fit="fill",
+        )
+
+        self.assertEqual(viewport.render_width, 1440)
+        self.assertEqual(viewport.render_height, 2560)
+        self.assertEqual(viewport.offset_x, 0)
+        self.assertEqual(viewport.offset_y, 0)
+        self.assertAlmostEqual(viewport.scale, 2560.0 / 1014.0)
+
+    def test_accumulate_interlaced_view_respects_content_viewport(self):
+        interlaced = torch.zeros((3, 4, 5), dtype=torch.float32)
+        image = torch.ones((3, 2, 3), dtype=torch.float32)
+        viewpoint_index = torch.zeros((4, 5, 3), dtype=torch.long)
+        viewpoint_index[1:3, 1:4, :] = 7
+        viewport = cr_66views.AspectViewport(
+            source_width=6,
+            source_height=4,
+            panel_width=5,
+            panel_height=4,
+            render_width=3,
+            render_height=2,
+            offset_x=1,
+            offset_y=1,
+            scale=0.5,
+            aspect_fit="contain",
+        )
+
+        cr_66views.accumulate_interlaced_view(
+            interlaced,
+            image,
+            viewpoint_index,
+            view_id=7,
+            viewport=viewport,
+        )
+
+        self.assertTrue(torch.allclose(interlaced[:, 1:3, 1:4], torch.ones((3, 2, 3))))
+        self.assertTrue(torch.allclose(interlaced[:, :1, :], torch.zeros((3, 1, 5))))
+        self.assertTrue(torch.allclose(interlaced[:, 3:, :], torch.zeros((3, 1, 5))))
 
     def test_synthetic_camera_preserves_n3dv_negative_fov_sentinel(self):
         anchor = SimpleNamespace(

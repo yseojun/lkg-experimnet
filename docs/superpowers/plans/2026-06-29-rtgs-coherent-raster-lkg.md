@@ -756,6 +756,22 @@ manifest records sampled view indices, cluster size, remapping mode, camera FoV 
 
 Stop after reporting Task 4 status and ask whether to commit or open a PR.
 
+## Aspect Ratio Follow-Up
+
+**Observation, 2026-06-29:** Changing the requested panel resolution from the source camera aspect ratio to the 1440x2560 LKG portrait panel reintroduced N3DV-looking projection artifacts when the renderer used the legacy full-panel crop-to-fill policy. Existing helpers such as `scale_intrinsics_to_resolution()` only scale intrinsics into the full target frame; they do not create an aspect-preserving content viewport.
+
+**Decision:** `rtgs_cr_66views.py` now uses `--aspect-fit contain` by default. The requested `--width/--height` remain the final panel image size, but CR and sampled official comparison renders are performed inside a centered source-aspect viewport. The interlaced output keeps the full panel resolution and leaves the outside area black. Legacy full-panel behavior remains available with `--aspect-fit fill`, and full-panel fit behavior remains available with `--aspect-fit fit`.
+
+**Verified outputs:**
+
+```text
+dnerf jumpingjacks 160x160 -> viewport 160x160+0+0, sampled mean PSNR 80.417 dB
+dnerf jumpingjacks 360x640 -> viewport 360x360+0+140, sampled mean PSNR 82.954 dB
+N3DV coffee_martini 338x254 -> viewport 338x254+0+0, sampled mean PSNR 60.257 dB
+N3DV coffee_martini 360x640 -> viewport 360x270+0+185, sampled mean PSNR 60.079 dB
+N3DV coffee_martini 1440x2560 -> viewport 1440x1080+0+740, 66-view LKG image size 1440x2560
+```
+
 ## Review Checklist
 
 - [x] Task 1 establishes a commit-able RTGS official 1-view baseline.
