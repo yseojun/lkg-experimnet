@@ -40,8 +40,8 @@ N3DV_FRAME_INDEX="${N3DV_FRAME_INDEX:-0}"
 WIDTH="${WIDTH:-1440}"
 HEIGHT="${HEIGHT:-2560}"
 VIEWS="${VIEWS:-66}"
-ENGINE="${ENGINE:-compose}"
-CLUSTERS="${CLUSTERS:-2,4,8,16}"
+EXPERIMENT_ENGINE="one_shot"
+CLUSTERS="${CLUSTERS:-1,2,4,8,16}"
 ABATION_CLUSTER_DEFAULT="8"
 ABLATION_CLUSTER="${ABLATION_CLUSTER:-$ABATION_CLUSTER_DEFAULT}"
 VIEW_DEGREE="${VIEW_DEGREE:-53.0}"
@@ -155,7 +155,7 @@ for scene in "${scenes[@]}"; do
     dataset_kind="$(dataset_kind_for_scene "$scene")"
     printf -v camera_label "cam%03d" "$CAMERA_INDEX"
     printf -v frame_label "frame%04d" "$N3DV_FRAME_INDEX"
-    run_id="${scene}_${ENGINE}_${SPLIT}_${camera_label}_${frame_label}"
+    run_id="${scene}_${EXPERIMENT_ENGINE}_${SPLIT}_${camera_label}_${frame_label}"
     run_dir="$ARTIFACT_DIR/$run_id"
 
     if [[ ! -f "$checkpoint_path" ]]; then
@@ -170,7 +170,6 @@ for scene in "${scenes[@]}"; do
     cmd=(
         "$PYTHON_BIN"
         "$ROOT_DIR/rtgs_cr_experiment.py"
-        --engine "$ENGINE"
         --dataset-kind "$dataset_kind"
         --model-path "$model_path"
         --checkpoint "$CHECKPOINT"

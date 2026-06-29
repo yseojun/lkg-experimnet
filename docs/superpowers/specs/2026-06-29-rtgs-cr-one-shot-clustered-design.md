@@ -146,7 +146,7 @@ This cannot be represented by the current `rasterization_CR` Python API because 
 
 ## Recommended Architecture
 
-Keep `compose` as the correctness baseline and complete the existing `clustered` engine as the one-shot CR engine. Do not replace `compose` until `clustered cluster_size=1` matches it for both dnerf and N3DV.
+Current status: `cluster_size=1` one-shot has matched the old compose baseline for dnerf and N3DV, so `rtgs_cr_experiment.py` is now a one-shot-only experiment runner. The user-facing engine name is `one_shot`; the old `compose` and `clustered` experiment-engine names should not be used in new commands.
 
 The implementation should introduce a focused one-shot module instead of growing `cr_experiment.py` further:
 
@@ -164,11 +164,11 @@ Responsibilities:
 - unpatchify/unpad the viewport output;
 - paste the viewport output into the final panel-sized interlaced tensor.
 
-`cr_experiment.py` should only select the engine, time it, save artifacts, and write metrics.
+`cr_experiment.py` should time one-shot variants, save artifacts, and write metrics.
 
 ## Viewport Handling
 
-The existing `compose` path supports aspect-preserving 1440x2560 rendering by rendering only the content viewport and placing it inside the panel. The current `clustered` path rejects non-full-panel viewports.
+The one-shot path supports aspect-preserving 1440x2560 rendering by rendering only the content viewport and placing it inside the panel.
 
 The one-shot path should support the same viewport contract. The viewport crop must happen before lookup construction:
 
@@ -403,19 +403,20 @@ Cases:
 
 Cases:
 
-- `--engine clustered` no longer repeats the compose variant;
-- `clustered` rows preserve the existing metrics schema;
+- `--engine compose` is rejected and the default engine is `one_shot`;
+- one-shot rows preserve the existing metrics schema;
+- timing, quality, resource, and resolution columns follow `experiment/docs/rtgs_cr_metric_columns.md` and the Korean reference `experiment/docs/rtgs_cr_metric_columns_ko.md`;
 - manifest records `render_call_count=1` for one-shot timing iterations;
-- `compose` remains available and unchanged.
+- the experiment script does not pass an engine flag and defaults to one-shot.
 
 ### Clustered Metric Tests
 
 Cases:
 
-- sampled clustered views are rendered through a constant-view lookup, equivalent to the 3DGS helper `constant_view_index_like()`;
-- clustered sampled metrics compare one-shot CR views against official RTGS sampled views;
+- sampled one-shot views are rendered through a constant-view lookup, equivalent to the 3DGS helper `constant_view_index_like()`;
+- one-shot sampled metrics compare one-shot CR views against official RTGS sampled views;
 - interlaced one-shot output is compared against compose interlaced output;
-- `compute_compose_metric_stats()` is not reused as the only metric source for clustered rows.
+- `compute_sampled_view_metric_stats()` is the sampled-view metric entry point for one-shot experiment rows.
 
 ## Validation Commands
 
@@ -428,7 +429,6 @@ cd /home/ysj/lkg-experiment/experiment
 conda activate rtgs-coherent-cu121
 
 PYTHONPATH=src python rtgs_cr_experiment.py \
-  --engine clustered \
   --dataset-kind dnerf \
   --model-path /data/ysj/result/4dgs/RTGS/jumpingjacks \
   --checkpoint checkpoints/chkpnt_best.pth \
@@ -436,7 +436,7 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
   --gsplat-root /home/ysj/lkg-experiment/gsplat \
   --dataset-root /data/ysj/dataset/dnerf \
   --artifact-dir /data/ysj/result/coherent-raster/generated/rtgs_cr_experiments \
-  --run-id jumpingjacks_clustered_smoke \
+  --run-id jumpingjacks_one_shot_smoke \
   --width 320 \
   --height 320 \
   --views 66 \
@@ -448,11 +448,10 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
   --skip-web-assets
 ```
 
-N3DV one-shot acceptance should not be run until Phase C exists. Before Phase C, the command below is only a diagnostic after viewport-aware clustered rendering is implemented and the existing letterbox guard is removed:
+N3DV one-shot acceptance command:
 
 ```bash
 PYTHONPATH=src python rtgs_cr_experiment.py \
-  --engine clustered \
   --dataset-kind n3dv \
   --model-path /data/ysj/result/4dgs/RTGS/coffee_martini \
   --checkpoint checkpoints/chkpnt_best.pth \
@@ -460,7 +459,7 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
   --gsplat-root /home/ysj/lkg-experiment/gsplat \
   --n3dv-root /data/ysj/dataset/N3DV \
   --artifact-dir /data/ysj/result/coherent-raster/generated/rtgs_cr_experiments \
-  --run-id coffee_martini_clustered_smoke \
+  --run-id coffee_martini_one_shot_smoke \
   --width 320 \
   --height 568 \
   --views 66 \
@@ -478,13 +477,13 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
 - The current `rasterization_CR` effectively supports one shared `K` in this path. If per-cluster or per-view intrinsics are required later, `rasterization_CR()`, `isect_tiles_CR()`, and `intersect_tile_kernel_CR_AccuTile()` must all be extended together.
 - `cluster_size>1` intentionally reuses covariance/depth/color and may reduce quality. `cluster_size=1` must remain the correctness baseline.
 - Full-resolution 1440x2560 one-shot may expose VRAM pressure from `means2d/conics/colors [C,N,...]`, especially for `cluster_size=1` where `C=66`.
-- Clustered rows can be misleading if they only report compose-style sampled metrics. The experiment must report clustered sampled metrics and one-shot-vs-compose interlaced PSNR.
+- One-shot rows can be misleading if they only report old compose-style sampled metrics. The experiment must report one-shot sampled metrics and, for acceptance runs, one-shot-vs-compose interlaced PSNR.
 
 ## Recommended Next Implementation Order
 
 1. Add `cr_one_shot.py` with viewport lookup, grouped viewmat, color evaluation, and one-shot call helpers.
 2. Add tests for shape contracts, viewport cropping, and adapter decision metadata.
-3. Wire `cr_experiment.py --engine clustered` to the new helper for dnerf/FoV-positive cameras.
+3. Wire `cr_experiment.py` to the new one-shot helper for dnerf/FoV-positive cameras.
 4. Validate dnerf `cluster_size=1` against compose.
 5. Add explicit N3DV diagnostic failure mode so old bad behavior is documented and cannot be mistaken for success.
 6. Extend CR projection kernels for the RTGS mean adapter.
@@ -511,6 +510,7 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
 - 2026-06-29: Added the sentinel-FoV RTGS projection adapter to the grouped CR CUDA projection and tile-intersection kernels, removed the temporary N3DV clustered guard, and validated `coffee_martini` clustered `cluster=2` with `rtgs_compat_projection=True`:
   - 64x112 smoke with generated linear view map: `n3dv_cluster_adapter_smoke`;
   - 1440x2560 LKG run with calibration view map: `n3dv_cluster_adapter_fullres`, `frame_ms=526.160`, `fps=1.901`, `peak_vram_gb=15.289`.
+- 2026-06-29: Renamed the experiment runner engine to `one_shot`, removed the old compose experiment branch, made `cluster_1` part of the default sweep (`1,2,4,8,16`), and updated `run_rtgs_cr_experiments_all.sh` to stop passing `--engine`.
 
 ## Sub-Agent Review Notes
 

@@ -31,12 +31,12 @@ from lkg_experiment.rtgs_coherent.cr_1view import adapt_snapshot_for_rtgs_compat
 
 
 DEFAULT_RTGS_CR_EXPERIMENT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_cr_experiments"
-ENGINE_CHOICES = ("compose", "clustered")
+ENGINE_CHOICES = ("one_shot",)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = cr_66views.build_parser()
-    parser.description = "Run RTGS + CoherentRaster experiments with 3DGS experiment-compatible artifacts"
+    parser.description = "Run one-shot RTGS + CoherentRaster experiments with 3DGS experiment-compatible artifacts"
     parser.add_argument("--artifact-dir", default=str(DEFAULT_RTGS_CR_EXPERIMENT_ROOT))
     parser.add_argument("--run-id", help="Output run directory name")
     parser.add_argument("--output-prefix", default="", help="Prefix for per-camera images inside a run")
@@ -44,15 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--engine",
         choices=ENGINE_CHOICES,
-        default="compose",
-        help="compose uses the current verified RTGS-compatible per-view CR path; clustered uses CR grouped views when supported",
+        default="one_shot",
+        help="Experiment engine. Only one_shot grouped CoherentRaster rendering is supported.",
     )
-    parser.add_argument("--clusters", default="2,4,8,16")
-    parser.add_argument(
-        "--compose-repeat-variants",
-        action="store_true",
-        help="Repeat compose timing for every cluster/ablation row. By default compose renders once because clusters do not affect it.",
-    )
+    parser.add_argument("--clusters", default="1,2,4,8,16")
     parser.add_argument("--ablation-cluster", default=8, type=int)
     parser.add_argument("--no-without-remap", action="store_true")
     parser.add_argument("--no-without-reuse", action="store_true")
@@ -84,8 +79,6 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
 
     device = str(args.device)
     context = cr_66views.prepare_rtgs_cr_66_context(args)
-    if str(args.engine) == "clustered":
-        ensure_clustered_engine_supported(context)
 
     run_id = args.run_id or make_run_id(
         model_path=Path(args.model_path),
@@ -136,20 +129,12 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-        if str(args.engine) == "compose":
-            interlaced, timing = time_compose_renderer(
-                context,
-                warmup_iters=int(args.warmup_iters),
-                measure_iters=int(args.measure_iters),
-                progress_label=f"compose/{variant.name}",
-            )
-        else:
-            interlaced, timing = time_clustered_renderer(
-                context,
-                variant=variant,
-                warmup_iters=int(args.warmup_iters),
-                measure_iters=int(args.measure_iters),
-            )
+        interlaced, timing = time_one_shot_renderer(
+            context,
+            variant=variant,
+            warmup_iters=int(args.warmup_iters),
+            measure_iters=int(args.measure_iters),
+        )
         last_interlaced = interlaced
         writer.save_tensor_image(
             image_artifact_path(variant.name, "looking_glass_tensor.png", output_prefix=str(args.output_prefix)),
@@ -167,7 +152,7 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
 
         metrics = None
         if not bool(args.skip_metrics):
-            metrics = compute_compose_metric_stats(context, metric_view_indices)
+            metrics = compute_sampled_view_metric_stats(context, metric_view_indices)
         rows.append(
             build_metric_row(
                 variant=variant,
@@ -222,16 +207,6 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def resolve_experiment_variants(args: argparse.Namespace) -> list[ExperimentVariant]:
-    if str(args.engine) == "compose" and not bool(args.compose_repeat_variants):
-        return [
-            ExperimentVariant(
-                name="compose",
-                cluster_size=1,
-                use_remapping=True,
-                reuse_enabled=False,
-                group="compose",
-            )
-        ]
     return build_experiment_variants(
         parse_cluster_values(args.clusters),
         ablation_cluster=int(args.ablation_cluster),
@@ -286,9 +261,10 @@ def build_metric_row(
     return row
 
 
-def time_compose_renderer(
+def time_one_shot_renderer(
     context: cr_66views.RtgsCr66RenderContext,
     *,
+    variant: Any | None = None,
     warmup_iters: int,
     measure_iters: int,
     render_fn: Callable[[cr_66views.RtgsCr66RenderContext], tuple[Any, float]] | None = None,
@@ -297,7 +273,11 @@ def time_compose_renderer(
     if int(warmup_iters) < 0 or int(measure_iters) <= 0:
         raise ValueError("warmup_iters must be non-negative and measure_iters must be positive")
     if render_fn is None:
-        render_fn = _render_compose_once
+        if variant is None:
+            raise ValueError("variant is required when render_fn is not provided")
+        render_fn = lambda current_context: render_one_shot_interlaced_once(current_context, variant=variant)
+        if progress_label is None:
+            progress_label = f"one_shot/{variant.name}"
     _reset_cuda_peak_memory()
     last = None
     total_ms = 0.0
@@ -316,31 +296,13 @@ def time_compose_renderer(
     return last, TimingStats(fps=fps, frame_ms=average_ms, peak_vram_gb=_peak_vram_gb())
 
 
-def time_clustered_renderer(
-    context: cr_66views.RtgsCr66RenderContext,
-    *,
-    variant: Any,
-    warmup_iters: int,
-    measure_iters: int,
-) -> tuple[Any, TimingStats]:
-    ensure_clustered_engine_supported(context)
-    render_fn = lambda current_context: render_clustered_interlaced_once(current_context, variant=variant)
-    return time_compose_renderer(
-        context,
-        warmup_iters=warmup_iters,
-        measure_iters=measure_iters,
-        render_fn=render_fn,
-        progress_label=f"clustered/{variant.name}",
-    )
-
-
-def render_clustered_interlaced_once(context: cr_66views.RtgsCr66RenderContext, *, variant: Any):
+def render_one_shot_interlaced_once(context: cr_66views.RtgsCr66RenderContext, *, variant: Any):
     from lkg_experiment.rtgs_coherent import cr_one_shot
 
     return cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(context, variant=variant)
 
 
-def compute_compose_metric_stats(
+def compute_sampled_view_metric_stats(
     context: cr_66views.RtgsCr66RenderContext,
     metric_view_indices: Sequence[int],
 ) -> MetricStats:
@@ -467,10 +429,6 @@ def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderConte
     return interlaced.clamp(0.0, 1.0).contiguous()
 
 
-def ensure_clustered_engine_supported(context: Any) -> None:
-    return None
-
-
 def build_manifest(
     *,
     args: argparse.Namespace,
@@ -525,15 +483,6 @@ def build_manifest(
     }
 
 
-def _render_compose_once(context: cr_66views.RtgsCr66RenderContext, *, progress_label: str | None = None):
-    return cr_66views.render_rtgs_cr_66_interlaced_frame(
-        context,
-        debug=bool(context.args.debug_cr),
-        progress_label=progress_label,
-        progress_every_views=int(context.args.progress_every_views),
-    )
-
-
 def _call_render_fn(
     render_fn: Callable[..., tuple[Any, float]],
     context: cr_66views.RtgsCr66RenderContext,
@@ -550,14 +499,9 @@ def _call_render_fn(
 
 
 def _engine_notes(engine: str) -> dict[str, Any]:
-    if engine == "compose":
-        return {
-            "cluster_affects_render": False,
-            "description": "Validated RTGS-compatible path renders each synthetic view independently and composes LKG subpixels.",
-        }
     return {
         "cluster_affects_render": True,
-        "description": "Grouped CoherentRaster path with RTGS-compatible projection adapter support for sentinel-FoV cameras.",
+        "description": "One-shot grouped CoherentRaster path with RTGS-compatible projection adapter support for sentinel-FoV cameras.",
     }
 
 
