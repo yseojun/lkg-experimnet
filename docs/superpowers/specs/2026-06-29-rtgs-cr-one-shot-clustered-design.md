@@ -497,8 +497,17 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
 - 2026-06-29: Wired `cr_experiment.py --engine clustered` to delegate rendering through the new one-shot module.
 - 2026-06-29: Removed the positive-FoV letterbox guard because one-shot now renders the content viewport instead of the full panel.
 - 2026-06-29: Validated a 64x64 dnerf `jumpingjacks` smoke run. `cluster_size=1` one-shot and compose interlaced PNGs matched exactly (`MSE=0`, `MAE=0`, `PSNR=inf`).
+- 2026-06-29: Validated full LKG 1440x2560 dnerf `jumpingjacks` runs:
+  - clustered one-shot: `jumpingjacks_clustered_lkg1440x2560_codex_20260629`, `frame_ms=458.176`, `fps=2.183`, `peak_vram_gb=2.846`;
+  - compose baseline: `jumpingjacks_compose_lkg1440x2560_codex_20260629`, `frame_ms=32525.305`, `fps=0.031`, `peak_vram_gb=2.252`;
+  - interlaced PNG comparison: `MSE=0`, `MAE=0`, `PSNR=inf`.
 - 2026-06-29: Validated a 64x112 N3DV `coffee_martini` compose smoke run. The content viewport resolved to `64x48+0+32`, confirming the letterboxed N3DV compose path still works.
 - 2026-06-29: Confirmed N3DV clustered with `rtgs_compat_projection=True` stops at the intended sentinel-FoV guard. A diagnostic `--no-rtgs-compat-projection` clustered run executed and produced a 64x112 image; versus compose it measured `MSE=0.00021566`, `MAE=0.00593724`, `PSNR=36.662 dB`. This is diagnostic only and does not replace Phase C kernel adapter acceptance.
+- 2026-06-29: Validated full LKG 1440x2560 N3DV `coffee_martini` runs:
+  - compose baseline: `coffee_martini_compose_lkg1440x2560_codex_20260629`, content viewport `1440x1080+0+740`, `frame_ms=27172.960`, `fps=0.037`, `peak_vram_gb=10.516`;
+  - clustered with `rtgs_compat_projection=True`: stopped at the intended sentinel-FoV guard;
+  - diagnostic clustered with `--no-rtgs-compat-projection`: `coffee_martini_clustered_no_adapter_lkg1440x2560_codex_20260629`, `frame_ms=582.383`, `fps=1.717`, `peak_vram_gb=19.857`;
+  - diagnostic clustered versus compose: `MSE=0.00487815`, `MAE=0.03059597`, `PSNR=23.117 dB`, confirming this is not an acceptance result before the Phase C adapter.
 - 2026-06-29: Kept the sentinel-FoV RTGS projection adapter guard in place. N3DV clustered acceptance still requires the kernel-level adapter work described in Phase C.
 
 ## Sub-Agent Review Notes
