@@ -503,7 +503,7 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
     )
     (output_dir / "manifest.json").write_text(_json_dumps(manifest), encoding="utf-8")
     print(
-        f"Wrote {output_dir} (sampled_mean_psnr={metrics_summary.get('psnr_mean', float('nan')):.3f})",
+        f"Wrote {output_dir} (sampled_mean_psnr={format_optional_metric(metrics_summary.get('psnr_mean'))})",
         file=sys.stderr,
         flush=True,
     )
@@ -591,6 +591,18 @@ def summarize_sampled_metrics(sampled_metrics: Mapping[str, Mapping[str, float]]
             summary[f"{key}_min"] = None
             summary[f"{key}_max"] = None
     return summary
+
+
+def format_optional_metric(value: Any, *, precision: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(numeric):
+        return "n/a"
+    return f"{numeric:.{int(precision)}f}"
 
 
 def save_tensor_image(path: Path, tensor: Any) -> None:

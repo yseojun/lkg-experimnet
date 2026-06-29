@@ -98,6 +98,12 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         render.assert_called_once()
 
+    def test_format_optional_metric_handles_missing_sampled_comparisons(self):
+        summary = cr_66views.summarize_sampled_metrics({})
+
+        self.assertIsNone(summary["psnr_mean"])
+        self.assertEqual(cr_66views.format_optional_metric(summary["psnr_mean"]), "n/a")
+
 
 if __name__ == "__main__":
     unittest.main()
