@@ -99,6 +99,7 @@ def render_rtgs_66_views(args: Any) -> int:
         config_path=args.config,
         device=args.device,
         checkpoint_load_device=args.checkpoint_load_device,
+        rotation_convention=args.rtgs_rotation_convention,
     )
     _, anchor_camera = load_rtgs_camera(
         checkpoint=checkpoint,
@@ -266,6 +267,7 @@ def render_rtgs_66_views(args: Any) -> int:
         "gaussians_snapshot": int(geometry.means.shape[0]),
         "active_sh_degree": int(checkpoint.model.active_sh_degree),
         "active_sh_degree_t": int(checkpoint.model.active_sh_degree_t),
+        "rtgs_rotation_convention": str(checkpoint.model.rotation_convention),
         "map_metadata": map_metadata,
         "write_interlaced": bool(args.write_interlaced),
         "write_per_view": bool(args.write_per_view),

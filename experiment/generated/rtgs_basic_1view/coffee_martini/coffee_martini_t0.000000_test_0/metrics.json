@@ -1,0 +1,339 @@
+{
+  "active_sh_degree": 3,
+  "active_sh_degree_t": 2,
+  "args": {
+    "background": "auto",
+    "camera_index": 0,
+    "checkpoint": "checkpoints/chkpnt_best.pth",
+    "checkpoint_load_device": "cpu",
+    "compare_official": true,
+    "compute_cov3d_python": "config",
+    "config": null,
+    "convert_shs_python": "config",
+    "dataset_root": "/data/ysj/dataset/dnerf",
+    "device": "cuda",
+    "diagnostic_sample_count": 4096,
+    "model_path": "/data/ysj/result/4dgs/RTGS/coffee_martini",
+    "n3dv_frame_index": 0,
+    "n3dv_root": "/data/ysj/dataset/N3DV",
+    "no_ssim": true,
+    "official_output_index": null,
+    "official_result_name": "ours_best",
+    "output_dir": null,
+    "rtgs_code_root": "/home/ysj/lkg-experiment/4d-gaussian-splatting",
+    "rtgs_rotation_convention": "current",
+    "source_path_override": null,
+    "split": "test",
+    "write_diagnostics": true
+  },
+  "camera_diagnostics": {
+    "FoVx": 1.4935054002830719,
+    "FoVy": 1.2135940334461468,
+    "camera_center": [
+      3.8720550537109375,
+      -0.43790140748023987,
+      0.36619842052459717
+    ],
+    "cx": 676.0,
+    "cy": 507.0,
+    "fl_x": 730.3771702081667,
+    "fl_y": 730.3771702081667,
+    "full_proj_transform": [
+      [
+        0.09910847991704941,
+        0.034881822764873505,
+        -0.995589017868042,
+        -0.9954894781112671
+      ],
+      [
+        1.0753264427185059,
+        -0.04958793520927429,
+        0.09088115394115448,
+        0.09087206423282623
+      ],
+      [
+        -0.034645866602659225,
+        -1.43930983543396,
+        -0.02725929580628872,
+        -0.027256568893790245
+      ],
+      [
+        0.09982071071863174,
+        0.3702939450740814,
+        3.8947536945343018,
+        3.9043641090393066
+      ]
+    ],
+    "image_height": 1014,
+    "image_width": 1352,
+    "projection_matrix": [
+      [
+        1.080439567565918,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.4405860900878906,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.000100016593933,
+        1.0
+      ],
+      [
+        0.0,
+        0.0,
+        -0.010001000016927719,
+        0.0
+      ]
+    ],
+    "uses_center_shift_projection": true,
+    "world_view_transform": [
+      [
+        0.0917297750711441,
+        0.024213632568717003,
+        -0.9954894781112671,
+        0.0
+      ],
+      [
+        0.9952675104141235,
+        -0.03442205488681793,
+        0.09087206423282623,
+        0.0
+      ],
+      [
+        -0.032066453248262405,
+        -0.9991140365600586,
+        -0.027256568893790245,
+        0.0
+      ],
+      [
+        0.09238898009061813,
+        0.2570439577102661,
+        3.9043641090393066,
+        1.0
+      ]
+    ]
+  },
+  "camera_image_name": "cam00_0000",
+  "camera_index": 0,
+  "camera_timestamp": 0.0,
+  "camera_uid": 0,
+  "checkpoint_path": "/data/ysj/result/4dgs/RTGS/coffee_martini/checkpoints/chkpnt_best.pth",
+  "config_path": "/home/ysj/lkg-experiment/4d-gaussian-splatting/configs/dynerf/coffee_martini.yaml",
+  "created_at": "2026-06-29T04:33:16",
+  "dataset_kind": "n3dv",
+  "dataset_path": "/data/ysj/dataset/N3DV/coffee_martini",
+  "gaussians_total": 4744560,
+  "height": 1014,
+  "iteration": 30000,
+  "metrics": {
+    "gt_vs_official_gt": {
+      "mae": 0.0010627532610669732,
+      "mse": 7.16127578925807e-06,
+      "psnr": 51.45009600753879
+    },
+    "official_render_vs_gt": {
+      "mae": 0.025081202387809753,
+      "mse": 0.0017714414279907942,
+      "psnr": 27.51673202868443
+    },
+    "rtgs_vs_gt": {
+      "mae": 0.06372178345918655,
+      "mse": 0.009719287976622581,
+      "psnr": 20.123655498011278
+    },
+    "rtgs_vs_official_render": {
+      "mae": 0.06481213867664337,
+      "mse": 0.009548688307404518,
+      "psnr": 20.200562828645484
+    }
+  },
+  "mode": "rtgs_basic_1view",
+  "model_diagnostics": {
+    "active_sh_degree": 3,
+    "active_sh_degree_t": 2,
+    "env_map": null,
+    "feature_channel_match": true,
+    "features_dc": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 7.164906978607178,
+      "mean": 0.20944975316524506,
+      "min": -1.9935246706008911,
+      "numel": 14233680,
+      "sample_step": 3475,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        1,
+        3
+      ]
+    },
+    "features_rest": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 0.2628454566001892,
+      "mean": -0.0007667523459531367,
+      "min": -0.13900971412658691,
+      "numel": 668982960,
+      "sample_step": 163325,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        47,
+        3
+      ]
+    },
+    "features_shape": [
+      4744560,
+      48,
+      3
+    ],
+    "force_sh_3d": false,
+    "gaussian_dim": 4,
+    "get_max_sh_channels": 48,
+    "max_sh_degree": 3,
+    "max_sh_degree_t": 2,
+    "opacity": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 17.271224975585938,
+      "mean": -1.512256145477295,
+      "min": -6.494389533996582,
+      "numel": 4744560,
+      "sample_step": 1158,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        1
+      ]
+    },
+    "prefilter_var": -1.0,
+    "rot_4d": true,
+    "rotation": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 9.02513599395752,
+      "mean": 0.5160381197929382,
+      "min": -1.0827080011367798,
+      "numel": 18978240,
+      "sample_step": 4633,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        4
+      ]
+    },
+    "rotation_r": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 9.214452743530273,
+      "mean": 0.5116105675697327,
+      "min": -1.1360890865325928,
+      "numel": 18978240,
+      "sample_step": 4633,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        4
+      ]
+    },
+    "scaling": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": -0.40729767084121704,
+      "mean": -6.761534214019775,
+      "min": -23.504898071289062,
+      "numel": 14233680,
+      "sample_step": 3475,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        3
+      ]
+    },
+    "scaling_t": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 6.008962631225586,
+      "mean": -1.9848766326904297,
+      "min": -12.485209465026855,
+      "numel": 4744560,
+      "sample_step": 1158,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        1
+      ]
+    },
+    "t": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 45.48130416870117,
+      "mean": 5.082575798034668,
+      "min": -37.68996047973633,
+      "numel": 4744560,
+      "sample_step": 1158,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        1
+      ]
+    },
+    "time_duration": [
+      0.0,
+      10.0
+    ],
+    "xyz": {
+      "device": "cuda:0",
+      "dtype": "float32",
+      "max": 133.6331787109375,
+      "mean": 0.2080601006746292,
+      "min": -40.526466369628906,
+      "numel": 14233680,
+      "sample_step": 3475,
+      "sample_strategy": "stride_slice",
+      "sampled_numel": 4096,
+      "shape": [
+        4744560,
+        3
+      ]
+    }
+  },
+  "model_path": "/data/ysj/result/4dgs/RTGS/coffee_martini",
+  "n3dv_camera_label": "cam00",
+  "n3dv_frame_index": 0,
+  "official_gt_path": "/data/ysj/result/4dgs/RTGS/coffee_martini/test/ours_best/gt/00196.png",
+  "official_output_index": 196,
+  "official_output_index_reason": "n3dv safe_state(seed=0) train-then-test shuffle",
+  "official_render_path": "/data/ysj/result/4dgs/RTGS/coffee_martini/test/ours_best/renders/00196.png",
+  "pipeline": {
+    "compute_cov3D_python": false,
+    "convert_SHs_python": false,
+    "debug": false,
+    "env_map_res": 0,
+    "env_optimize_from": 0,
+    "env_optimize_until": 5000,
+    "eval_shfs_4d": true
+  },
+  "rtgs_render_ms": 207.6633400283754,
+  "rtgs_rotation_convention": "current",
+  "scene": "coffee_martini",
+  "split": "test",
+  "timestamp": 0.0,
+  "width": 1352
+}

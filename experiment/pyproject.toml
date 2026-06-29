@@ -28,3 +28,4 @@ lkg-render-looking-glass = "lkg_experiment.coherent_default.render_looking_glass
 lkg-batch-experiments = "lkg_experiment.experiment.batch_experiments:main"
 lkg-generate-mapping-artifacts = "lkg_experiment.coherent_default.generate_mapping_artifacts:main"
 lkg-rtgs-coherent = "lkg_experiment.rtgs_coherent.cli:main"
+lkg-rtgs-basic-1view = "lkg_experiment.rtgs_coherent.basic_1view:main"

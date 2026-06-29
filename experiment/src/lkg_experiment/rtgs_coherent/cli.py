@@ -87,6 +87,7 @@ class RtgsLiteGaussianModel:
         force_sh_3d: bool = False,
         sh_degree_t: int = 2,
         prefilter_var: float = -1.0,
+        rotation_convention: str = "current",
     ) -> None:
         self.active_sh_degree = 0
         self.max_sh_degree = int(sh_degree)
@@ -97,6 +98,7 @@ class RtgsLiteGaussianModel:
         self.active_sh_degree_t = 0
         self.max_sh_degree_t = int(sh_degree_t)
         self.prefilter_var = float(prefilter_var)
+        self.rotation_convention = _normalize_rtgs_rotation_convention(rotation_convention)
         self.env_map = None
 
     def restore(self, model_args: tuple[Any, ...]) -> None:
@@ -211,7 +213,12 @@ class RtgsLiteGaussianModel:
 
     def get_cov_t(self, scaling_modifier: float = 1.0):
         if self.rot_4d:
-            L = _build_scaling_rotation_4d(float(scaling_modifier) * self.get_scaling_xyzt, self._rotation, self._rotation_r)
+            L = _build_scaling_rotation_4d(
+                float(scaling_modifier) * self.get_scaling_xyzt,
+                self._rotation,
+                self._rotation_r,
+                convention=self.rotation_convention,
+            )
             actual_covariance = L @ L.transpose(1, 2)
             return actual_covariance[:, 3, 3].unsqueeze(1)
         return self.get_scaling_t * float(scaling_modifier)
@@ -230,7 +237,12 @@ class RtgsLiteGaussianModel:
         return _strip_symmetric(actual_covariance)
 
     def get_current_covariance_and_mean_offset(self, scaling_modifier: float = 1.0, timestamp: float = 0.0):
-        L = _build_scaling_rotation_4d(float(scaling_modifier) * self.get_scaling_xyzt, self._rotation, self._rotation_r)
+        L = _build_scaling_rotation_4d(
+            float(scaling_modifier) * self.get_scaling_xyzt,
+            self._rotation,
+            self._rotation_r,
+            convention=self.rotation_convention,
+        )
         actual_covariance = L @ L.transpose(1, 2)
         cov_11 = actual_covariance[:, :3, :3]
         cov_12 = actual_covariance[:, 0:3, 3:4]
@@ -283,7 +295,20 @@ class RtgsSimpleCamera:
         self.zfar = 100.0
         self.znear = 0.01
         self.world_view_transform = torch.tensor(_get_world_to_view2(R, T), dtype=torch.float32).transpose(0, 1)
-        self.projection_matrix = _get_projection_matrix(self.znear, self.zfar, self.FoVx, self.FoVy).transpose(0, 1)
+        if self.cx > 0.0 and self.cy > 0.0 and self.fl_x > 0.0 and self.fl_y > 0.0:
+            projection_matrix = _get_projection_matrix_center_shift(
+                self.znear,
+                self.zfar,
+                self.cx,
+                self.cy,
+                self.fl_x,
+                self.fl_y,
+                self.image_width,
+                self.image_height,
+            )
+        else:
+            projection_matrix = _get_projection_matrix(self.znear, self.zfar, self.FoVx, self.FoVy)
+        self.projection_matrix = projection_matrix.transpose(0, 1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
@@ -313,6 +338,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-indices", default=None, help="Comma or whitespace separated camera indices for --render-mode single-all-cams")
     parser.add_argument("--n3dv-frame-index", type=int, default=0, help="N3DV dynamic frame index used with cameras.json; -1 uses all frames")
+    parser.add_argument(
+        "--rtgs-rotation-convention",
+        choices=("legacy", "current"),
+        default="current",
+        help="4D rotation convention for RTGS checkpoints; legacy matches pre-flip RTGS outputs, current matches upstream main",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--checkpoint-load-device",
@@ -465,6 +496,7 @@ def load_rtgs_checkpoint(
     config_path: Path | str | None,
     device: str,
     checkpoint_load_device: str = "cpu",
+    rotation_convention: str = "current",
 ) -> RtgsCheckpoint:
     install_rtgs_code_root(rtgs_code_root)
     import torch
@@ -499,6 +531,7 @@ def load_rtgs_checkpoint(
         force_sh_3d=force_sh_3d,
         sh_degree_t=2 if eval_shfs_4d else 0,
         prefilter_var=prefilter_var,
+        rotation_convention=rotation_convention,
     )
     model.restore(model_args)
     model.to(device)
@@ -848,7 +881,18 @@ def render_rtgs_original(camera: Any, pc: Any, pipe: Any, background: Any):
 
     with _torch_no_grad():
         camera_cuda = camera.cuda()
-        return render(camera_cuda, pc, pipe, background)["render"].detach().clamp(0.0, 1.0).contiguous()
+        override_color = None
+        if _uses_legacy_rtgs_rotation(pc) and bool(getattr(pipe, "compute_cov3D_python", False)):
+            import torch
+
+            all_gaussians = torch.ones((pc.get_xyz.shape[0],), dtype=torch.bool, device=pc.get_xyz.device)
+            override_color = evaluate_rtgs_colors(
+                pc,
+                timestamp=float(camera_cuda.timestamp),
+                camera_center=camera_cuda.camera_center,
+                mask=all_gaussians,
+            )
+        return render(camera_cuda, pc, pipe, background, override_color=override_color)["render"].detach().clamp(0.0, 1.0).contiguous()
 
 
 def render_rtgs_coherent(
@@ -1506,6 +1550,7 @@ def render_rtgs_single_camera(
         "gaussians_snapshot": int(snapshot.means.shape[0]),
         "active_sh_degree": int(checkpoint.model.active_sh_degree),
         "active_sh_degree_t": int(checkpoint.model.active_sh_degree_t),
+        "rtgs_rotation_convention": str(checkpoint.model.rotation_convention),
         "rtgs_render_ms": rtgs_ms,
         "coherent_render_ms": cr_ms,
         "metrics": metrics,
@@ -1601,6 +1646,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config_path=args.config,
         device=args.device,
         checkpoint_load_device=args.checkpoint_load_device,
+        rotation_convention=args.rtgs_rotation_convention,
     )
     if args.render_mode == "single-all-cams":
         return render_rtgs_single_all_cameras(args=args, checkpoint=checkpoint)
@@ -1778,9 +1824,21 @@ def _build_scaling_rotation(s: Any, r: Any):
     return L @ R
 
 
-def _build_rotation_4d(l: Any, r: Any):
+def _normalize_rtgs_rotation_convention(value: str) -> str:
+    convention = str(value).strip().lower()
+    if convention not in {"legacy", "current"}:
+        raise ValueError(f"unsupported RTGS rotation convention: {value!r}")
+    return convention
+
+
+def _uses_legacy_rtgs_rotation(model: Any) -> bool:
+    return _normalize_rtgs_rotation_convention(getattr(model, "rotation_convention", "current")) == "legacy"
+
+
+def _build_rotation_4d(l: Any, r: Any, *, convention: str = "current"):
     import torch
 
+    convention = _normalize_rtgs_rotation_convention(convention)
     q_l = torch.nn.functional.normalize(l)
     q_r = torch.nn.functional.normalize(r)
     a, b, c, d = q_l.unbind(-1)
@@ -1825,14 +1883,17 @@ def _build_rotation_4d(l: Any, r: Any):
             p,
         ]
     ).view(4, 4, -1).permute(2, 0, 1)
-    return (M_l @ M_r).flip(1, 2)
+    rotation = M_l @ M_r
+    if convention == "current":
+        rotation = rotation.flip(1, 2)
+    return rotation
 
 
-def _build_scaling_rotation_4d(s: Any, l: Any, r: Any):
+def _build_scaling_rotation_4d(s: Any, l: Any, r: Any, *, convention: str = "current"):
     import torch
 
     L = torch.zeros((s.shape[0], 4, 4), dtype=s.dtype, device=s.device)
-    R = _build_rotation_4d(l, r)
+    R = _build_rotation_4d(l, r, convention=convention)
     L[:, 0, 0] = s[:, 0]
     L[:, 1, 1] = s[:, 1]
     L[:, 2, 2] = s[:, 2]
@@ -1861,6 +1922,35 @@ def _get_projection_matrix(znear: float, zfar: float, fovX: float, fovY: float):
     bottom = -top
     right = tan_half_fovx * znear
     left = -right
+    P = torch.zeros(4, 4, dtype=torch.float32)
+    z_sign = 1.0
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
+
+
+def _get_projection_matrix_center_shift(
+    znear: float,
+    zfar: float,
+    cx: float,
+    cy: float,
+    fl_x: float,
+    fl_y: float,
+    width: int,
+    height: int,
+):
+    import torch
+
+    top = float(cy) / float(fl_y) * float(znear)
+    bottom = -(float(height) - float(cy)) / float(fl_y) * float(znear)
+    left = -(float(width) - float(cx)) / float(fl_x) * float(znear)
+    right = float(cx) / float(fl_x) * float(znear)
+
     P = torch.zeros(4, 4, dtype=torch.float32)
     z_sign = 1.0
     P[0, 0] = 2.0 * znear / (right - left)
@@ -1942,6 +2032,8 @@ def _pipeline_namespace_for_model(pipe_cfg: Mapping[str, Any], model: Any) -> Si
     env_map_missing = env_map is None or (hasattr(env_map, "numel") and int(env_map.numel()) == 0)
     if int(pipe.env_map_res) > 0 and env_map_missing:
         pipe.env_map_res = 0
+    if _uses_legacy_rtgs_rotation(model) and bool(getattr(model, "rot_4d", False)) and int(getattr(model, "gaussian_dim", 3)) == 4:
+        pipe.compute_cov3D_python = True
     return pipe
 
 

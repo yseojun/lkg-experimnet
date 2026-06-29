@@ -16,6 +16,7 @@ from lkg_experiment.rtgs_coherent.cli import (
     _load_rtgs_colmap_camera_lite,
     _load_rtgs_n3dv_dynamic_camera,
     _count_rtgs_n3dv_dynamic_cameras,
+    _get_projection_matrix_center_shift,
     _pipeline_namespace_for_model,
 )
 from lkg_experiment.rtgs_coherent import (
@@ -52,6 +53,7 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(args.compare_original_views, 5)
         self.assertEqual(args.width, 1440)
         self.assertEqual(args.height, 2560)
+        self.assertEqual(args.rtgs_rotation_convention, "current")
         self.assertFalse(args.no_crop_to_fill)
         self.assertTrue(args.write_interlaced)
 
@@ -312,6 +314,28 @@ class RtgsCoherentTest(unittest.TestCase):
         self.assertEqual(camera.image_height, 96)
         torch.testing.assert_close(K, torch.tensor([[200.0, 0.0, 64.0], [0.0, 240.0, 48.0], [0.0, 0.0, 1.0]]))
 
+    def test_rtgs_simple_camera_uses_center_shift_projection_when_intrinsics_are_explicit(self):
+        camera = rtgs_cli.RtgsSimpleCamera(
+            R=np.eye(3),
+            T=np.zeros(3),
+            FoVx=1.0,
+            FoVy=1.0,
+            image=torch.zeros((3, 80, 100)),
+            image_name="off_center",
+            uid=0,
+            timestamp=0.0,
+            fl_x=50.0,
+            fl_y=60.0,
+            cx=30.0,
+            cy=35.0,
+            resolution=(100, 80),
+            data_device="cpu",
+        )
+
+        expected = _get_projection_matrix_center_shift(0.01, 100.0, 30.0, 35.0, 50.0, 60.0, 100, 80).transpose(0, 1)
+
+        torch.testing.assert_close(camera.projection_matrix, expected)
+
     def test_cr_color_helper_accepts_precomputed_rgb(self):
         gsplat_root = Path(__file__).resolve().parents[2] / "gsplat"
         sys.path.insert(0, str(gsplat_root))
@@ -362,6 +386,49 @@ class RtgsCoherentTest(unittest.TestCase):
         pipe = _pipeline_namespace_for_model({"env_map_res": 500}, model)
 
         self.assertEqual(pipe.env_map_res, 0)
+
+    def test_pipeline_namespace_forces_python_covariance_for_legacy_rotation(self):
+        model = RtgsLiteGaussianModel(3, rotation_convention="legacy")
+
+        pipe = _pipeline_namespace_for_model({"compute_cov3D_python": False}, model)
+
+        self.assertTrue(pipe.compute_cov3D_python)
+
+    def test_rtgs_lite_gaussian_model_supports_legacy_rotation_convention(self):
+        model = RtgsLiteGaussianModel(3, rotation_convention="legacy")
+        model._xyz = torch.zeros((1, 3))
+        model._scaling = torch.log(torch.tensor([[1.2, 0.7, 0.5]]))
+        model._scaling_t = torch.log(torch.tensor([[0.9]]))
+        model._rotation = torch.tensor([[0.7, 0.2, -0.4, 0.1]])
+        model._rotation_r = torch.tensor([[0.4, -0.3, 0.2, 0.8]])
+        model._t = torch.tensor([[0.1]])
+
+        covars, delta_mean = model.get_current_covariance_and_mean_offset(timestamp=0.7)
+        expected_covars, expected_delta_mean = _reference_4d_covariance_and_offset(
+            model,
+            timestamp=0.7,
+            convention="legacy",
+        )
+
+        torch.testing.assert_close(covars, expected_covars)
+        torch.testing.assert_close(delta_mean, expected_delta_mean)
+
+    def test_rtgs_lite_gaussian_model_rotation_conventions_diverge(self):
+        legacy = RtgsLiteGaussianModel(3, rotation_convention="legacy")
+        current = RtgsLiteGaussianModel(3, rotation_convention="current")
+        for model in (legacy, current):
+            model._xyz = torch.zeros((1, 3))
+            model._scaling = torch.log(torch.tensor([[1.2, 0.7, 0.5]]))
+            model._scaling_t = torch.log(torch.tensor([[0.9]]))
+            model._rotation = torch.tensor([[0.7, 0.2, -0.4, 0.1]])
+            model._rotation_r = torch.tensor([[0.4, -0.3, 0.2, 0.8]])
+            model._t = torch.tensor([[0.1]])
+
+        legacy_covars, legacy_delta = legacy.get_current_covariance_and_mean_offset(timestamp=0.7)
+        current_covars, current_delta = current.get_current_covariance_and_mean_offset(timestamp=0.7)
+
+        self.assertGreater(torch.max(torch.abs(legacy_covars - current_covars)).item(), 1e-4)
+        self.assertGreater(torch.max(torch.abs(legacy_delta - current_delta)).item(), 1e-4)
 
     def test_rtgs_gaussian_model_stub_reexports_basic_point_cloud(self):
         originals = {
@@ -647,6 +714,70 @@ class _FakeRtgsModel:
 
     def get_marginal_t(self, timestamp, scaling_modifier=1.0):
         return torch.tensor([[1.0], [0.01]])
+
+
+def _reference_4d_covariance_and_offset(model, *, timestamp: float, convention: str):
+    scaling = torch.cat([model._scaling.exp(), model._scaling_t.exp()], dim=1)
+    q_l = torch.nn.functional.normalize(model._rotation)
+    q_r = torch.nn.functional.normalize(model._rotation_r)
+    a, b, c, d = q_l.unbind(-1)
+    p, q, r, s = q_r.unbind(-1)
+    m_l = torch.stack(
+        [
+            a,
+            -b,
+            -c,
+            -d,
+            b,
+            a,
+            -d,
+            c,
+            c,
+            d,
+            a,
+            -b,
+            d,
+            -c,
+            b,
+            a,
+        ]
+    ).view(4, 4, -1).permute(2, 0, 1)
+    m_r = torch.stack(
+        [
+            p,
+            q,
+            r,
+            s,
+            -q,
+            p,
+            -s,
+            r,
+            -r,
+            s,
+            p,
+            -q,
+            -s,
+            -r,
+            q,
+            p,
+        ]
+    ).view(4, 4, -1).permute(2, 0, 1)
+    rotation = m_l @ m_r
+    if convention == "current":
+        rotation = rotation.flip(1, 2)
+    scale = torch.zeros((scaling.shape[0], 4, 4), dtype=scaling.dtype)
+    scale[:, 0, 0] = scaling[:, 0]
+    scale[:, 1, 1] = scaling[:, 1]
+    scale[:, 2, 2] = scaling[:, 2]
+    scale[:, 3, 3] = scaling[:, 3]
+    transform = rotation @ scale
+    covariance = transform @ transform.transpose(1, 2)
+    cov_11 = covariance[:, :3, :3]
+    cov_12 = covariance[:, 0:3, 3:4]
+    cov_t = covariance[:, 3:4, 3:4]
+    current_covariance = cov_11 - cov_12 @ cov_12.transpose(1, 2) / cov_t
+    mean_offset = cov_12.squeeze(-1) / cov_t.squeeze(-1) * (float(timestamp) - model._t)
+    return rtgs_cli._strip_symmetric(current_covariance), mean_offset
 
 
 class _FakeCamera:
