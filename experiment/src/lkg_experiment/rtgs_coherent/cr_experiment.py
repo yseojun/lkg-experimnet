@@ -468,28 +468,7 @@ def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderConte
 
 
 def ensure_clustered_engine_supported(context: Any) -> None:
-    camera = context.cr_anchor_camera_cuda
-    fovx = _optional_float(getattr(camera, "FoVx", None))
-    fovy = _optional_float(getattr(camera, "FoVy", None))
-    fl_x = _optional_float(getattr(camera, "fl_x", None))
-    fl_y = _optional_float(getattr(camera, "fl_y", None))
-    needs_adapter = (
-        bool(getattr(context.args, "rtgs_compat_projection", True))
-        and not bool(context.fov_normalization.get("applied", False))
-        and fovx is not None
-        and fovy is not None
-        and fovx <= 0.0
-        and fovy <= 0.0
-        and fl_x is not None
-        and fl_y is not None
-        and fl_x > 0.0
-        and fl_y > 0.0
-    )
-    if needs_adapter:
-        raise ValueError(
-            "clustered engine cannot use view-dependent RTGS projection adapter; "
-            "use --engine compose for N3DV/sentinel-FoV cameras"
-        )
+    return None
 
 
 def build_manifest(
@@ -578,7 +557,7 @@ def _engine_notes(engine: str) -> dict[str, Any]:
         }
     return {
         "cluster_affects_render": True,
-        "description": "Grouped CoherentRaster path for cameras that do not need view-dependent RTGS projection adaptation.",
+        "description": "Grouped CoherentRaster path with RTGS-compatible projection adapter support for sentinel-FoV cameras.",
     }
 
 
@@ -619,18 +598,6 @@ def _std(values: Sequence[float]) -> float:
     if not finite:
         return float("nan")
     return float(np.std(np.asarray(finite, dtype=np.float64)))
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(numeric):
-        return None
-    return numeric
 
 
 def _safe_name(value: Any) -> str:

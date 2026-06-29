@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -10,6 +11,68 @@ from lkg_experiment.coherent_default.coherent_gsplat_bridge import (
     build_cr_lookup_arrays,
     lookup_arrays_to_torch,
 )
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_rtgs_projection_adapter(camera: Any, *, device: str, dtype: Any, enabled: bool):
+    import torch
+
+    info: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "reason": None,
+        "values": None,
+    }
+    if not bool(enabled):
+        info["reason"] = "disabled"
+        return None, info
+
+    fl_x = _optional_float(getattr(camera, "fl_x", None))
+    fl_y = _optional_float(getattr(camera, "fl_y", None))
+    fovx = _optional_float(getattr(camera, "FoVx", None))
+    fovy = _optional_float(getattr(camera, "FoVy", None))
+    cx = _optional_float(getattr(camera, "cx", None))
+    cy = _optional_float(getattr(camera, "cy", None))
+    width = int(getattr(camera, "image_width", 0) or 0)
+    height = int(getattr(camera, "image_height", 0) or 0)
+    if fl_x is None or fl_y is None or fl_x <= 0.0 or fl_y <= 0.0 or width <= 0 or height <= 0:
+        info["reason"] = "missing_positive_explicit_intrinsics"
+        return None, info
+    if fovx is None or fovy is None or fovx > 0.0 or fovy > 0.0:
+        info["reason"] = "fov_not_nonpositive_sentinel"
+        return None, info
+
+    tan_x = math.tan(float(fovx) * 0.5)
+    tan_y = math.tan(float(fovy) * 0.5)
+    if abs(tan_x) < 1e-12 or abs(tan_y) < 1e-12:
+        info["reason"] = "invalid_fov_tangent"
+        return None, info
+
+    fov_fx = float(width) / (2.0 * tan_x)
+    fov_fy = float(height) / (2.0 * tan_y)
+    scale_x = float(fl_x) / fov_fx
+    scale_y = float(fl_y) / fov_fy
+    values = [fov_fx, fov_fy, scale_x, scale_y, float(cx if cx is not None else width / 2.0), float(cy if cy is not None else height / 2.0)]
+    adapter = torch.tensor(values, dtype=dtype, device=device).contiguous()
+    info["applied"] = True
+    info["reason"] = "explicit_intrinsics_with_nonpositive_fov_sentinel"
+    info["values"] = {
+        "fov_fx": float(fov_fx),
+        "fov_fy": float(fov_fy),
+        "scale_x": float(scale_x),
+        "scale_y": float(scale_y),
+        "cx": float(values[4]),
+        "cy": float(values[5]),
+    }
+    return adapter, info
 
 
 def crop_viewpoint_index_to_viewport(viewpoint_index: np.ndarray, viewport: Any) -> np.ndarray:
@@ -121,6 +184,13 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
         crop_to_fill=bool(context.crop_to_fill),
     ).cuda()
     _, K = cr_66views.rtgs_camera_to_gsplat_inputs(anchor_camera, device=device)
+    rtgs_projection_adapter, _adapter_info = build_rtgs_projection_adapter(
+        anchor_camera,
+        device=device,
+        dtype=snapshot.means.dtype,
+        enabled=bool(getattr(context.args, "rtgs_compat_projection", True))
+        and not bool(getattr(context, "fov_normalization", {}).get("applied", False)),
+    )
     backgrounds = None if context.runtime.background is None else context.runtime.background.contiguous()
     should_sync = device.startswith("cuda") and torch.cuda.is_available()
     if should_sync:
@@ -147,6 +217,7 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
             tile_size=int(context.args.tile_size),
             is_debug=bool(context.args.debug_cr),
             covars=snapshot.covars,
+            rtgs_projection_adapter=rtgs_projection_adapter,
         )
         viewport_image = unpatchify_image_shape_matrix(rendered)
         viewport_image = unpad(viewport_image, int(context.render_height), int(context.render_width)).clamp(0.0, 1.0).contiguous()

@@ -159,7 +159,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
         self.assertIs(actual, expected)
         render.assert_called_once_with(context, variant=variant)
 
-    def test_clustered_engine_rejects_rtgs_projection_adapter_context(self):
+    def test_clustered_engine_allows_rtgs_projection_adapter_context(self):
         context = SimpleNamespace(
             fov_normalization={"applied": False},
             cr_anchor_camera_cuda=SimpleNamespace(FoVx=-1.0, FoVy=-1.0, fl_x=730.0, fl_y=730.0),
@@ -167,8 +167,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
             viewport=SimpleNamespace(offset_x=0, offset_y=0, render_width=80, render_height=60, panel_width=80, panel_height=60),
         )
 
-        with self.assertRaisesRegex(ValueError, "clustered engine cannot use view-dependent RTGS projection adapter"):
-            cr_experiment.ensure_clustered_engine_supported(context)
+        cr_experiment.ensure_clustered_engine_supported(context)
 
     def test_clustered_engine_allows_letterboxed_viewport_for_positive_fov(self):
         context = SimpleNamespace(

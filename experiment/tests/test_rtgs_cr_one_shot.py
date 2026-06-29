@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import sys
 import types
+import math
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +15,60 @@ from lkg_experiment.rtgs_coherent import cr_one_shot
 
 
 class RtgsCrOneShotTest(unittest.TestCase):
+    def test_build_rtgs_projection_adapter_for_sentinel_camera(self):
+        camera = SimpleNamespace(
+            FoVx=-1.0,
+            FoVy=-1.0,
+            fl_x=777.916513,
+            fl_y=777.916513,
+            cx=720.0,
+            cy=540.0,
+            image_width=1440,
+            image_height=1080,
+        )
+
+        adapter, info = cr_one_shot.build_rtgs_projection_adapter(camera, device="cpu", dtype=torch.float32, enabled=True)
+
+        fov_fx = 1440.0 / (2.0 * math.tan(-0.5))
+        fov_fy = 1080.0 / (2.0 * math.tan(-0.5))
+        self.assertTrue(info["applied"])
+        self.assertEqual(info["reason"], "explicit_intrinsics_with_nonpositive_fov_sentinel")
+        self.assertEqual(tuple(adapter.shape), (6,))
+        self.assertTrue(
+            torch.allclose(
+                adapter,
+                torch.tensor(
+                    [
+                        fov_fx,
+                        fov_fy,
+                        777.916513 / fov_fx,
+                        777.916513 / fov_fy,
+                        720.0,
+                        540.0,
+                    ],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_build_rtgs_projection_adapter_returns_none_for_positive_fov(self):
+        camera = SimpleNamespace(
+            FoVx=0.7,
+            FoVy=0.7,
+            fl_x=-1.0,
+            fl_y=-1.0,
+            cx=-1.0,
+            cy=-1.0,
+            image_width=1440,
+            image_height=1440,
+        )
+
+        adapter, info = cr_one_shot.build_rtgs_projection_adapter(camera, device="cpu", dtype=torch.float32, enabled=True)
+
+        self.assertIsNone(adapter)
+        self.assertFalse(info["applied"])
+        self.assertEqual(info["reason"], "missing_positive_explicit_intrinsics")
+
     def test_crop_viewpoint_index_to_viewport_uses_content_bounds(self):
         viewpoint_index = np.arange(5 * 7 * 3, dtype=np.int32).reshape(5, 7, 3)
         viewport = SimpleNamespace(
@@ -145,6 +200,14 @@ class RtgsCrOneShotTest(unittest.TestCase):
         raster_module.rasterization_CR = fake_rasterization_cr
 
         class FakeCamera:
+            FoVx = -1.0
+            FoVy = -1.0
+            fl_x = 2.0
+            fl_y = 2.0
+            cx = 2.0
+            cy = 1.5
+            image_width = 4
+            image_height = 3
             camera_center = torch.zeros(3)
 
             def cuda(self):
@@ -193,6 +256,8 @@ class RtgsCrOneShotTest(unittest.TestCase):
         self.assertEqual(camera_factory.call_args.kwargs["height"], 3)
         self.assertEqual(calls["rasterization"]["width"], 4)
         self.assertEqual(calls["rasterization"]["height"], 3)
+        self.assertIn("rtgs_projection_adapter", calls["rasterization"])
+        self.assertEqual(tuple(calls["rasterization"]["rtgs_projection_adapter"].shape), (6,))
         self.assertEqual(tuple(panel.shape), (3, 5, 7))
         self.assertTrue(torch.allclose(panel[:, 0, 0], torch.tensor([0.1, 0.2, 0.3])))
         self.assertTrue(torch.allclose(panel[:, 1, 2], torch.tensor([0.25, 0.5, 0.75])))

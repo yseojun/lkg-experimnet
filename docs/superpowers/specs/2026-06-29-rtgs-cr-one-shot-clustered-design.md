@@ -387,7 +387,7 @@ Cases:
 - dnerf positive FoV disables adapter;
 - N3DV sentinel FoV enables adapter;
 - adapter metadata records scales per view or per reference view;
-- `clustered` refuses N3DV acceptance if the kernel adapter is unavailable.
+- `clustered` accepts N3DV sentinel-FoV cameras when the kernel adapter is available.
 - adapter K is FoV-derived at viewport render size, not panel size.
 
 ### Kernel Adapter Equivalence Tests
@@ -508,7 +508,9 @@ PYTHONPATH=src python rtgs_cr_experiment.py \
   - clustered with `rtgs_compat_projection=True`: stopped at the intended sentinel-FoV guard;
   - diagnostic clustered with `--no-rtgs-compat-projection`: `coffee_martini_clustered_no_adapter_lkg1440x2560_codex_20260629`, `frame_ms=582.383`, `fps=1.717`, `peak_vram_gb=19.857`;
   - diagnostic clustered versus compose: `MSE=0.00487815`, `MAE=0.03059597`, `PSNR=23.117 dB`, confirming this is not an acceptance result before the Phase C adapter.
-- 2026-06-29: Kept the sentinel-FoV RTGS projection adapter guard in place. N3DV clustered acceptance still requires the kernel-level adapter work described in Phase C.
+- 2026-06-29: Added the sentinel-FoV RTGS projection adapter to the grouped CR CUDA projection and tile-intersection kernels, removed the temporary N3DV clustered guard, and validated `coffee_martini` clustered `cluster=2` with `rtgs_compat_projection=True`:
+  - 64x112 smoke with generated linear view map: `n3dv_cluster_adapter_smoke`;
+  - 1440x2560 LKG run with calibration view map: `n3dv_cluster_adapter_fullres`, `frame_ms=526.160`, `fps=1.901`, `peak_vram_gb=15.289`.
 
 ## Sub-Agent Review Notes
 
