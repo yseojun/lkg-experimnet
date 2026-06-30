@@ -1,0 +1,46 @@
+{
+  "name": "rtgs-coherent-raster-gsplat-patches",
+  "created_utc": "2026-06-30",
+  "source_repo": "/home/ysj/lkg-experiment/gsplat",
+  "recommended_base_commit": {
+    "hash": "6f6609a",
+    "subject": "Support precomputed RGB in coherent raster"
+  },
+  "patch_commits": [
+    {
+      "hash": "938f6a9",
+      "subject": "Add RTGS projection adapter to coherent raster",
+      "patch": "patches/0001-Add-RTGS-projection-adapter-to-coherent-raster.patch"
+    },
+    {
+      "hash": "ede313e",
+      "subject": "Add coherent raster timing metrics",
+      "patch": "patches/0002-Add-coherent-raster-timing-metrics.patch"
+    }
+  ],
+  "modified_files": [
+    "gsplat/cuda/_wrapper_coherent_raster.py",
+    "gsplat/cuda/csrc/CoherentRaster.cpp",
+    "gsplat/cuda/csrc/CoherentRaster.h",
+    "gsplat/cuda/csrc/CoherentRaster_CR.cuh",
+    "gsplat/cuda/csrc/CoherentRaster_CRKernel.cu",
+    "gsplat/cuda/csrc/CoherentRaster_Modified.cuh",
+    "gsplat/cuda/csrc/CoherentRaster_ModifiedKernel.cu",
+    "gsplat/cuda/csrc/CoherentRaster_ModifiedWrapper.cu",
+    "gsplat/cuda/include/Ops_CoherentRaster.h",
+    "gsplat/rendering_coherent_raster.py"
+  ],
+  "scope": {
+    "affects": [
+      "gsplat.rendering_coherent_raster.rasterization_CR",
+      "CoherentRaster CUDA projection and tile-intersection wrappers"
+    ],
+    "does_not_affect": [
+      "gsplat.rendering.rasterization"
+    ]
+  },
+  "apply_order": [
+    "patches/0001-Add-RTGS-projection-adapter-to-coherent-raster.patch",
+    "patches/0002-Add-coherent-raster-timing-metrics.patch"
+  ]
+}

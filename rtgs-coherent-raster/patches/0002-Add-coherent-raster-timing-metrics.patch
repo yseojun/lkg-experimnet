@@ -1,0 +1,92 @@
+From ede313ef4ab5df8993ccb855f72ddc27444fc08c Mon Sep 17 00:00:00 2001
+From: yseojun <ddt1016@naver.com>
+Date: Tue, 30 Jun 2026 04:00:27 +0000
+Subject: [PATCH 2/2] Add coherent raster timing metrics
+
+---
+ gsplat/rendering_coherent_raster.py | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/gsplat/rendering_coherent_raster.py b/gsplat/rendering_coherent_raster.py
+index 1d49e99..d76feb3 100644
+--- a/gsplat/rendering_coherent_raster.py
++++ b/gsplat/rendering_coherent_raster.py
+@@ -71,6 +71,7 @@ def rasterization_CR(
+     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+     covars: Tensor | None = None,
+     rtgs_projection_adapter: Tensor | None = None,
++    return_timing: bool = False,
+ ) -> Tuple[Tensor, Tensor, Dict]:
+     
+     # adjacent_viewmats: [num_of_view_group, view_group_size, 4, 4]
+@@ -82,9 +83,11 @@ def rasterization_CR(
+     # colors: [N, 16, 3] = [N, K, 3]
+     
+     meta = {}
++    timing_ms: Dict[str, float] = {}
+ 
+ 
+     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
++    projection_start = _timing_stage_start(return_timing, means)
+     if is_debug:
+         torch.cuda.synchronize()
+         tic = time.time()
+@@ -170,6 +173,7 @@ def rasterization_CR(
+         torch.cuda.synchronize()
+         toc = time.time()
+         print(f"projection(): {toc-tic:.8f}")
++    timing_ms["cr_projection_ms"] = _timing_stage_elapsed_ms(projection_start, return_timing, means)
+ 
+ 
+ 
+@@ -197,6 +201,7 @@ def rasterization_CR(
+     tile_width = math.ceil(width / float(tile_size))
+     tile_height = math.ceil(height / float(tile_size))
+     
++    keygen_start = _timing_stage_start(return_timing, means)
+     if is_debug:
+         torch.cuda.synchronize()
+         tic = time.time()
+@@ -231,11 +236,14 @@ def rasterization_CR(
+         torch.cuda.synchronize()
+         toc = time.time()
+         print(f"isect_offsets(): {toc-tic:.8f}")
++    timing_ms["cr_keygen_ms"] = _timing_stage_elapsed_ms(keygen_start, return_timing, means)
++    timing_ms["cr_sort_ms"] = 0.0
+     
+     means2d = means2d.permute(1, 0, 2)
+     conics = conics.permute(1, 0, 2)
+     colors = colors.permute(1, 0, 2)
+ 
++    blend_start = _timing_stage_start(return_timing, means)
+     if is_debug:
+         torch.cuda.synchronize()
+         tic = time.time()
+@@ -257,9 +265,24 @@ def rasterization_CR(
+         toc = time.time()
+         print(f"rasterize_to_pixels(): {toc-tic:.8f}")
+ 
++    timing_ms["cr_blend_ms"] = _timing_stage_elapsed_ms(blend_start, return_timing, means)
++    if return_timing:
++        meta["timing_ms"] = timing_ms
+     return render_colors, None, meta
+ 
+ 
++def _timing_stage_start(enabled: bool, reference: Tensor) -> float:
++    if enabled and reference.is_cuda and torch.cuda.is_available():
++        torch.cuda.synchronize()
++    return time.perf_counter()
++
++
++def _timing_stage_elapsed_ms(start: float, enabled: bool, reference: Tensor) -> float:
++    if enabled and reference.is_cuda and torch.cuda.is_available():
++        torch.cuda.synchronize()
++    return float((time.perf_counter() - start) * 1000.0) if enabled else 0.0
++
++
+ def _prepare_colors_for_cr(
+     colors: Tensor,
+     *,
+-- 
+2.34.1
+

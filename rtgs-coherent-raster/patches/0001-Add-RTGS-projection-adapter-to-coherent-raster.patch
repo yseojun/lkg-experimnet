@@ -1,0 +1,491 @@
+From 938f6a96d0b3de13d6dbcfd3a4f94ca8b7c80f36 Mon Sep 17 00:00:00 2001
+From: yseojun <ddt1016@naver.com>
+Date: Mon, 29 Jun 2026 16:56:14 +0000
+Subject: [PATCH 1/2] Add RTGS projection adapter to coherent raster
+
+---
+ gsplat/cuda/_wrapper_coherent_raster.py       | 14 +++++-
+ gsplat/cuda/csrc/CoherentRaster.cpp           | 31 ++++++++++++-
+ gsplat/cuda/csrc/CoherentRaster.h             |  4 +-
+ gsplat/cuda/csrc/CoherentRaster_CR.cuh        | 31 +++++++++++++
+ gsplat/cuda/csrc/CoherentRaster_CRKernel.cu   |  3 +-
+ gsplat/cuda/csrc/CoherentRaster_Modified.cuh  |  1 +
+ .../csrc/CoherentRaster_ModifiedKernel.cu     | 46 +++++++++++++------
+ .../csrc/CoherentRaster_ModifiedWrapper.cu    |  8 ++++
+ gsplat/cuda/include/Ops_CoherentRaster.h      |  6 ++-
+ gsplat/rendering_coherent_raster.py           |  9 +++-
+ 10 files changed, 128 insertions(+), 25 deletions(-)
+
+diff --git a/gsplat/cuda/_wrapper_coherent_raster.py b/gsplat/cuda/_wrapper_coherent_raster.py
+index 77c3d65..b24e845 100644
+--- a/gsplat/cuda/_wrapper_coherent_raster.py
++++ b/gsplat/cuda/_wrapper_coherent_raster.py
+@@ -49,6 +49,7 @@ def fully_fused_projection_CR(
+     calc_compensations: bool = False,
+     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+     opacities: Tensor | None = None,  # [N] or None
++    rtgs_projection_adapter: Tensor | None = None,  # [6] or None
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+ 
+     C = viewmats.size(0)
+@@ -72,6 +73,9 @@ def fully_fused_projection_CR(
+     if opacities is not None:
+         assert opacities.size() == (N,), opacities.size()
+         opacities = opacities.contiguous()
++    if rtgs_projection_adapter is not None:
++        assert rtgs_projection_adapter.size() == (6,), rtgs_projection_adapter.size()
++        rtgs_projection_adapter = rtgs_projection_adapter.to(device=means.device, dtype=means.dtype).contiguous()
+ 
+     viewmats = viewmats.contiguous()
+     Ks = Ks.contiguous()
+@@ -101,7 +105,8 @@ def fully_fused_projection_CR(
+         far_plane,
+         radius_clip,
+         calc_compensations,
+-        camera_model_type
++        camera_model_type,
++        rtgs_projection_adapter,
+     )
+ 
+     return radii, means2d, depths, conics, compensations
+@@ -135,6 +140,7 @@ def isect_tiles_CR(
+     n_cameras: int | None = None,
+     camera_ids: Tensor | None = None,
+     gaussian_ids: Tensor | None = None,
++    rtgs_projection_adapter: Tensor | None = None,
+ ) -> Tuple[Tensor, Tensor, Tensor]:
+ 
+     if packed:
+@@ -154,6 +160,9 @@ def isect_tiles_CR(
+         assert means2d.shape == (C, N, 2), means2d.size()
+         assert radii.shape == (C, N, 2), radii.size()
+         assert depths.shape == (C, N), depths.size()
++    if rtgs_projection_adapter is not None:
++        assert rtgs_projection_adapter.size() == (6,), rtgs_projection_adapter.size()
++        rtgs_projection_adapter = rtgs_projection_adapter.to(device=means3d.device, dtype=means3d.dtype).contiguous()
+ 
+     tiles_per_gauss, isect_ids, flatten_ids, translation_values = _make_lazy_cuda_func("intersect_tile_CR")(
+         means3d.contiguous(),
+@@ -170,6 +179,7 @@ def isect_tiles_CR(
+         tile_width,
+         tile_height,
+         sort,
++        rtgs_projection_adapter,
+     )
+ 
+     
+@@ -229,4 +239,4 @@ def rasterize_to_pixels_CR(
+             flatten_ids.contiguous(),
+         )[0]
+ 
+-    return render_colors
+\ No newline at end of file
++    return render_colors
+diff --git a/gsplat/cuda/csrc/CoherentRaster.cpp b/gsplat/cuda/csrc/CoherentRaster.cpp
+index 474fc83..d97c2cf 100644
+--- a/gsplat/cuda/csrc/CoherentRaster.cpp
++++ b/gsplat/cuda/csrc/CoherentRaster.cpp
+@@ -63,7 +63,8 @@ projection_ewa_3dgs_fused_fwd_CR(
+     const float far_plane,
+     const float radius_clip,
+     const bool calc_compensations,
+-    const CameraModelType camera_model
++    const CameraModelType camera_model,
++    const at::optional<at::Tensor> rtgs_projection_adapter
+ ) {
+     DEVICE_GUARD(means);
+     CHECK_INPUT(means);
+@@ -76,6 +77,17 @@ projection_ewa_3dgs_fused_fwd_CR(
+     }
+     CHECK_INPUT(viewmats);
+     CHECK_INPUT(Ks);
++    if (rtgs_projection_adapter.has_value()) {
++        CHECK_INPUT(rtgs_projection_adapter.value());
++        TORCH_CHECK(
++            rtgs_projection_adapter.value().dim() == 1 && rtgs_projection_adapter.value().size(0) == 6,
++            "rtgs_projection_adapter must have shape [6]"
++        );
++        TORCH_CHECK(
++            rtgs_projection_adapter.value().scalar_type() == means.scalar_type(),
++            "rtgs_projection_adapter dtype must match means dtype"
++        );
++    }
+ 
+     uint32_t N = means.size(0);    // number of gaussians
+     uint32_t C = viewmats.size(0); // number of cameras
+@@ -100,6 +112,7 @@ projection_ewa_3dgs_fused_fwd_CR(
+         opacities,
+         viewmats,
+         Ks,
++        rtgs_projection_adapter,
+         image_width,
+         image_height,
+         eps2d,
+@@ -135,12 +148,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
+     const uint32_t tile_size,
+     const uint32_t tile_width,
+     const uint32_t tile_height,
+-    const bool sort
++    const bool sort,
++    const at::optional<at::Tensor> rtgs_projection_adapter
+ ) {
+     DEVICE_GUARD(means2d);
+     CHECK_INPUT(means2d);
+     CHECK_INPUT(radii);
+     CHECK_INPUT(depths);
++    if (rtgs_projection_adapter.has_value()) {
++        CHECK_INPUT(rtgs_projection_adapter.value());
++        TORCH_CHECK(
++            rtgs_projection_adapter.value().dim() == 1 && rtgs_projection_adapter.value().size(0) == 6,
++            "rtgs_projection_adapter must have shape [6]"
++        );
++        TORCH_CHECK(
++            rtgs_projection_adapter.value().scalar_type() == K.scalar_type(),
++            "rtgs_projection_adapter dtype must match K dtype"
++        );
++    }
+ 
+     uint32_t n_elements = means2d.numel() / 2;
+     bool packed = means2d.dim() == 2;
+@@ -182,6 +207,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
+             reference_viewmat,
+             adjacent_viewmats,
+             K,
++            rtgs_projection_adapter,
+             num_of_adjacent,
+             means2d,
+             radii,
+@@ -219,6 +245,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
+             reference_viewmat,
+             adjacent_viewmats,
+             K,
++            rtgs_projection_adapter,
+             num_of_adjacent,
+             means2d,
+             radii,
+diff --git a/gsplat/cuda/csrc/CoherentRaster.h b/gsplat/cuda/csrc/CoherentRaster.h
+index f9e3eaf..57a55f4 100644
+--- a/gsplat/cuda/csrc/CoherentRaster.h
++++ b/gsplat/cuda/csrc/CoherentRaster.h
+@@ -43,6 +43,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel_CR(
+     const at::optional<at::Tensor> opacities, // [N] optional
+     const at::Tensor viewmats,             // [C, 4, 4]
+     const at::Tensor Ks,                   // [C, 3, 3]
++    const at::optional<at::Tensor> rtgs_projection_adapter, // [6] optional
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+@@ -68,6 +69,7 @@ void launch_intersect_tile_kernel_CR(
+     const at::Tensor reference_viewmat,   // [1, 4, 4]
+     const at::Tensor adjacent_viewmats, // [num_of_adjacent, 4, 4]
+     const at::Tensor K,         // [3, 3]
++    const at::optional<at::Tensor> rtgs_projection_adapter, // [6] optional
+     const uint32_t num_of_adjacent,
+     const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
+     const at::Tensor radii,                      // [C, N, 2] or [nnz, 2]
+@@ -113,4 +115,4 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel_CR(
+     at::Tensor renders  // [n_tile_height, n_tile_width, 3, tile_size, tile_size]
+ );
+ 
+-} // namespace gsplat
+\ No newline at end of file
++} // namespace gsplat
+diff --git a/gsplat/cuda/csrc/CoherentRaster_CR.cuh b/gsplat/cuda/csrc/CoherentRaster_CR.cuh
+index 191c455..19948e3 100644
+--- a/gsplat/cuda/csrc/CoherentRaster_CR.cuh
++++ b/gsplat/cuda/csrc/CoherentRaster_CR.cuh
+@@ -104,6 +104,36 @@ inline __device__ void cam_to_image_coord(
+ }
+ 
+ 
++inline __device__ void cam_to_image_coord_rtgs_adapter(
++    // inputs
++    const float* __restrict__ point_in_cam_coord,  // [3]
++    const float* __restrict__ K,  // [3, 3]
++    const float* __restrict__ rtgs_projection_adapter,  // [6] optional
++    // outputs
++    float* point_in_image_coord // [2]
++) {
++    float fx = K[0];
++    float fy = K[4];
++    float cx = K[2];
++    float cy = K[5];
++    float x_c = point_in_cam_coord[0];
++    float y_c = point_in_cam_coord[1];
++    float z_c = point_in_cam_coord[2];
++
++    if (rtgs_projection_adapter != nullptr) {
++        fx = rtgs_projection_adapter[0];
++        fy = rtgs_projection_adapter[1];
++        x_c *= rtgs_projection_adapter[2];
++        y_c *= rtgs_projection_adapter[3];
++        cx = rtgs_projection_adapter[4];
++        cy = rtgs_projection_adapter[5];
++    }
++
++    point_in_image_coord[0] = fx * (x_c / z_c) + cx;
++    point_in_image_coord[1] = fy * (y_c / z_c) + cy;
++}
++
++
+ // AccuTile applied version
+ __global__ void intersect_tile_kernel_CR_AccuTile(
+     const uint32_t n_view_group,
+@@ -112,6 +142,7 @@ __global__ void intersect_tile_kernel_CR_AccuTile(
+     const float *__restrict__ reference_viewmat,
+     const float *__restrict__ adjacent_viewmats,
+     const float *__restrict__ K,
++    const float *__restrict__ rtgs_projection_adapter,
+     const uint32_t view_group_size, 
+     const float *__restrict__ means2d,
+     const int32_t *__restrict__ radii,
+diff --git a/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu b/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu
+index fc1f28d..cc32d1b 100644
+--- a/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu
++++ b/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu
+@@ -44,6 +44,7 @@ __global__ void intersect_tile_kernel_CR_AccuTile(
+     const float *__restrict__ reference_viewmat,
+     const float *__restrict__ adjacent_viewmats,
+     const float *__restrict__ K,
++    const float *__restrict__ rtgs_projection_adapter,
+     const uint32_t view_group_size, 
+     const float *__restrict__ means2d,
+     const int32_t *__restrict__ radii,
+@@ -94,7 +95,7 @@ __global__ void intersect_tile_kernel_CR_AccuTile(
+         const float* cur_adjacent_viewmat = adjacent_viewmats + view_group_size*16 * view_group_idx + 16*i;
+ 
+         world_to_cam_coord(cur_mean3d, cur_adjacent_viewmat, adj_mean_cam);
+-        cam_to_image_coord(adj_mean_cam, K, adj_mean_image);
++        cam_to_image_coord_rtgs_adapter(adj_mean_cam, K, rtgs_projection_adapter, adj_mean_image);
+ 
+         float translation_x = adj_mean_image[0] - mean2d.x;
+         float translation_y = adj_mean_image[1] - mean2d.y;
+diff --git a/gsplat/cuda/csrc/CoherentRaster_Modified.cuh b/gsplat/cuda/csrc/CoherentRaster_Modified.cuh
+index cecea7d..284b401 100644
+--- a/gsplat/cuda/csrc/CoherentRaster_Modified.cuh
++++ b/gsplat/cuda/csrc/CoherentRaster_Modified.cuh
+@@ -52,6 +52,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+     const scalar_t *__restrict__ opacities, // [N] optional
+     const scalar_t *__restrict__ viewmats, // [C, 4, 4]
+     const scalar_t *__restrict__ Ks,       // [C, 3, 3]
++    const scalar_t *__restrict__ rtgs_projection_adapter, // [6] optional
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+diff --git a/gsplat/cuda/csrc/CoherentRaster_ModifiedKernel.cu b/gsplat/cuda/csrc/CoherentRaster_ModifiedKernel.cu
+index 92af075..0c22957 100644
+--- a/gsplat/cuda/csrc/CoherentRaster_ModifiedKernel.cu
++++ b/gsplat/cuda/csrc/CoherentRaster_ModifiedKernel.cu
+@@ -52,6 +52,7 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+     const scalar_t *__restrict__ opacities, // [N] optional
+     const scalar_t *__restrict__ viewmats, // [C, 4, 4]
+     const scalar_t *__restrict__ Ks,       // [C, 3, 3]
++    const scalar_t *__restrict__ rtgs_projection_adapter, // [6] optional
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+@@ -96,6 +97,19 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+     // transform Gaussian center to camera space
+     vec3 mean_c;
+     posW2C(R, t, glm::make_vec3(means), mean_c);
++    vec3 projection_mean_c = mean_c;
++    scalar_t fx = Ks[0];
++    scalar_t fy = Ks[4];
++    scalar_t cx = Ks[2];
++    scalar_t cy = Ks[5];
++    if (rtgs_projection_adapter != nullptr) {
++        fx = rtgs_projection_adapter[0];
++        fy = rtgs_projection_adapter[1];
++        projection_mean_c.x *= rtgs_projection_adapter[2];
++        projection_mean_c.y *= rtgs_projection_adapter[3];
++        cx = rtgs_projection_adapter[4];
++        cy = rtgs_projection_adapter[5];
++    }
+     if (mean_c.z < near_plane || mean_c.z > far_plane) {
+         radii[idx * 2] = 0;
+         radii[idx * 2 + 1] = 0;
+@@ -135,12 +149,12 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+     switch (camera_model) {
+     case CameraModelType::PINHOLE: // perspective projection
+         persp_proj(
+-            mean_c,
++            projection_mean_c,
+             covar_c,
+-            Ks[0],
+-            Ks[4],
+-            Ks[2],
+-            Ks[5],
++            fx,
++            fy,
++            cx,
++            cy,
+             image_width,
+             image_height,
+             covar2d,
+@@ -149,12 +163,12 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+         break;
+     case CameraModelType::ORTHO: // orthographic projection
+         ortho_proj(
+-            mean_c,
++            projection_mean_c,
+             covar_c,
+-            Ks[0],
+-            Ks[4],
+-            Ks[2],
+-            Ks[5],
++            fx,
++            fy,
++            cx,
++            cy,
+             image_width,
+             image_height,
+             covar2d,
+@@ -163,12 +177,12 @@ __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR(
+         break;
+     case CameraModelType::FISHEYE: // fisheye projection
+         fisheye_proj(
+-            mean_c,
++            projection_mean_c,
+             covar_c,
+-            Ks[0],
+-            Ks[4],
+-            Ks[2],
+-            Ks[5],
++            fx,
++            fy,
++            cx,
++            cy,
+             image_width,
+             image_height,
+             covar2d,
+@@ -261,6 +275,7 @@ template __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR<float>(
+     const float *__restrict__ opacities,
+     const float *__restrict__ viewmats,
+     const float *__restrict__ Ks,
++    const float *__restrict__ rtgs_projection_adapter,
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+@@ -287,6 +302,7 @@ template __global__ void projection_ewa_3dgs_fused_fwd_kernel_CR<double>(
+     const double *__restrict__ opacities,
+     const double *__restrict__ viewmats,
+     const double *__restrict__ Ks,
++    const double *__restrict__ rtgs_projection_adapter,
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+diff --git a/gsplat/cuda/csrc/CoherentRaster_ModifiedWrapper.cu b/gsplat/cuda/csrc/CoherentRaster_ModifiedWrapper.cu
+index 32af453..4f408f4 100644
+--- a/gsplat/cuda/csrc/CoherentRaster_ModifiedWrapper.cu
++++ b/gsplat/cuda/csrc/CoherentRaster_ModifiedWrapper.cu
+@@ -53,6 +53,7 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel_CR(
+     const at::optional<at::Tensor> opacities, // [N] optional
+     const at::Tensor viewmats,             // [C, 4, 4]
+     const at::Tensor Ks,                   // [C, 3, 3]
++    const at::optional<at::Tensor> rtgs_projection_adapter, // [6] optional
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const float eps2d,
+@@ -105,6 +106,9 @@ void launch_projection_ewa_3dgs_fused_fwd_kernel_CR(
+                                         : nullptr,
+                     viewmats.data_ptr<scalar_t>(),
+                     Ks.data_ptr<scalar_t>(),
++                    rtgs_projection_adapter.has_value()
++                        ? rtgs_projection_adapter.value().data_ptr<scalar_t>()
++                        : nullptr,
+                     image_width,
+                     image_height,
+                     eps2d,
+@@ -132,6 +136,7 @@ void launch_intersect_tile_kernel_CR(
+     const at::Tensor reference_viewmat,         // [1, 4, 4]
+     const at::Tensor adjacent_viewmats,         // [n_view_group, view_group_size, 4, 4]
+     const at::Tensor K,                         // [3, 3]
++    const at::optional<at::Tensor> rtgs_projection_adapter, // [6] optional
+     const uint32_t view_group_size,             // number of adjacent cameras
+     const at::Tensor means2d,                    // [1, N, 2]
+     const at::Tensor radii,                      // [1, N, 2]
+@@ -197,6 +202,9 @@ void launch_intersect_tile_kernel_CR(
+                     reference_viewmat.data_ptr<float>(),
+                     adjacent_viewmats.data_ptr<float>(),
+                     K.data_ptr<float>(),
++                    rtgs_projection_adapter.has_value()
++                        ? rtgs_projection_adapter.value().data_ptr<float>()
++                        : nullptr,
+                     view_group_size,
+                     means2d.data_ptr<float>(),
+                     radii.data_ptr<int32_t>(),
+diff --git a/gsplat/cuda/include/Ops_CoherentRaster.h b/gsplat/cuda/include/Ops_CoherentRaster.h
+index 4f90a94..7e9eade 100644
+--- a/gsplat/cuda/include/Ops_CoherentRaster.h
++++ b/gsplat/cuda/include/Ops_CoherentRaster.h
+@@ -55,7 +55,8 @@ projection_ewa_3dgs_fused_fwd_CR(
+     const float far_plane,
+     const float radius_clip,
+     const bool calc_compensations,
+-    const CameraModelType camera_model
++    const CameraModelType camera_model,
++    const at::optional<at::Tensor> rtgs_projection_adapter
+ );
+ 
+ 
+@@ -73,7 +74,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
+     const uint32_t tile_size,
+     const uint32_t tile_width,
+     const uint32_t tile_height,
+-    const bool sort
++    const bool sort,
++    const at::optional<at::Tensor> rtgs_projection_adapter
+ );
+ 
+ at::Tensor intersect_offset_CR(
+diff --git a/gsplat/rendering_coherent_raster.py b/gsplat/rendering_coherent_raster.py
+index af048d2..1d49e99 100644
+--- a/gsplat/rendering_coherent_raster.py
++++ b/gsplat/rendering_coherent_raster.py
+@@ -69,7 +69,8 @@ def rasterization_CR(
+     rasterize_mode: Literal["classic", "antialiased"] = "classic",
+     channel_chunk: int = 32,
+     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+-    covars: Tensor | None = None
++    covars: Tensor | None = None,
++    rtgs_projection_adapter: Tensor | None = None,
+ ) -> Tuple[Tensor, Tensor, Dict]:
+     
+     # adjacent_viewmats: [num_of_view_group, view_group_size, 4, 4]
+@@ -105,6 +106,7 @@ def rasterization_CR(
+         calc_compensations=(rasterize_mode == "antialiased"),
+         camera_model=camera_model,
+         opacities=opacities,  # use opacities to compute a tigher bound for radii.
++        rtgs_projection_adapter=rtgs_projection_adapter,
+     )
+ 
+     proj_results_last = fully_fused_projection_CR(
+@@ -125,6 +127,7 @@ def rasterization_CR(
+         calc_compensations=(rasterize_mode == "antialiased"),
+         camera_model=camera_model,
+         opacities=opacities,  # use opacities to compute a tigher bound for radii.
++        rtgs_projection_adapter=rtgs_projection_adapter,
+     )
+ 
+     # make mask
+@@ -161,6 +164,7 @@ def rasterization_CR(
+         calc_compensations=(rasterize_mode == "antialiased"),
+         camera_model=camera_model,
+         opacities=opacities,  # use opacities to compute a tigher bound for radii.
++        rtgs_projection_adapter=rtgs_projection_adapter,
+     )
+     if is_debug:
+         torch.cuda.synchronize()
+@@ -206,7 +210,8 @@ def rasterization_CR(
+         Ks[0],        # [3, 3]
+         tile_size,
+         tile_width,
+-        tile_height
++        tile_height,
++        rtgs_projection_adapter=rtgs_projection_adapter,
+     )
+     if is_debug:
+         torch.cuda.synchronize()
+-- 
+2.34.1
+
