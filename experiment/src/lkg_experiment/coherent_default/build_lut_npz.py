@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from ctypes import byref, c_float, c_int32
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,13 @@ import numpy as np
 RGB_CHANNELS = 3
 INDEX_METHOD_BALANCED_RAMP = "balanced-ramp"
 INDEX_METHOD_LKG_CALIBRATION = "lkg-calibration"
+BRIDGE_SYSTEM_LIBCURL_ENV = "LKG_BRIDGE_SYSTEM_LIBCURL"
+BRIDGE_SYSTEM_LIBCURL_CANDIDATES = (
+    Path("/lib/x86_64-linux-gnu/libcurl.so.4"),
+    Path("/usr/lib/x86_64-linux-gnu/libcurl.so.4"),
+    Path("/lib64/libcurl.so.4"),
+    Path("/usr/lib64/libcurl.so.4"),
+)
 
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[3]
@@ -60,11 +69,32 @@ def install_bridge_sdk_root(path: Path | str) -> Path:
     package_root = src_root / "bridge_python_sdk"
     if not package_root.is_dir():
         raise FileNotFoundError(f"Bridge SDK package directory not found: {package_root}")
+    preload_bridge_system_libcurl()
     for import_root in (src_root, package_root):
         import_root_str = str(import_root)
         if import_root_str not in sys.path:
             sys.path.insert(0, import_root_str)
     return root
+
+
+def preload_bridge_system_libcurl() -> Path | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    configured = os.environ.get(BRIDGE_SYSTEM_LIBCURL_ENV)
+    if configured and configured.strip().lower() in {"0", "false", "off", "none"}:
+        return None
+    candidates = [Path(configured).expanduser()] if configured else list(BRIDGE_SYSTEM_LIBCURL_CANDIDATES)
+    for candidate in candidates:
+        try:
+            path = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        try:
+            ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+            return path
+        except OSError:
+            continue
+    return None
 
 
 def as_int(value: Any, default: int = 0) -> int:

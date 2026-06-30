@@ -23,9 +23,13 @@ from lkg_experiment.rtgs_coherent.cli import (
     DEFAULT_GENERATED_ROOT,
     RtgsSimpleCamera,
     _install_gsplat_root,
+    _background_tensor,
+    _camera_source_path,
     _json_ready,
     compute_pair_metrics,
     evaluate_rtgs_colors,
+    load_rtgs_camera,
+    load_rtgs_checkpoint,
     materialize_rtgs_geometry,
     render_rtgs_coherent,
     rtgs_camera_from_gsplat_viewmat,
@@ -463,6 +467,77 @@ def prepare_rtgs_cr_66_context(args: argparse.Namespace) -> RtgsCr66RenderContex
 
     _install_gsplat_root(args.gsplat_root)
     runtime = prepare_official_rtgs_1view(args)
+    return _prepare_rtgs_cr_66_context_from_runtime(args, runtime)
+
+
+def prepare_rtgs_cr_66_context_lite(args: argparse.Namespace) -> RtgsCr66RenderContext:
+    import torch
+
+    if str(args.interlace_mode) != "compose":
+        raise ValueError("only --interlace-mode compose is currently supported")
+    if int(args.views) <= 0:
+        raise ValueError("--views must be positive")
+    if int(args.width) <= 0 or int(args.height) <= 0:
+        raise ValueError("--width and --height must be positive")
+    if not str(args.device).startswith("cuda"):
+        raise RuntimeError("RTGS + CR 66-view rendering requires CUDA")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available; cannot run RTGS + CR 66-view rendering")
+
+    _install_gsplat_root(args.gsplat_root)
+    runtime = prepare_lite_rtgs_runtime(args)
+    return _prepare_rtgs_cr_66_context_from_runtime(args, runtime)
+
+
+def prepare_lite_rtgs_runtime(args: argparse.Namespace) -> Any:
+    checkpoint = load_rtgs_checkpoint(
+        model_path=args.model_path,
+        checkpoint=args.checkpoint,
+        rtgs_code_root=args.rtgs_code_root,
+        dataset_root=args.dataset_root,
+        n3dv_root=args.n3dv_root,
+        config_path=args.config,
+        device=args.device,
+        checkpoint_load_device=args.checkpoint_load_device,
+    )
+    gt, camera = load_rtgs_camera(
+        checkpoint=checkpoint,
+        split=args.split,
+        camera_index=int(args.camera_index),
+        device=args.device,
+        n3dv_frame_index=int(args.n3dv_frame_index),
+    )
+    model_cfg = dict(checkpoint.config.get("ModelParams", {}))
+    official = SimpleNamespace(
+        scene_name=checkpoint.scene_paths.scene_name,
+        scene_paths=checkpoint.scene_paths,
+        source_path=_camera_source_path(checkpoint.scene_paths),
+        config=checkpoint.config,
+        cfg_args=checkpoint.cfg_args,
+        model_args=SimpleNamespace(
+            frame_ratio=int(model_cfg.get("frame_ratio", getattr(checkpoint.cfg_args, "frame_ratio", 1))),
+        ),
+        pipeline_args=SimpleNamespace(),
+        optimization_args=SimpleNamespace(),
+        gaussians=checkpoint.model,
+        checkpoint_path=checkpoint.checkpoint_path,
+        iteration=int(checkpoint.iteration),
+        time_duration=[float(value) for value in checkpoint.model.time_duration],
+    )
+    return SimpleNamespace(
+        official=official,
+        gt=gt.contiguous() if hasattr(gt, "contiguous") else gt,
+        camera=camera,
+        camera_source="lite_rtgs_camera_loader",
+        pipe=SimpleNamespace(),
+        background=_background_tensor(args.background, checkpoint.cfg_args, args.device),
+        ssim_metric=None,
+    )
+
+
+def _prepare_rtgs_cr_66_context_from_runtime(args: argparse.Namespace, runtime: Any) -> RtgsCr66RenderContext:
+    import torch
+
     official_camera_cuda = runtime.camera.cuda()
     cr_anchor_camera_cuda, fov_normalization = normalize_explicit_intrinsics_fov(
         official_camera_cuda,
@@ -518,6 +593,40 @@ def prepare_rtgs_cr_66_context(args: argparse.Namespace) -> RtgsCr66RenderContex
         orbit_center=orbit_center,
         view_degree=float(args.view_degree),
         orbit_direction=int(args.orbit_direction),
+    )
+
+
+def context_for_playback_camera(context: RtgsCr66RenderContext, camera: Any) -> RtgsCr66RenderContext:
+    import torch
+
+    camera_cuda = camera.cuda() if hasattr(camera, "cuda") else camera
+    cr_anchor_camera_cuda, fov_normalization = normalize_explicit_intrinsics_fov(
+        camera_cuda,
+        enabled=bool(getattr(context.args, "normalize_explicit_intrinsics_fov", False)),
+    )
+    viewport = resolve_lkg_camera_viewport(
+        source_width=int(cr_anchor_camera_cuda.image_width),
+        source_height=int(cr_anchor_camera_cuda.image_height),
+        target_width=int(context.panel_width),
+        target_height=int(context.panel_height),
+        aspect_fit=str(context.args.aspect_fit),
+        camera_aspect_mode=str(context.args.camera_aspect_mode),
+    )
+    crop_to_fill = camera_crop_to_fill_for_viewport(
+        viewport,
+        no_crop_to_fill=bool(getattr(context.args, "no_crop_to_fill", False)),
+    )
+    anchor_viewmat, _ = rtgs_camera_to_gsplat_inputs(cr_anchor_camera_cuda, device=str(context.args.device))
+    return replace(
+        context,
+        cr_anchor_camera_cuda=cr_anchor_camera_cuda,
+        fov_normalization=fov_normalization,
+        timestamp=float(getattr(cr_anchor_camera_cuda, "timestamp", 0.0)),
+        render_width=int(viewport.render_width),
+        render_height=int(viewport.render_height),
+        viewport=viewport,
+        crop_to_fill=crop_to_fill,
+        anchor_c2w=torch.linalg.inv(anchor_viewmat),
     )
 
 

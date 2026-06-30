@@ -44,6 +44,9 @@ from lkg_experiment.coherent_default.run_coherent_raster_experiment import (
 
 
 DEFAULT_PANEL_VIEWS = 45
+PANEL_RENDERER_FIXED = "fixed"
+PANEL_RENDERER_SHADER = "shader"
+PANEL_RENDERER_CHOICES = (PANEL_RENDERER_FIXED, PANEL_RENDERER_SHADER)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decorated", action="store_true")
     parser.add_argument("--not-floating", action="store_true")
     parser.add_argument("--swap-interval", default=0, type=int)
+    parser.add_argument(
+        "--panel-renderer",
+        choices=PANEL_RENDERER_CHOICES,
+        default=PANEL_RENDERER_FIXED,
+        help="OpenGL panel blit path; fixed avoids shader compilation for fragile Bridge/OpenGL stacks.",
+    )
     parser.add_argument("--max-frames", default=0, type=int, help="0 means hold until the panel window is closed")
     parser.add_argument("--stats", action="store_true")
     return parser
@@ -130,6 +139,57 @@ def configure_x11_environment() -> None:
 def graphics_env_summary() -> str:
     keys = ("DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "PYOPENGL_PLATFORM")
     return ", ".join(f"{key}={os.environ.get(key, '') or '<unset>'}" for key in keys)
+
+
+def prepare_pyopengl_before_bridge() -> None:
+    # Import only. Calling shader entrypoints here can crash on fragile Bridge/GL stacks.
+    from OpenGL import GL  # noqa: F401
+
+
+def wake_x11_display_for_panel() -> None:
+    if not os.environ.get("DISPLAY"):
+        return
+    import subprocess
+
+    def run_quietly(command: list[str], *, env: dict[str, str] | None = None) -> None:
+        try:
+            subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    run_quietly(["xset", "dpms", "force", "on"])
+    run_quietly(["xset", "s", "off", "s", "noblank", "-dpms"])
+
+    dbus_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if not dbus_address:
+        bus_path = Path(f"/run/user/{os.getuid()}/bus")
+        if bus_path.exists():
+            dbus_address = f"unix:path={bus_path}"
+    if dbus_address:
+        env = dict(os.environ)
+        env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
+        run_quietly(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.ScreenSaver",
+                "--object-path",
+                "/org/gnome/ScreenSaver",
+                "--method",
+                "org.gnome.ScreenSaver.SetActive",
+                "false",
+            ],
+            env=env,
+        )
 
 
 def resolve_panel_render_size(
@@ -306,12 +366,7 @@ def init_panel_window(args: argparse.Namespace, width: int, height: int, x: int,
 
     if not glfw.init():
         raise RuntimeError("failed to initialize GLFW")
-    gl_major, gl_minor = (4, 1) if sys.platform == "darwin" else (4, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, gl_major)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, gl_minor)
-    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-    if sys.platform == "darwin":
-        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+    configure_panel_context_hints(glfw, args)
     glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
     glfw.window_hint(glfw.DECORATED, glfw.TRUE if args.decorated else glfw.FALSE)
     glfw.window_hint(glfw.RESIZABLE, glfw.FALSE)
@@ -342,6 +397,64 @@ def init_panel_window(args: argparse.Namespace, width: int, height: int, x: int,
     except Exception:
         pass
     return window
+
+
+def init_bridge_bootstrap_context(args: argparse.Namespace):
+    import glfw
+
+    if not glfw.init():
+        raise RuntimeError("failed to initialize GLFW")
+    configure_panel_context_hints(glfw, args)
+    glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+    window = glfw.create_window(1, 1, "LKG Bridge bootstrap", None, None)
+    if not window:
+        glfw.terminate()
+        raise RuntimeError("failed to create GLFW bootstrap window")
+    glfw.make_context_current(window)
+    glfw.swap_interval(0)
+    if panel_renderer(args) == PANEL_RENDERER_SHADER:
+        prewarm_opengl_shader_entrypoints()
+    return window
+
+
+def panel_renderer(args: argparse.Namespace) -> str:
+    value = str(getattr(args, "panel_renderer", PANEL_RENDERER_FIXED))
+    return value if value in PANEL_RENDERER_CHOICES else PANEL_RENDERER_FIXED
+
+
+def configure_panel_context_hints(glfw: Any, args: argparse.Namespace) -> None:
+    if panel_renderer(args) == PANEL_RENDERER_SHADER:
+        gl_major, gl_minor = (4, 1) if sys.platform == "darwin" else (4, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, gl_major)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, gl_minor)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        if sys.platform == "darwin":
+            glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+        return
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 0)
+
+
+def prewarm_opengl_shader_entrypoints() -> None:
+    from OpenGL import GL
+
+    shader = GL.glCreateShader(GL.GL_VERTEX_SHADER)
+    if shader:
+        GL.glDeleteShader(shader)
+    program = GL.glCreateProgram()
+    if program:
+        GL.glDeleteProgram(program)
+
+
+def destroy_glfw_bootstrap_context(window: Any) -> None:
+    if window is None:
+        return
+    try:
+        import glfw
+
+        glfw.destroy_window(window)
+    except Exception:
+        pass
 
 
 def init_panel_texture(width: int, height: int) -> int:
@@ -451,6 +564,49 @@ def create_panel_quad() -> tuple[int, int]:
     return int(vao), int(vbo)
 
 
+def create_panel_read_fbo(texture: int) -> int:
+    from OpenGL import GL
+
+    fbo = GL.glGenFramebuffers(1)
+    GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, int(fbo))
+    GL.glFramebufferTexture2D(
+        GL.GL_READ_FRAMEBUFFER,
+        GL.GL_COLOR_ATTACHMENT0,
+        GL.GL_TEXTURE_2D,
+        int(texture),
+        0,
+    )
+    status = GL.glCheckFramebufferStatus(GL.GL_READ_FRAMEBUFFER)
+    GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, 0)
+    if status != GL.GL_FRAMEBUFFER_COMPLETE:
+        GL.glDeleteFramebuffers(1, [fbo])
+        raise RuntimeError(f"panel texture read framebuffer is incomplete: 0x{int(status):04x}")
+    return int(fbo)
+
+
+def create_panel_renderer_resources(args: argparse.Namespace, texture: int | None = None) -> tuple[int | None, int | None, int | None]:
+    if panel_renderer(args) == PANEL_RENDERER_SHADER:
+        program = create_panel_program()
+        vao, vbo = create_panel_quad()
+        return program, vao, vbo
+    read_fbo = create_panel_read_fbo(texture) if texture is not None else None
+    return None, read_fbo, None
+
+
+def delete_panel_renderer_resources(program: int | None, vao: int | None, vbo: int | None) -> None:
+    from OpenGL import GL
+
+    if vbo is not None:
+        GL.glDeleteBuffers(1, [vbo])
+    if vao is not None:
+        if program is None:
+            GL.glDeleteFramebuffers(1, [vao])
+        else:
+            GL.glDeleteVertexArrays(1, [vao])
+    if program is not None:
+        GL.glDeleteProgram(program)
+
+
 def rendered_to_rgba(rendered: Any) -> np.ndarray:
     rgb = tensor_to_hwc_uint8(rendered)
     rgba = np.empty((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
@@ -477,7 +633,7 @@ def upload_direct(texture: int, width: int, height: int, rgba: np.ndarray) -> No
     )
 
 
-def draw_panel_texture(window: Any, program: int, vao: int, texture: int) -> tuple[int, int]:
+def draw_panel_texture(window: Any, program: int | None, vao: int | None, texture: int) -> tuple[int, int]:
     import glfw
     from OpenGL import GL
 
@@ -495,6 +651,32 @@ def draw_panel_texture(window: Any, program: int, vao: int, texture: int) -> tup
         pass
     GL.glClearColor(0.0, 0.0, 0.0, 1.0)
     GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+    if program is None:
+        read_fbo = int(vao) if vao is not None else create_panel_read_fbo(texture)
+        owns_read_fbo = vao is None
+        try:
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, int(read_fbo))
+            GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
+            GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
+            GL.glDrawBuffer(GL.GL_BACK)
+            GL.glBlitFramebuffer(
+                0,
+                int(fb_height),
+                int(fb_width),
+                0,
+                0,
+                0,
+                int(fb_width),
+                int(fb_height),
+                GL.GL_COLOR_BUFFER_BIT,
+                GL.GL_NEAREST,
+            )
+        finally:
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, 0)
+            GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, 0)
+            if owns_read_fbo:
+                GL.glDeleteFramebuffers(1, [read_fbo])
+        return int(fb_width), int(fb_height)
     GL.glUseProgram(int(program))
     GL.glActiveTexture(GL.GL_TEXTURE0)
     GL.glBindTexture(GL.GL_TEXTURE_2D, int(texture))
@@ -509,6 +691,8 @@ def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
     configure_x11_environment()
+    wake_x11_display_for_panel()
+    prepare_pyopengl_before_bridge()
 
     import torch
 
@@ -525,13 +709,16 @@ def main() -> None:
         checkpoint = resolve_checkpoint_path(args.checkpoint_path, iteration=args.iteration, rank=args.rank)
         cfg = load_cfg(result_root_from_checkpoint(checkpoint))
 
-    bridge = BridgeAPI()
+    bridge = None
+    bootstrap_window = None
     window = None
     texture = None
     program = None
     vao = None
     vbo = None
     try:
+        bootstrap_window = init_bridge_bootstrap_context(args)
+        bridge = BridgeAPI()
         if not bridge.initialize("LkgExperimentRenderPanel"):
             raise RuntimeError("Bridge initialize failed")
         display_handle, display_info = resolve_bridge_or_fallback_display(bridge, args)
@@ -555,9 +742,10 @@ def main() -> None:
                 f"{exc}. GLFW needs access to the local X11 display. "
                 f"Current graphics environment: {graphics_env_summary()}."
             ) from exc
+        destroy_glfw_bootstrap_context(bootstrap_window)
+        bootstrap_window = None
         texture = init_panel_texture(width, height)
-        program = create_panel_program()
-        vao, vbo = create_panel_quad()
+        program, vao, vbo = create_panel_renderer_resources(args, texture)
 
         viewpoint_index, source_view_count, render_view_count, view_labels, mapping_label = build_viewpoint_index(
             args,
@@ -651,7 +839,8 @@ def main() -> None:
             f"native={native_width}x{native_height}, window={width}x{height}@{panel_x},{panel_y}, "
             f"size_mode={size_label}, checkpoint={checkpoint} step={step}, gsplat_root={gsplat_root}, "
             f"camera={camera_label}, views={render_view_count}/{source_view_count}, "
-            f"cluster={args.coherent_cluster_size}, remap={not args.no_remapping}, mapping={mapping_label}",
+            f"cluster={args.coherent_cluster_size}, remap={not args.no_remapping}, "
+            f"panel_renderer={panel_renderer(args)}, mapping={mapping_label}",
             file=sys.stderr,
             flush=True,
         )
@@ -708,18 +897,15 @@ def main() -> None:
                 break
     finally:
         try:
+            delete_panel_renderer_resources(program, vao, vbo)
             from OpenGL import GL
 
-            if vbo is not None:
-                GL.glDeleteBuffers(1, [vbo])
-            if vao is not None:
-                GL.glDeleteVertexArrays(1, [vao])
-            if program is not None:
-                GL.glDeleteProgram(program)
             if texture is not None:
                 GL.glDeleteTextures(1, [texture])
         except Exception:
             pass
+        if bootstrap_window is not None:
+            destroy_glfw_bootstrap_context(bootstrap_window)
         if window is not None:
             try:
                 import glfw
@@ -728,8 +914,16 @@ def main() -> None:
                 glfw.terminate()
             except Exception:
                 pass
+        elif bootstrap_window is not None:
+            try:
+                import glfw
+
+                glfw.terminate()
+            except Exception:
+                pass
         try:
-            bridge.uninitialize()
+            if bridge is not None:
+                bridge.uninitialize()
         except Exception:
             pass
 

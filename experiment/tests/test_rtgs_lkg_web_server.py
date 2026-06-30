@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import tomllib
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -139,6 +141,108 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertAlmostEqual(payload["render_fps"]["current_fps"], 25.0)
         self.assertAlmostEqual(payload["display_fps"]["current_fps"], 100.0)
 
+    def test_publish_render_frame_does_not_require_web_preview_jpeg(self):
+        state = lkg_web_server.InteractiveState()
+        tensor = object()
+        playback = lkg_web_server.PlaybackStatus(
+            frame_index=2,
+            frame_count=5,
+            timestamp=0.25,
+            camera_index=7,
+            n3dv_frame_index=11,
+        )
+
+        state.publish_render_frame(tensor=tensor, render_ms=20.0, playback=playback)
+
+        seq, latest_tensor = state.latest_tensor_snapshot()
+        jpeg_seq, latest_jpeg = state.latest_jpeg_snapshot()
+        payload = state.status_payload()
+        self.assertEqual(seq, 1)
+        self.assertIs(latest_tensor, tensor)
+        self.assertEqual(jpeg_seq, 1)
+        self.assertIsNone(latest_jpeg)
+        self.assertEqual(payload["playback"]["frame_index"], 2)
+        self.assertEqual(payload["playback"]["frame_count"], 5)
+        self.assertAlmostEqual(payload["playback"]["timestamp"], 0.25)
+
+    def test_publish_preview_jpeg_keeps_frame_sequence_and_preview_bytes_separate(self):
+        state = lkg_web_server.InteractiveState()
+        state.publish_render_frame(tensor=object(), render_ms=20.0, playback=None)
+
+        state.publish_preview_jpeg(seq=1, jpeg=b"jpg")
+
+        seq, latest_jpeg = state.latest_jpeg_snapshot()
+        self.assertEqual(seq, 1)
+        self.assertEqual(latest_jpeg, b"jpg")
+
+    def test_playback_cursor_loops_over_timeline(self):
+        timeline = [
+            lkg_web_server.PlaybackFrame(frame_index=0, camera_index=0, n3dv_frame_index=None, timestamp=0.0, camera=object()),
+            lkg_web_server.PlaybackFrame(frame_index=1, camera_index=1, n3dv_frame_index=None, timestamp=0.5, camera=object()),
+            lkg_web_server.PlaybackFrame(frame_index=2, camera_index=2, n3dv_frame_index=None, timestamp=1.0, camera=object()),
+        ]
+        cursor = lkg_web_server.PlaybackCursor(timeline)
+
+        frames = [cursor.next_frame() for _ in range(5)]
+
+        self.assertEqual([frame.frame_index for frame in frames], [0, 1, 2, 0, 1])
+        self.assertEqual(cursor.current_status().frame_index, 1)
+        self.assertEqual(cursor.current_status().frame_count, 3)
+
+    def test_build_dnerf_playback_timeline_keeps_anchor_camera_pose_and_changes_time(self):
+        args = SimpleNamespace(
+            playback_mode="auto",
+            split="test",
+            camera_index=2,
+            n3dv_frame_index=0,
+            device="cpu",
+        )
+        official = SimpleNamespace(
+            scene_paths=SimpleNamespace(dataset_kind="dnerf"),
+            gaussians=object(),
+            iteration=30000,
+            config={},
+            cfg_args=SimpleNamespace(),
+            checkpoint_path=Path("/tmp/chkpnt.pth"),
+            source_path=Path("/tmp/source"),
+            model_args=SimpleNamespace(frame_ratio=1),
+            time_duration=[0.0, 1.0],
+        )
+        context = SimpleNamespace(runtime=SimpleNamespace(official=official))
+        loaded = []
+
+        def fake_load_playback_camera(*, checkpoint_like, args, camera_index, n3dv_frame_index):
+            del checkpoint_like, args, n3dv_frame_index
+            loaded.append(int(camera_index))
+            return SimpleNamespace(
+                pose_id=f"pose_{int(camera_index)}",
+                timestamp=float(camera_index) * 0.25,
+                uid=int(camera_index),
+                image_name=f"cam_{int(camera_index):03d}",
+                image=object(),
+            )
+
+        with mock.patch.object(lkg_web_server, "_dnerf_playback_camera_count", return_value=4), mock.patch.object(
+            lkg_web_server,
+            "_load_playback_camera",
+            side_effect=fake_load_playback_camera,
+        ):
+            timeline = lkg_web_server.build_playback_timeline(args, context)
+
+        self.assertEqual(loaded, [2, 0, 1, 2, 3])
+        self.assertEqual([frame.frame_index for frame in timeline], [0, 1, 2, 3])
+        self.assertEqual([frame.camera_index for frame in timeline], [2, 2, 2, 2])
+        self.assertEqual([frame.timestamp for frame in timeline], [0.0, 0.25, 0.5, 0.75])
+        self.assertEqual([frame.camera.pose_id for frame in timeline], ["pose_2", "pose_2", "pose_2", "pose_2"])
+        self.assertEqual([frame.camera.image_name for frame in timeline], ["time_000", "time_001", "time_002", "time_003"])
+        self.assertTrue(all(frame.camera.image is None for frame in timeline))
+
+    def test_should_encode_web_preview_respects_disabled_and_fps_interval(self):
+        self.assertFalse(lkg_web_server.should_encode_web_preview(web_preview_fps=0.0, now=10.0, last_preview_at=None))
+        self.assertTrue(lkg_web_server.should_encode_web_preview(web_preview_fps=5.0, now=10.0, last_preview_at=None))
+        self.assertFalse(lkg_web_server.should_encode_web_preview(web_preview_fps=5.0, now=10.1, last_preview_at=10.0))
+        self.assertTrue(lkg_web_server.should_encode_web_preview(web_preview_fps=5.0, now=10.2, last_preview_at=10.0))
+
     def test_web_routes_serve_status_and_checkpoints(self):
         option = lkg_web_server.CheckpointOption(
             id="jumpingjacks:checkpoints/chkpnt_best.pth",
@@ -179,6 +283,15 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         run.assert_called_once()
 
+    def test_default_bridge_sdk_root_matches_workspace_checkout(self):
+        args = lkg_web_server.build_parser().parse_args([])
+
+        self.assertEqual(Path(args.bridge_sdk_root).name, "Bridge-Python-SDK-Lab")
+        self.assertEqual(args.playback_mode, "auto")
+        self.assertEqual(args.playback_fps, 0.0)
+        self.assertEqual(args.web_preview_fps, 5.0)
+        self.assertEqual(args.rtgs_context_loader, "lite")
+
     def test_wrapper_script_exists_and_uses_module_main(self):
         script = Path(__file__).resolve().parents[1] / "rtgs_lkg_web_server.py"
 
@@ -196,6 +309,56 @@ class RtgsLkgWebServerTest(unittest.TestCase):
             data["project"]["scripts"]["lkg-rtgs-lkg-web-server"],
             "lkg_experiment.rtgs_coherent.lkg_web_server:main",
         )
+
+    def test_should_wake_panel_display_uses_periodic_interval(self):
+        self.assertTrue(lkg_web_server.should_wake_panel_display(now=10.0, last_wake=None, interval_s=30.0))
+        self.assertFalse(lkg_web_server.should_wake_panel_display(now=20.0, last_wake=10.0, interval_s=30.0))
+        self.assertTrue(lkg_web_server.should_wake_panel_display(now=40.0, last_wake=10.0, interval_s=30.0))
+
+    def test_poll_panel_window_events_sets_stop_event_when_window_closes(self):
+        stop_event = threading.Event()
+        window = object()
+        glfw = SimpleNamespace(
+            poll_events=mock.Mock(),
+            window_should_close=mock.Mock(return_value=True),
+        )
+
+        keep_running = lkg_web_server.poll_panel_window_events(glfw, window, stop_event)
+
+        self.assertFalse(keep_running)
+        self.assertTrue(stop_event.is_set())
+        glfw.poll_events.assert_called_once_with()
+        glfw.window_should_close.assert_called_once_with(window)
+
+    def test_stop_http_server_skips_shutdown_when_web_thread_is_not_running(self):
+        server = SimpleNamespace(shutdown=mock.Mock(), server_close=mock.Mock())
+        web_thread = SimpleNamespace(is_alive=mock.Mock(return_value=False), join=mock.Mock())
+
+        lkg_web_server.stop_http_server(server, web_thread)
+
+        server.shutdown.assert_not_called()
+        server.server_close.assert_called_once_with()
+        web_thread.join.assert_not_called()
+
+    def test_stop_http_server_shutdowns_and_joins_running_web_thread(self):
+        server = SimpleNamespace(shutdown=mock.Mock(), server_close=mock.Mock())
+        web_thread = SimpleNamespace(is_alive=mock.Mock(return_value=True), join=mock.Mock())
+
+        lkg_web_server.stop_http_server(server, web_thread, timeout=3.0)
+
+        server.shutdown.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        web_thread.join.assert_called_once_with(timeout=3.0)
+
+    def test_stop_http_server_still_closes_when_shutdown_is_interrupted(self):
+        server = SimpleNamespace(shutdown=mock.Mock(side_effect=KeyboardInterrupt), server_close=mock.Mock())
+        web_thread = SimpleNamespace(is_alive=mock.Mock(return_value=True), join=mock.Mock())
+
+        lkg_web_server.stop_http_server(server, web_thread, timeout=3.0)
+
+        server.shutdown.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        web_thread.join.assert_called_once_with(timeout=3.0)
 
 
 if __name__ == "__main__":

@@ -296,6 +296,124 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertAlmostEqual(render_ms, 12.5)
         self.assertTrue(torch.allclose(image, one_shot_image))
 
+    def test_context_for_playback_camera_updates_timestamp_and_anchor_pose(self):
+        base_camera = SimpleNamespace(
+            image_width=4,
+            image_height=4,
+            FoVx=0.7,
+            FoVy=0.7,
+            fl_x=4.0,
+            fl_y=4.0,
+            cx=2.0,
+            cy=2.0,
+            image=torch.zeros((3, 4, 4), dtype=torch.float32),
+            timestamp=0.0,
+        )
+        playback_camera = cr_66views.RtgsSimpleCamera(
+            R=np.eye(3, dtype=np.float64),
+            T=np.array([1.0, 2.0, 3.0], dtype=np.float64),
+            FoVx=0.7,
+            FoVy=0.7,
+            image=torch.zeros((3, 4, 4), dtype=torch.float32),
+            image_name="frame_001",
+            uid=1,
+            timestamp=0.5,
+            fl_x=4.0,
+            fl_y=4.0,
+            cx=2.0,
+            cy=2.0,
+            resolution=(4, 4),
+            data_device="cpu",
+        )
+        context = cr_66views.RtgsCr66RenderContext(
+            args=SimpleNamespace(
+                device="cpu",
+                width=8,
+                height=8,
+                aspect_fit="contain",
+                camera_aspect_mode="expand",
+                no_crop_to_fill=False,
+                normalize_explicit_intrinsics_fov=False,
+            ),
+            runtime=SimpleNamespace(official=SimpleNamespace(gaussians=object()), background=None),
+            cr_anchor_camera_cuda=base_camera,
+            fov_normalization={"applied": False},
+            timestamp=0.0,
+            panel_width=8,
+            panel_height=8,
+            render_width=8,
+            render_height=8,
+            viewport=cr_66views.AspectViewport(4, 4, 8, 8, 8, 8, 0, 0, 2.0, "fit"),
+            crop_to_fill=False,
+            source_view_count=2,
+            viewpoint_index=np.zeros((8, 8, 3), dtype=np.int32),
+            viewpoint_index_t=torch.zeros((8, 8, 3), dtype=torch.long),
+            view_index_stats={},
+            geometry=SimpleNamespace(mask=None),
+            anchor_c2w=torch.eye(4),
+            orbit_center=torch.tensor([0.0, 0.0, 1.0]),
+            view_degree=10.0,
+            orbit_direction=-1,
+        )
+
+        updated = cr_66views.context_for_playback_camera(context, playback_camera)
+
+        self.assertAlmostEqual(updated.timestamp, 0.5)
+        self.assertEqual(updated.cr_anchor_camera_cuda.image_name, "frame_001")
+        self.assertFalse(torch.allclose(updated.anchor_c2w, context.anchor_c2w))
+        self.assertEqual(updated.render_width, 8)
+        self.assertEqual(updated.render_height, 8)
+
+    def test_lite_runtime_uses_checkpoint_and_single_camera_without_official_scene(self):
+        args = SimpleNamespace(
+            model_path="/tmp/model",
+            checkpoint="checkpoints/chkpnt_best.pth",
+            rtgs_code_root="/tmp/rtgs",
+            dataset_root="/tmp/dnerf",
+            n3dv_root="/tmp/n3dv",
+            config=None,
+            device="cuda",
+            checkpoint_load_device="cpu",
+            split="test",
+            camera_index=3,
+            n3dv_frame_index=0,
+            background="auto",
+        )
+        scene_paths = SimpleNamespace(scene_name="jumpingjacks", dataset_kind="dnerf", dataset_path=Path("/tmp/dnerf/jumpingjacks"), config_path=Path("/tmp/rtgs/config.yaml"))
+        model = SimpleNamespace(time_duration=[0.0, 1.0])
+        checkpoint = SimpleNamespace(
+            model=model,
+            iteration=30000,
+            config={"ModelParams": {"frame_ratio": 1}},
+            cfg_args=SimpleNamespace(white_background=False),
+            scene_paths=scene_paths,
+            checkpoint_path=Path("/tmp/model/checkpoints/chkpnt_best.pth"),
+        )
+        camera = SimpleNamespace(timestamp=0.25)
+
+        with mock.patch.object(cr_66views, "prepare_official_rtgs_1view") as official_loader, mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_66views.load_rtgs_checkpoint",
+            return_value=checkpoint,
+        ) as load_checkpoint, mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_66views.load_rtgs_camera",
+            return_value=(object(), camera),
+        ) as load_camera, mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_66views._background_tensor",
+            return_value="background",
+        ):
+            runtime = cr_66views.prepare_lite_rtgs_runtime(args)
+
+        official_loader.assert_not_called()
+        load_checkpoint.assert_called_once()
+        load_camera.assert_called_once()
+        self.assertIs(runtime.official.gaussians, model)
+        self.assertIs(runtime.camera, camera)
+        self.assertEqual(runtime.camera_source, "lite_rtgs_camera_loader")
+        self.assertEqual(runtime.background, "background")
+        self.assertEqual(runtime.official.scene_name, "jumpingjacks")
+        self.assertEqual(runtime.official.source_path, Path("/tmp/dnerf/jumpingjacks"))
+        self.assertEqual(runtime.official.model_args.frame_ratio, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

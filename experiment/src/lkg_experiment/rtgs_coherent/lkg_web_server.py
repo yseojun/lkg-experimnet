@@ -7,19 +7,23 @@ import queue
 import sys
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 
 DEFAULT_CHECKPOINT_ROOT = Path("/data/ysj/result/4dgs/RTGS")
 DEFAULT_RTGS_CODE_ROOT = Path(__file__).resolve().parents[4] / "4d-gaussian-splatting"
 DEFAULT_GSPLAT_ROOT = Path(__file__).resolve().parents[4] / "gsplat"
+DEFAULT_BRIDGE_SDK_ROOT = Path(__file__).resolve().parents[4] / "Bridge-Python-SDK-Lab"
 DEFAULT_DATASET_ROOT = Path("/data/ysj/dataset/dnerf")
 DEFAULT_N3DV_ROOT = Path("/data/ysj/dataset/N3DV")
 DEFAULT_VIEWPOINT_INDEX_PATH = Path("/data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz")
 LOADING_TEXT = "\uccb4\ud06c\ud3ec\uc778\ud2b8 \ubcc0\uacbd\uc911"
+PANEL_WAKE_INTERVAL_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,57 @@ class OrbitState:
         }
 
 
+@dataclass(frozen=True)
+class PlaybackFrame:
+    frame_index: int
+    camera_index: int
+    n3dv_frame_index: int | None
+    timestamp: float
+    camera: Any
+
+
+@dataclass(frozen=True)
+class PlaybackStatus:
+    frame_index: int
+    frame_count: int
+    timestamp: float
+    camera_index: int
+    n3dv_frame_index: int | None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "frame_index": int(self.frame_index),
+            "frame_count": int(self.frame_count),
+            "timestamp": float(self.timestamp),
+            "camera_index": int(self.camera_index),
+            "n3dv_frame_index": None if self.n3dv_frame_index is None else int(self.n3dv_frame_index),
+        }
+
+
+class PlaybackCursor:
+    def __init__(self, timeline: list[PlaybackFrame]) -> None:
+        if not timeline:
+            raise ValueError("playback timeline must contain at least one frame")
+        self.timeline = list(timeline)
+        self.index = 0
+        self.current = self.timeline[0]
+
+    def next_frame(self) -> PlaybackFrame:
+        frame = self.timeline[self.index]
+        self.current = frame
+        self.index = (self.index + 1) % len(self.timeline)
+        return frame
+
+    def current_status(self) -> PlaybackStatus:
+        return PlaybackStatus(
+            frame_index=int(self.current.frame_index),
+            frame_count=len(self.timeline),
+            timestamp=float(self.current.timestamp),
+            camera_index=int(self.current.camera_index),
+            n3dv_frame_index=self.current.n3dv_frame_index,
+        )
+
+
 class FpsAccumulator:
     def __init__(self) -> None:
         self.frames = 0
@@ -120,6 +175,7 @@ class RuntimeBundle:
     checkpoint: CheckpointOption
     args: argparse.Namespace
     context: Any
+    cursor: PlaybackCursor
 
 
 class InteractiveState:
@@ -133,7 +189,9 @@ class InteractiveState:
         self.display_fps = FpsAccumulator()
         self.frame_seq = 0
         self.latest_jpeg: bytes | None = None
+        self.latest_jpeg_seq = 0
         self.latest_tensor: Any = None
+        self.playback_status: PlaybackStatus | None = None
         self.runtime_bundle: RuntimeBundle | None = None
 
     def set_active_checkpoint(self, option: CheckpointOption) -> None:
@@ -166,12 +224,19 @@ class InteractiveState:
         with self._lock:
             self.last_error = message
 
-    def publish_frame(self, *, tensor: Any, jpeg: bytes, render_ms: float) -> None:
+    def publish_render_frame(self, *, tensor: Any, render_ms: float, playback: PlaybackStatus | None) -> None:
         with self._lock:
             self.latest_tensor = tensor
-            self.latest_jpeg = bytes(jpeg)
             self.frame_seq += 1
+            self.latest_jpeg_seq = self.frame_seq
+            if playback is not None:
+                self.playback_status = playback
             self.render_fps.add_frame(render_ms)
+
+    def publish_preview_jpeg(self, *, seq: int, jpeg: bytes) -> None:
+        with self._lock:
+            self.latest_jpeg_seq = int(seq)
+            self.latest_jpeg = bytes(jpeg)
 
     def latest_tensor_snapshot(self) -> tuple[int, Any]:
         with self._lock:
@@ -179,7 +244,7 @@ class InteractiveState:
 
     def latest_jpeg_snapshot(self) -> tuple[int, bytes | None]:
         with self._lock:
-            return self.frame_seq, self.latest_jpeg
+            return self.latest_jpeg_seq, self.latest_jpeg
 
     def record_display_frame(self, display_ms: float) -> None:
         with self._lock:
@@ -193,6 +258,7 @@ class InteractiveState:
                 "frame_seq": int(self.frame_seq),
                 "active_checkpoint": None if self.active_checkpoint is None else self.active_checkpoint.to_json(),
                 "orbit": self.orbit.to_json(),
+                "playback": None if self.playback_status is None else self.playback_status.to_json(),
                 "render_fps": self.render_fps.to_json(),
                 "display_fps": self.display_fps.to_json(),
             }
@@ -207,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--display-mode", choices=("glfw", "none"), default="glfw")
     parser.add_argument("--display-index", default=0, type=int)
-    parser.add_argument("--bridge-sdk-root", default=str(Path(__file__).resolve().parents[4] / "LookingGlassBridge"))
+    parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
     parser.add_argument("--allow-bridge-display-fallback", action="store_true")
     parser.add_argument("--allow-non-native-panel-size", action="store_true")
     parser.add_argument("--window-x", type=int)
@@ -215,6 +281,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decorated", action="store_true")
     parser.add_argument("--not-floating", action="store_true")
     parser.add_argument("--swap-interval", default=0, type=int)
+    parser.add_argument(
+        "--panel-renderer",
+        choices=("fixed", "shader"),
+        default="fixed",
+        help="OpenGL panel blit path; fixed avoids shader compilation for fragile Bridge/OpenGL stacks.",
+    )
     parser.add_argument("--rtgs-code-root", default=str(DEFAULT_RTGS_CODE_ROOT))
     parser.add_argument("--rtgs-code-policy", choices=("clean", "as-is"), default="clean")
     parser.add_argument("--rtgs-clean-cache-root", default=None)
@@ -251,6 +323,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-cr", action="store_true")
     parser.add_argument("--max-frames", default=0, type=int)
     parser.add_argument("--frame-sleep", default=0.0, type=float)
+    parser.add_argument("--playback-mode", choices=("auto", "static"), default="auto")
+    parser.add_argument("--playback-fps", default=0.0, type=float)
+    parser.add_argument("--web-preview-fps", default=5.0, type=float)
+    parser.add_argument(
+        "--rtgs-context-loader",
+        choices=("lite", "official"),
+        default="lite",
+        help="Use lightweight checkpoint+single-camera loading for interactive playback, or official Scene loading for diagnostics.",
+    )
     return parser
 
 
@@ -411,6 +492,175 @@ def build_rtgs_cr_args_for_checkpoint(base_args: argparse.Namespace, option: Che
     return cr_66views.build_parser().parse_args(argv)
 
 
+def build_playback_timeline(args: argparse.Namespace, context: Any) -> list[PlaybackFrame]:
+    if str(getattr(args, "playback_mode", "auto")) == "static":
+        camera = context.runtime.camera
+        return [
+            PlaybackFrame(
+                frame_index=0,
+                camera_index=int(args.camera_index),
+                n3dv_frame_index=int(args.n3dv_frame_index) if context.runtime.official.scene_paths.dataset_kind == "n3dv" else None,
+                timestamp=float(getattr(camera, "timestamp", context.timestamp)),
+                camera=camera,
+            )
+        ]
+
+    official = context.runtime.official
+    checkpoint_like = SimpleNamespace(
+        model=official.gaussians,
+        iteration=official.iteration,
+        config=official.config,
+        cfg_args=official.cfg_args,
+        scene_paths=official.scene_paths,
+        checkpoint_path=official.checkpoint_path,
+    )
+
+    if official.scene_paths.dataset_kind == "n3dv":
+        frame_indices = _n3dv_playback_frame_indices(args, official)
+        if frame_indices:
+            frames = []
+            for timeline_index, frame_index in enumerate(frame_indices):
+                camera = _load_playback_camera(
+                    checkpoint_like=checkpoint_like,
+                    args=args,
+                    camera_index=int(args.camera_index),
+                    n3dv_frame_index=int(frame_index),
+                )
+                frames.append(
+                    PlaybackFrame(
+                        frame_index=timeline_index,
+                        camera_index=int(args.camera_index),
+                        n3dv_frame_index=int(frame_index),
+                        timestamp=float(getattr(camera, "timestamp", 0.0)),
+                        camera=camera,
+                    )
+                )
+            return frames
+
+    if official.scene_paths.dataset_kind == "dnerf":
+        return _build_fixed_pose_dnerf_timeline(args, official, checkpoint_like)
+
+    frame_count = _dnerf_playback_camera_count(args, official)
+    frames = []
+    for timeline_index in range(frame_count):
+        camera = _load_playback_camera(
+            checkpoint_like=checkpoint_like,
+            args=args,
+            camera_index=timeline_index,
+            n3dv_frame_index=int(args.n3dv_frame_index),
+        )
+        frames.append(
+            PlaybackFrame(
+                frame_index=timeline_index,
+                camera_index=timeline_index,
+                n3dv_frame_index=None,
+                timestamp=float(getattr(camera, "timestamp", 0.0)),
+                camera=camera,
+            )
+        )
+    return frames
+
+
+def _build_fixed_pose_dnerf_timeline(args: argparse.Namespace, official: Any, checkpoint_like: Any) -> list[PlaybackFrame]:
+    frame_count = _dnerf_playback_camera_count(args, official)
+    anchor_camera = _load_playback_camera(
+        checkpoint_like=checkpoint_like,
+        args=args,
+        camera_index=int(args.camera_index),
+        n3dv_frame_index=int(args.n3dv_frame_index),
+    )
+    frames = []
+    for timeline_index in range(frame_count):
+        time_camera = _load_playback_camera(
+            checkpoint_like=checkpoint_like,
+            args=args,
+            camera_index=timeline_index,
+            n3dv_frame_index=int(args.n3dv_frame_index),
+        )
+        timestamp = float(getattr(time_camera, "timestamp", 0.0))
+        playback_camera = clone_camera_with_timestamp(
+            anchor_camera,
+            timestamp=timestamp,
+            timeline_index=timeline_index,
+        )
+        frames.append(
+            PlaybackFrame(
+                frame_index=timeline_index,
+                camera_index=int(args.camera_index),
+                n3dv_frame_index=None,
+                timestamp=timestamp,
+                camera=playback_camera,
+            )
+        )
+    return frames
+
+
+def clone_camera_with_timestamp(anchor_camera: Any, *, timestamp: float, timeline_index: int) -> Any:
+    camera = deepcopy(anchor_camera)
+    if hasattr(camera, "timestamp"):
+        camera.timestamp = float(timestamp)
+    if hasattr(camera, "uid"):
+        camera.uid = int(timeline_index)
+    if hasattr(camera, "colmap_id"):
+        camera.colmap_id = int(timeline_index)
+    if hasattr(camera, "image_name"):
+        camera.image_name = f"time_{int(timeline_index):03d}"
+    if hasattr(camera, "image"):
+        camera.image = None
+    return camera
+
+
+def _load_playback_camera(*, checkpoint_like: Any, args: argparse.Namespace, camera_index: int, n3dv_frame_index: int) -> Any:
+    from lkg_experiment.rtgs_coherent.cli import load_rtgs_camera
+
+    _gt, camera = load_rtgs_camera(
+        checkpoint=checkpoint_like,
+        split=str(args.split),
+        camera_index=int(camera_index),
+        device=str(args.device),
+        n3dv_frame_index=int(n3dv_frame_index),
+    )
+    if hasattr(camera, "image"):
+        camera.image = None
+    return camera
+
+
+def _dnerf_playback_camera_count(args: argparse.Namespace, official: Any) -> int:
+    from lkg_experiment.rtgs_coherent.cli import _count_blender_cameras
+
+    return _count_blender_cameras(
+        source_path=Path(official.source_path),
+        split=str(args.split),
+        frame_ratio=int(getattr(official.model_args, "frame_ratio", 1)),
+        time_duration=[float(value) for value in official.time_duration],
+    )
+
+
+def _n3dv_playback_frame_indices(args: argparse.Namespace, official: Any) -> list[int]:
+    from lkg_experiment.rtgs_coherent.cli import (
+        _has_rtgs_n3dv_dynamic_cameras,
+        _read_rtgs_n3dv_dynamic_camera_index,
+        _rtgs_camera_loader_args,
+        _select_rtgs_n3dv_dynamic_cameras,
+    )
+
+    loader_args = _rtgs_camera_loader_args(
+        config=official.config,
+        cfg_args=official.cfg_args,
+        scene_paths=official.scene_paths,
+        device=str(args.device),
+    )
+    loader_args.n3dv_frame_index = -1
+    if not _has_rtgs_n3dv_dynamic_cameras(loader_args):
+        return []
+    selected = _select_rtgs_n3dv_dynamic_cameras(
+        _read_rtgs_n3dv_dynamic_camera_index(loader_args),
+        args=loader_args,
+        split=str(args.split),
+    )
+    return sorted({int(camera["frame_index"]) for camera in selected})
+
+
 def create_http_server(
     host: str,
     port: int,
@@ -487,6 +737,32 @@ def handle_http_get(path: str, *, state: InteractiveState, catalog: CheckpointCa
     return 404, "text/plain", b""
 
 
+def should_wake_panel_display(*, now: float, last_wake: float | None, interval_s: float = PANEL_WAKE_INTERVAL_S) -> bool:
+    return last_wake is None or (float(now) - float(last_wake)) >= float(interval_s)
+
+
+def should_encode_web_preview(*, web_preview_fps: float, now: float, last_preview_at: float | None) -> bool:
+    fps = float(web_preview_fps)
+    if fps <= 0.0:
+        return False
+    return last_preview_at is None or (float(now) - float(last_preview_at)) + 1e-9 >= (1.0 / fps)
+
+
+def _playback_sleep_seconds(playback_fps: float, render_start: float) -> float:
+    fps = float(playback_fps)
+    if fps <= 0.0:
+        return 0.0
+    return max(0.0, (1.0 / fps) - (time.perf_counter() - float(render_start)))
+
+
+def poll_panel_window_events(glfw: Any, window: Any, stop_event: threading.Event) -> bool:
+    glfw.poll_events()
+    if glfw.window_should_close(window):
+        stop_event.set()
+        return False
+    return True
+
+
 def _json_response(payload: dict[str, Any], *, status: int = 200) -> tuple[int, str, bytes]:
     return status, "application/json", json.dumps(payload, sort_keys=True).encode("utf-8")
 
@@ -521,8 +797,19 @@ class CheckpointWorker(threading.Thread):
             try:
                 rtgs_args = build_rtgs_cr_args_for_checkpoint(self.args, option)
                 with self.gpu_lock:
-                    context = cr_66views.prepare_rtgs_cr_66_context(rtgs_args)
-                self.state.set_runtime_bundle(RuntimeBundle(checkpoint=option, args=rtgs_args, context=context))
+                    if str(self.args.rtgs_context_loader) == "official":
+                        context = cr_66views.prepare_rtgs_cr_66_context(rtgs_args)
+                    else:
+                        context = cr_66views.prepare_rtgs_cr_66_context_lite(rtgs_args)
+                timeline = build_playback_timeline(self.args, context)
+                self.state.set_runtime_bundle(
+                    RuntimeBundle(
+                        checkpoint=option,
+                        args=rtgs_args,
+                        context=context,
+                        cursor=PlaybackCursor(timeline),
+                    )
+                )
             except Exception as exc:
                 self.state.set_error(str(exc))
             finally:
@@ -553,21 +840,68 @@ class RenderingWorker(threading.Thread):
                 time.sleep(0.05)
                 continue
             try:
+                frame_info = bundle.cursor.next_frame()
+                render_context = cr_66views.context_for_playback_camera(bundle.context, frame_info.camera)
+                render_start = time.perf_counter()
                 with self.gpu_lock:
                     frame, render_ms = cr_66views.render_rtgs_cr_66_interlaced_frame(
-                        bundle.context,
+                        render_context,
                         orbit_state=self.state.orbit_snapshot(),
                         debug=bool(self.args.debug_cr),
                     )
-                    jpeg = tensor_to_jpeg_bytes(frame)
-                self.state.publish_frame(tensor=frame.detach(), jpeg=jpeg, render_ms=render_ms)
+                self.state.publish_render_frame(
+                    tensor=frame.detach(),
+                    render_ms=render_ms,
+                    playback=bundle.cursor.current_status(),
+                )
             except Exception as exc:
                 self.state.set_error(str(exc))
                 time.sleep(0.2)
+                continue
             if self.args.max_frames and self.state.status_payload()["frame_seq"] >= int(self.args.max_frames):
                 self.stop_event.set()
-            if float(self.args.frame_sleep) > 0.0:
-                time.sleep(float(self.args.frame_sleep))
+            sleep_s = max(float(self.args.frame_sleep), _playback_sleep_seconds(float(self.args.playback_fps), render_start))
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+
+
+class WebPreviewWorker(threading.Thread):
+    def __init__(
+        self,
+        *,
+        args: argparse.Namespace,
+        state: InteractiveState,
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(name="WebPreviewWorker", daemon=True)
+        self.args = args
+        self.state = state
+        self.stop_event = stop_event
+
+    def run(self) -> None:
+        last_seq = -1
+        last_preview_at: float | None = None
+        while not self.stop_event.is_set():
+            now = time.perf_counter()
+            if not should_encode_web_preview(
+                web_preview_fps=float(self.args.web_preview_fps),
+                now=now,
+                last_preview_at=last_preview_at,
+            ):
+                time.sleep(0.01)
+                continue
+            seq, tensor = self.state.latest_tensor_snapshot()
+            if tensor is None or seq == last_seq:
+                time.sleep(0.01)
+                continue
+            try:
+                jpeg = tensor_to_jpeg_bytes(tensor)
+                self.state.publish_preview_jpeg(seq=seq, jpeg=jpeg)
+                last_seq = seq
+                last_preview_at = now
+            except Exception as exc:
+                self.state.set_error(str(exc))
+                time.sleep(0.2)
 
 
 class DisplayWorker(threading.Thread):
@@ -598,27 +932,36 @@ class DisplayWorker(threading.Thread):
         from lkg_experiment.coherent_default.build_lut_npz import _load_bridge_api, install_bridge_sdk_root
         from lkg_experiment.coherent_default.render_looking_glass import (
             configure_x11_environment,
-            create_panel_program,
-            create_panel_quad,
+            create_panel_renderer_resources,
+            delete_panel_renderer_resources,
+            destroy_glfw_bootstrap_context,
             draw_panel_texture,
+            init_bridge_bootstrap_context,
             init_panel_texture,
             init_panel_window,
+            prepare_pyopengl_before_bridge,
             rendered_to_rgba,
             resolve_bridge_or_fallback_display,
             resolve_panel_render_size,
             upload_direct,
+            wake_x11_display_for_panel,
         )
 
         configure_x11_environment()
+        wake_x11_display_for_panel()
+        prepare_pyopengl_before_bridge()
         install_bridge_sdk_root(self.args.bridge_sdk_root)
         BridgeAPI, _ = _load_bridge_api()
-        bridge = BridgeAPI()
+        bootstrap_window = None
+        bridge = None
         window = None
         texture = None
         program = None
         vao = None
         vbo = None
         try:
+            bootstrap_window = init_bridge_bootstrap_context(self.args)
+            bridge = BridgeAPI()
             if not bridge.initialize("LkgRtgsWebServer"):
                 raise RuntimeError("Bridge initialize failed")
             display_handle, display_info = resolve_bridge_or_fallback_display(bridge, self.args)
@@ -637,11 +980,21 @@ class DisplayWorker(threading.Thread):
                 allow_non_native=bool(self.args.allow_non_native_panel_size),
             )
             window = init_panel_window(self.args, width, height, int(panel_x), int(panel_y))
+            destroy_glfw_bootstrap_context(bootstrap_window)
+            bootstrap_window = None
             texture = init_panel_texture(width, height)
-            program = create_panel_program()
-            vao, vbo = create_panel_quad()
+            program, vao, vbo = create_panel_renderer_resources(self.args, texture)
             last_seq = -1
+            last_wake = time.perf_counter()
+            import glfw
+
             while not self.stop_event.is_set():
+                now = time.perf_counter()
+                if should_wake_panel_display(now=now, last_wake=last_wake):
+                    wake_x11_display_for_panel()
+                    last_wake = now
+                if not poll_panel_window_events(glfw, window, self.stop_event):
+                    break
                 seq, tensor = self.state.latest_tensor_snapshot()
                 if tensor is not None and seq != last_seq:
                     start = time.perf_counter()
@@ -649,23 +1002,23 @@ class DisplayWorker(threading.Thread):
                         rgba = rendered_to_rgba(tensor)
                     upload_direct(texture, width, height, rgba)
                     draw_panel_texture(window, program, vao, texture)
-                    import glfw
-
                     glfw.swap_buffers(window)
                     self.state.record_display_frame((time.perf_counter() - start) * 1000.0)
                     last_seq = seq
                 else:
                     draw_panel_texture(window, program, vao, texture)
-                    import glfw
-
                     glfw.swap_buffers(window)
-                    glfw.poll_events()
-                    if glfw.window_should_close(window):
-                        self.stop_event.set()
-                        break
                     time.sleep(0.005)
         finally:
-            _cleanup_glfw(window=window, texture=texture, program=program, vao=vao, vbo=vbo, bridge=bridge)
+            _cleanup_glfw(
+                window=window,
+                bootstrap_window=bootstrap_window,
+                texture=texture,
+                program=program,
+                vao=vao,
+                vbo=vbo,
+                bridge=bridge,
+            )
 
 
 def run_interactive_server(args: argparse.Namespace) -> int:
@@ -680,6 +1033,7 @@ def run_interactive_server(args: argparse.Namespace) -> int:
     stop_event = threading.Event()
     checkpoint_worker = CheckpointWorker(args=args, state=state, requests=requests, gpu_lock=gpu_lock, stop_event=stop_event)
     rendering_worker = RenderingWorker(args=args, state=state, gpu_lock=gpu_lock, stop_event=stop_event)
+    preview_worker = WebPreviewWorker(args=args, state=state, stop_event=stop_event)
     display_worker = DisplayWorker(args=args, state=state, gpu_lock=gpu_lock, stop_event=stop_event)
     server = create_http_server(args.host, int(args.port), state=state, catalog=catalog, checkpoint_queue=requests)
     web_thread = threading.Thread(target=server.serve_forever, name="WebServerWorker", daemon=True)
@@ -687,6 +1041,7 @@ def run_interactive_server(args: argparse.Namespace) -> int:
     print(f"Initial checkpoint: {initial.checkpoint_path}", file=sys.stderr, flush=True)
     checkpoint_worker.start()
     rendering_worker.start()
+    preview_worker.start()
     display_worker.start()
     web_thread.start()
     try:
@@ -695,13 +1050,26 @@ def run_interactive_server(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         stop_event.set()
     finally:
-        server.shutdown()
-        server.server_close()
+        stop_http_server(server, web_thread)
         checkpoint_worker.join(timeout=5)
         rendering_worker.join(timeout=5)
+        preview_worker.join(timeout=5)
         display_worker.join(timeout=5)
-        web_thread.join(timeout=5)
     return 0
+
+
+def stop_http_server(server: Any, web_thread: threading.Thread, *, timeout: float = 5.0) -> None:
+    web_thread_running = bool(web_thread.is_alive())
+    try:
+        if web_thread_running:
+            try:
+                server.shutdown()
+            except KeyboardInterrupt:
+                pass
+    finally:
+        server.server_close()
+        if web_thread_running:
+            web_thread.join(timeout=timeout)
 
 
 def tensor_to_jpeg_bytes(tensor: Any, *, quality: int = 90) -> bytes:
@@ -715,20 +1083,32 @@ def tensor_to_jpeg_bytes(tensor: Any, *, quality: int = 90) -> bytes:
     return buf.getvalue()
 
 
-def _cleanup_glfw(*, window: Any, texture: Any, program: Any, vao: Any, vbo: Any, bridge: Any) -> None:
+def _cleanup_glfw(
+    *,
+    window: Any,
+    texture: Any,
+    program: Any,
+    vao: Any,
+    vbo: Any,
+    bridge: Any,
+    bootstrap_window: Any = None,
+) -> None:
     try:
+        from lkg_experiment.coherent_default.render_looking_glass import delete_panel_renderer_resources
         from OpenGL import GL
 
-        if vbo is not None:
-            GL.glDeleteBuffers(1, [vbo])
-        if vao is not None:
-            GL.glDeleteVertexArrays(1, [vao])
-        if program is not None:
-            GL.glDeleteProgram(program)
+        delete_panel_renderer_resources(program, vao, vbo)
         if texture is not None:
             GL.glDeleteTextures(1, [texture])
     except Exception:
         pass
+    if bootstrap_window is not None:
+        try:
+            from lkg_experiment.coherent_default.render_looking_glass import destroy_glfw_bootstrap_context
+
+            destroy_glfw_bootstrap_context(bootstrap_window)
+        except Exception:
+            pass
     if window is not None:
         try:
             import glfw
@@ -737,8 +1117,16 @@ def _cleanup_glfw(*, window: Any, texture: Any, program: Any, vao: Any, vbo: Any
             glfw.terminate()
         except Exception:
             pass
+    elif bootstrap_window is not None:
+        try:
+            import glfw
+
+            glfw.terminate()
+        except Exception:
+            pass
     try:
-        bridge.uninitialize()
+        if bridge is not None:
+            bridge.uninitialize()
     except Exception:
         pass
 

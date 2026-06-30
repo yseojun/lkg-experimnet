@@ -1,7 +1,9 @@
+import ctypes
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -354,6 +356,19 @@ class BuildLutNpzTest(unittest.TestCase):
 
         self.assertIn(str(root / "src"), sys.path)
         self.assertIn(str(root / "src/bridge_python_sdk"), sys.path)
+
+    def test_install_bridge_sdk_root_preloads_configured_system_libcurl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Bridge-Python-SDK-Lab"
+            (root / "src/bridge_python_sdk").mkdir(parents=True)
+            libcurl = Path(tmp) / "libcurl.so.4"
+            libcurl.write_bytes(b"")
+
+            with mock.patch.dict("os.environ", {"LKG_BRIDGE_SYSTEM_LIBCURL": str(libcurl)}):
+                with mock.patch.object(ctypes, "CDLL") as cdll:
+                    install_bridge_sdk_root(root)
+
+        cdll.assert_called_once_with(str(libcurl), mode=ctypes.RTLD_GLOBAL)
 
 
 if __name__ == "__main__":
