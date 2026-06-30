@@ -774,31 +774,71 @@ def materialize_rtgs_geometry(
     *,
     timestamp: float,
     scaling_modifier: float = 1.0,
-) -> RtgsSnapshotGeometry:
+    return_timing: bool = False,
+) -> RtgsSnapshotGeometry | tuple[RtgsSnapshotGeometry, dict[str, float]]:
     import torch
 
     means_base = pc.get_xyz
     opacity = pc.get_opacity.reshape(-1)
+    device = getattr(means_base, "device", None)
+    timing: dict[str, float] = {}
+
+    stage_start = _timing_stage_start(enabled=bool(return_timing), device=device)
     if bool(getattr(pc, "rot_4d", False)):
         covars, delta_mean = pc.get_current_covariance_and_mean_offset(float(scaling_modifier), float(timestamp))
         means = means_base + delta_mean
     else:
         covars = pc.get_covariance(float(scaling_modifier))
         means = means_base
+    timing["dynamic_geometry_ms"] = _timing_stage_elapsed_ms(stage_start, enabled=bool(return_timing), device=device)
 
+    stage_start = _timing_stage_start(enabled=bool(return_timing), device=device)
     if int(getattr(pc, "gaussian_dim", 3)) == 4:
         marginal_t = pc.get_marginal_t(float(timestamp), float(scaling_modifier)).reshape(-1)
         opacity = opacity * marginal_t
         mask = marginal_t > 0.05
     else:
         mask = torch.ones((means_base.shape[0],), dtype=torch.bool, device=means_base.device)
+    timing["temporal_opacity_ms"] = _timing_stage_elapsed_ms(stage_start, enabled=bool(return_timing), device=device)
 
-    return RtgsSnapshotGeometry(
+    stage_start = _timing_stage_start(enabled=bool(return_timing), device=device)
+    geometry = RtgsSnapshotGeometry(
         means=means[mask].contiguous(),
         covars=covars[mask].contiguous(),
         opacities=opacity[mask].contiguous(),
         mask=mask.contiguous(),
     )
+    timing["snapshot_compaction_ms"] = _timing_stage_elapsed_ms(stage_start, enabled=bool(return_timing), device=device)
+    if bool(return_timing):
+        return geometry, timing
+    return geometry
+
+
+def _timing_stage_start(*, enabled: bool, device: Any) -> float:
+    if enabled and _timing_should_sync(device):
+        import torch
+
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _timing_stage_elapsed_ms(start: float, *, enabled: bool, device: Any) -> float:
+    if enabled and _timing_should_sync(device):
+        import torch
+
+        torch.cuda.synchronize()
+    return float((time.perf_counter() - start) * 1000.0) if enabled else 0.0
+
+
+def _timing_should_sync(device: Any) -> bool:
+    if device is None or not str(device).startswith("cuda"):
+        return False
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def snapshot_from_geometry(

@@ -21,7 +21,7 @@ The timing scope is one rendered frame at one timestamp. Checkpoint loading, CUD
 | `timestamp` | RTGS timestamp used to materialize dynamic Gaussians. |
 | `output_prefix` | Optional filename prefix used when saving image artifacts. |
 | `engine` | Experiment engine. Current RTGS + CR experiment uses `one_shot`. |
-| `variant` | Variant name, for example `cluster_1`, `cluster_8_without_remap`, or `cluster_8_without_reuse`. |
+| `variant` | Variant name, for example `cluster_8`, `without_remap`, `without_reuse`, or `without_reuse_without_remap`. `without_reuse` is the official RTGS reference/GT variant in RTGS + CR experiments. |
 | `group` | Variant group used for aggregation/comparison. |
 
 ## Configuration Columns
@@ -38,6 +38,7 @@ The timing scope is one rendered frame at one timestamp. Checkpoint loading, CUD
 | `reuse_enabled` | Whether clustered attribute reuse is enabled. If false, rendering should behave like cluster size 1 for reuse-sensitive work. |
 | `tile_size` | CoherentRaster tile size. |
 | `map_mode` | LKG view mapping mode used to generate the interlaced lookup. |
+| `camera_aspect_mode` | Synthetic camera aspect policy. `expand` builds a full-panel 9:16 camera for LKG output; `preserve` keeps the legacy `aspect_fit` viewport/camera behavior. |
 
 ## RTGS Dynamic Timing
 
@@ -113,6 +114,7 @@ These metrics compare sampled RTGS + CR source-view renders against the official
 ## Notes
 
 - `lkg_interlace_post_ms` is intentionally not folded into `cr_core_total_ms`.
+- The current CR Python wrapper records `cr_keygen_ms` around the tile-intersection/key path. `cr_sort_ms` is kept as a schema column and records `0.0` until the CUDA path exposes sorting as a separately timed stage.
 - `frame_ms_without_lkg` is the fairer number for comparing dynamic RTGS + CR against renderer-only baselines.
 - `frame_ms_with_lkg_interlace` is the practical number for producing an LKG-ready tensor.
 - Disk output, video encoding, GLFW texture upload, and display swap should be measured in separate output/display columns if needed later.

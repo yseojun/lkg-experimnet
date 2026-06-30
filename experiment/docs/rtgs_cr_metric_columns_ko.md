@@ -19,7 +19,7 @@
 | `timestamp` | dynamic Gaussian을 materialize할 때 사용한 RTGS timestamp. |
 | `output_prefix` | image artifact 저장 시 사용하는 선택적 파일명 prefix. |
 | `engine` | 실험 engine. 현재 RTGS + CR experiment는 `one_shot`을 사용한다. |
-| `variant` | variant 이름. 예: `cluster_1`, `cluster_8_without_remap`, `cluster_8_without_reuse`. |
+| `variant` | variant 이름. 예: `cluster_8`, `without_remap`, `without_reuse`, `without_reuse_without_remap`. RTGS + CR 실험에서 `without_reuse`는 official RTGS reference/GT variant로 사용한다. |
 | `group` | aggregation/comparison에 사용하는 variant group. |
 
 ## 설정 컬럼
@@ -36,6 +36,7 @@
 | `reuse_enabled` | clustered attribute reuse 사용 여부. false이면 reuse-sensitive 작업에서는 cluster size 1과 같은 동작을 해야 한다. |
 | `tile_size` | CoherentRaster tile size. |
 | `map_mode` | interlaced lookup 생성을 위해 사용한 LKG view mapping mode. |
+| `camera_aspect_mode` | synthetic camera aspect 정책. `expand`는 LKG 출력을 위해 full-panel 9:16 camera를 만들고, `preserve`는 기존 `aspect_fit` viewport/camera 동작을 유지한다. |
 
 ## RTGS Dynamic Timing
 
@@ -111,6 +112,7 @@
 ## 해석 메모
 
 - `lkg_interlace_post_ms`는 의도적으로 `cr_core_total_ms`에 포함하지 않는다.
+- 현재 CR Python wrapper는 tile-intersection/key 경로를 `cr_keygen_ms`로 측정한다. `cr_sort_ms`는 schema 컬럼으로 유지하되, CUDA 경로에서 sort를 별도 timing stage로 노출하기 전까지 `0.0`으로 기록한다.
 - `frame_ms_without_lkg`는 dynamic RTGS + CR을 renderer-only baseline과 비교할 때 더 공정한 값이다.
 - `frame_ms_with_lkg_interlace`는 LKG-ready tensor를 실제로 생성하는 데 필요한 실용적인 값이다.
 - disk output, video encoding, GLFW texture upload, display swap은 필요 시 별도 output/display 컬럼으로 측정해야 한다.

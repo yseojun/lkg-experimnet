@@ -234,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", default=2560, type=int)
     parser.add_argument("--views", default=66, type=int)
     parser.add_argument("--aspect-fit", choices=("contain", "fill", "fit"), default="contain")
+    parser.add_argument("--camera-aspect-mode", choices=("preserve", "expand"), default="expand")
     parser.add_argument("--view-degree", default=53.0, type=float)
     parser.add_argument("--orbit-direction", default=-1, type=int)
     parser.add_argument("--orbit-center-distance", default=0.0, type=float)
@@ -363,6 +364,8 @@ def build_rtgs_cr_args_for_checkpoint(base_args: argparse.Namespace, option: Che
         str(base_args.views),
         "--aspect-fit",
         str(base_args.aspect_fit),
+        "--camera-aspect-mode",
+        str(base_args.camera_aspect_mode),
         "--view-degree",
         str(base_args.view_degree),
         "--orbit-direction",

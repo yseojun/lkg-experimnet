@@ -195,7 +195,15 @@ class RtgsCrOneShotTest(unittest.TestCase):
 
         def fake_rasterization_cr(**kwargs):
             calls["rasterization"] = kwargs
-            return fake_render.clone(), None, None
+            self.assertTrue(kwargs["return_timing"])
+            return fake_render.clone(), None, {
+                "timing_ms": {
+                    "cr_projection_ms": 1.0,
+                    "cr_keygen_ms": 2.0,
+                    "cr_sort_ms": 0.0,
+                    "cr_blend_ms": 3.0,
+                }
+            }
 
         raster_module.rasterization_CR = fake_rasterization_cr
 
@@ -223,6 +231,21 @@ class RtgsCrOneShotTest(unittest.TestCase):
                 "gsplat.rendering_coherent_raster": raster_module,
             },
         ), mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_66views.materialize_rtgs_geometry",
+            return_value=(
+                SimpleNamespace(
+                    means=torch.zeros((2, 3), dtype=torch.float32),
+                    covars=torch.zeros((2, 6), dtype=torch.float32),
+                    opacities=torch.ones(2, dtype=torch.float32),
+                    mask=torch.ones(2, dtype=torch.bool),
+                ),
+                {
+                    "dynamic_geometry_ms": 0.5,
+                    "temporal_opacity_ms": 0.25,
+                    "snapshot_compaction_ms": 0.25,
+                },
+            ),
+        ) as materialize, mock.patch(
             "lkg_experiment.rtgs_coherent.cr_one_shot.build_viewport_cr_lookup",
             wraps=cr_one_shot.build_viewport_cr_lookup,
         ) as build_lookup, mock.patch(
@@ -246,9 +269,20 @@ class RtgsCrOneShotTest(unittest.TestCase):
             "lkg_experiment.rtgs_coherent.cr_66views.rtgs_camera_to_gsplat_inputs",
             return_value=(torch.eye(4), torch.eye(3)),
         ):
-            panel, render_ms = cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(context, variant=variant)
+            panel, timing = cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(context, variant=variant)
 
-        self.assertGreaterEqual(render_ms, 0.0)
+        self.assertGreaterEqual(timing.frame_ms_with_lkg_interlace, 0.0)
+        self.assertAlmostEqual(timing.dynamic_geometry_ms, 0.5)
+        self.assertAlmostEqual(timing.temporal_opacity_ms, 0.25)
+        self.assertAlmostEqual(timing.snapshot_compaction_ms, 0.25)
+        self.assertGreaterEqual(timing.dynamic_color_ms, 0.0)
+        self.assertAlmostEqual(timing.cr_projection_ms, 1.0)
+        self.assertAlmostEqual(timing.cr_keygen_ms, 2.0)
+        self.assertAlmostEqual(timing.cr_sort_ms, 0.0)
+        self.assertAlmostEqual(timing.cr_blend_ms, 3.0)
+        self.assertGreaterEqual(timing.lkg_interlace_post_ms, 0.0)
+        materialize.assert_called_once()
+        self.assertTrue(materialize.call_args.kwargs["return_timing"])
         build_lookup.assert_called_once_with(context.viewpoint_index, viewport, tile_size=2, use_remapping=False)
         synthesize.assert_called_once()
         self.assertEqual(synthesize.call_args.kwargs["cluster_size"], 2)

@@ -45,6 +45,7 @@ from lkg_experiment.rtgs_coherent.official_1view import (
 
 DEFAULT_CR66_OUTPUT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_cr_66views"
 ASPECT_FIT_CHOICES = ("contain", "fill", "fit")
+CAMERA_ASPECT_MODE_CHOICES = ("preserve", "expand")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
             "contain preserves the source frustum inside a centered viewport; "
             "fill keeps the legacy full-panel crop-to-fill behavior; "
             "fit keeps the legacy full-panel fit behavior."
+        ),
+    )
+    parser.add_argument(
+        "--camera-aspect-mode",
+        choices=CAMERA_ASPECT_MODE_CHOICES,
+        default="expand",
+        help=(
+            "How to construct synthetic cameras for the LKG panel. "
+            "expand builds a full --width/--height camera and expands the non-limiting FoV; "
+            "preserve keeps --aspect-fit as the viewport/camera policy."
         ),
     )
     parser.add_argument("--views", type=int, default=66)
@@ -210,6 +221,35 @@ def resolve_aspect_viewport(
         offset_x=offset_x,
         offset_y=offset_y,
         scale=scale,
+        aspect_fit=aspect_fit,
+    )
+
+
+def resolve_lkg_camera_viewport(
+    *,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    aspect_fit: str,
+    camera_aspect_mode: str,
+) -> AspectViewport:
+    camera_aspect_mode = str(camera_aspect_mode)
+    if camera_aspect_mode not in CAMERA_ASPECT_MODE_CHOICES:
+        raise ValueError(f"unsupported camera aspect mode: {camera_aspect_mode!r}")
+    if camera_aspect_mode == "expand":
+        return resolve_aspect_viewport(
+            source_width=source_width,
+            source_height=source_height,
+            target_width=target_width,
+            target_height=target_height,
+            aspect_fit="fit",
+        )
+    return resolve_aspect_viewport(
+        source_width=source_width,
+        source_height=source_height,
+        target_width=target_width,
+        target_height=target_height,
         aspect_fit=aspect_fit,
     )
 
@@ -430,12 +470,13 @@ def prepare_rtgs_cr_66_context(args: argparse.Namespace) -> RtgsCr66RenderContex
     timestamp = float(getattr(cr_anchor_camera_cuda, "timestamp", 0.0))
     panel_width = int(args.width)
     panel_height = int(args.height)
-    viewport = resolve_aspect_viewport(
+    viewport = resolve_lkg_camera_viewport(
         source_width=int(cr_anchor_camera_cuda.image_width),
         source_height=int(cr_anchor_camera_cuda.image_height),
         target_width=panel_width,
         target_height=panel_height,
         aspect_fit=str(args.aspect_fit),
+        camera_aspect_mode=str(args.camera_aspect_mode),
     )
     crop_to_fill = camera_crop_to_fill_for_viewport(viewport, no_crop_to_fill=bool(args.no_crop_to_fill))
     source_view_count = int(args.views)
@@ -647,12 +688,13 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
     timestamp = float(getattr(cr_anchor_camera_cuda, "timestamp", 0.0))
     panel_width = int(args.width)
     panel_height = int(args.height)
-    viewport = resolve_aspect_viewport(
+    viewport = resolve_lkg_camera_viewport(
         source_width=int(cr_anchor_camera_cuda.image_width),
         source_height=int(cr_anchor_camera_cuda.image_height),
         target_width=panel_width,
         target_height=panel_height,
         aspect_fit=str(args.aspect_fit),
+        camera_aspect_mode=str(args.camera_aspect_mode),
     )
     render_width = int(viewport.render_width)
     render_height = int(viewport.render_height)
@@ -704,6 +746,7 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
         f"Rendering RTGS+CR {source_view_count} views for {runtime.official.scene_name} "
         f"(panel={panel_width}x{panel_height}, render={render_width}x{render_height}"
         f"+{viewport.offset_x}+{viewport.offset_y}, aspect_fit={viewport.aspect_fit}, "
+        f"camera_aspect_mode={args.camera_aspect_mode}, "
         f"sampled={sample_indices}, interlace={bool(args.write_interlaced)})",
         file=sys.stderr,
         flush=True,
@@ -830,6 +873,7 @@ def render_rtgs_cr_66views(args: argparse.Namespace) -> int:
         "render_width": render_width,
         "render_height": render_height,
         "aspect_fit": str(args.aspect_fit),
+        "camera_aspect_mode": str(args.camera_aspect_mode),
         "content_viewport": viewport.to_manifest(),
         "views": source_view_count,
         "sampled_view_indices": sample_indices,

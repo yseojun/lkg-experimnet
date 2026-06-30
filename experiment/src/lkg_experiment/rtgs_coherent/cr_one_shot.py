@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -11,6 +12,83 @@ from lkg_experiment.coherent_default.coherent_gsplat_bridge import (
     build_cr_lookup_arrays,
     lookup_arrays_to_torch,
 )
+
+
+@dataclass(frozen=True)
+class RtgsCrFrameTiming:
+    dynamic_geometry_ms: float = 0.0
+    temporal_opacity_ms: float = 0.0
+    snapshot_compaction_ms: float = 0.0
+    dynamic_color_ms: float = 0.0
+    cr_projection_ms: float = 0.0
+    cr_keygen_ms: float = 0.0
+    cr_sort_ms: float = 0.0
+    cr_blend_ms: float = 0.0
+    lkg_unpatchify_ms: float = 0.0
+    lkg_unpad_ms: float = 0.0
+    lkg_panel_paste_ms: float = 0.0
+
+    @property
+    def rtgs_dynamic_total_ms(self) -> float:
+        return float(self.dynamic_geometry_ms + self.temporal_opacity_ms + self.snapshot_compaction_ms + self.dynamic_color_ms)
+
+    @property
+    def cr_core_total_ms(self) -> float:
+        return float(self.cr_projection_ms + self.cr_keygen_ms + self.cr_sort_ms + self.cr_blend_ms)
+
+    @property
+    def lkg_interlace_post_ms(self) -> float:
+        return float(self.lkg_unpatchify_ms + self.lkg_unpad_ms + self.lkg_panel_paste_ms)
+
+    @property
+    def frame_ms_without_lkg(self) -> float:
+        return float(self.rtgs_dynamic_total_ms + self.cr_core_total_ms)
+
+    @property
+    def fps_without_lkg(self) -> float:
+        return 1000.0 / self.frame_ms_without_lkg if self.frame_ms_without_lkg > 0.0 else 0.0
+
+    @property
+    def frame_ms_with_lkg_interlace(self) -> float:
+        return float(self.frame_ms_without_lkg + self.lkg_interlace_post_ms)
+
+    @property
+    def fps_with_lkg_interlace(self) -> float:
+        return 1000.0 / self.frame_ms_with_lkg_interlace if self.frame_ms_with_lkg_interlace > 0.0 else 0.0
+
+    def to_metric_dict(self) -> dict[str, float]:
+        return {
+            "dynamic_geometry_ms": float(self.dynamic_geometry_ms),
+            "temporal_opacity_ms": float(self.temporal_opacity_ms),
+            "snapshot_compaction_ms": float(self.snapshot_compaction_ms),
+            "dynamic_color_ms": float(self.dynamic_color_ms),
+            "rtgs_dynamic_total_ms": float(self.rtgs_dynamic_total_ms),
+            "cr_projection_ms": float(self.cr_projection_ms),
+            "cr_keygen_ms": float(self.cr_keygen_ms),
+            "cr_sort_ms": float(self.cr_sort_ms),
+            "cr_blend_ms": float(self.cr_blend_ms),
+            "cr_core_total_ms": float(self.cr_core_total_ms),
+            "lkg_unpatchify_ms": float(self.lkg_unpatchify_ms),
+            "lkg_unpad_ms": float(self.lkg_unpad_ms),
+            "lkg_panel_paste_ms": float(self.lkg_panel_paste_ms),
+            "lkg_interlace_post_ms": float(self.lkg_interlace_post_ms),
+            "frame_ms_without_lkg": float(self.frame_ms_without_lkg),
+            "fps_without_lkg": float(self.fps_without_lkg),
+            "frame_ms_with_lkg_interlace": float(self.frame_ms_with_lkg_interlace),
+            "fps_with_lkg_interlace": float(self.fps_with_lkg_interlace),
+        }
+
+
+@dataclass(frozen=True)
+class RtgsCrOneShotState:
+    device: str
+    adjacent_viewmats: Any
+    snapshot: Any
+    K: Any
+    rtgs_projection_adapter: Any
+    backgrounds: Any
+    dynamic_geometry_timing: Mapping[str, float]
+    dynamic_color_ms: float
 
 
 def _optional_float(value: Any) -> float | None:
@@ -134,21 +212,39 @@ def paste_viewport_image_into_panel(viewport_image: Any, viewport: Any, *, backg
     return panel.contiguous()
 
 
-def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
+def _should_sync(device: str) -> bool:
+    if not str(device).startswith("cuda"):
+        return False
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _stage_start(device: str) -> float:
+    if _should_sync(device):
+        import torch
+
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _stage_elapsed_ms(start: float, device: str) -> float:
+    if _should_sync(device):
+        import torch
+
+        torch.cuda.synchronize()
+    return float((time.perf_counter() - start) * 1000.0)
+
+
+def prepare_rtgs_cr_one_shot_state(context: Any, *, variant: Any) -> RtgsCrOneShotState:
     import torch
-    from coherent_raster.utils.utils_coherent_raster import unpad, unpatchify_image_shape_matrix
-    from gsplat.rendering_coherent_raster import rasterization_CR
     from lkg_experiment.rtgs_coherent import cr_66views
     from lkg_experiment.rtgs_coherent.views66 import synthesize_grouped_viewmats
 
     device = str(context.args.device)
-    lookup = build_viewport_cr_lookup(
-        context.viewpoint_index,
-        context.viewport,
-        tile_size=int(context.args.tile_size),
-        use_remapping=bool(variant.use_remapping),
-    )
-    view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=device)
     view_labels = np.arange(int(context.source_view_count), dtype=np.int32)
     adjacent_viewmats = synthesize_grouped_viewmats(
         c2w=context.anchor_c2w,
@@ -162,16 +258,25 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
     )
     ref_idx = int(adjacent_viewmats.shape[1]) // 2
     reference_centers = torch.linalg.inv(adjacent_viewmats[:, ref_idx])[:, :3, 3]
+
+    geometry, dynamic_geometry_timing = cr_66views.materialize_rtgs_geometry(
+        context.runtime.official.gaussians,
+        timestamp=float(context.timestamp),
+        return_timing=True,
+    )
+    color_start = _stage_start(device)
     colors = [
         cr_66views.evaluate_rtgs_colors(
             context.runtime.official.gaussians,
             timestamp=float(context.timestamp),
             camera_center=center,
-            mask=context.geometry.mask,
+            mask=geometry.mask,
+            means_for_color=geometry.means,
         )
         for center in reference_centers
     ]
-    snapshot = cr_66views.snapshot_from_geometry(context.geometry, colors=torch.stack(colors, dim=0).contiguous())
+    dynamic_color_ms = _stage_elapsed_ms(color_start, device)
+    snapshot = cr_66views.snapshot_from_geometry(geometry, colors=torch.stack(colors, dim=0).contiguous())
     anchor_camera = cr_66views.synthetic_camera_from_viewmat_preserving_rtgs_contract(
         context.cr_anchor_camera_cuda,
         torch.linalg.inv(context.anchor_c2w),
@@ -192,19 +297,34 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
         and not bool(getattr(context, "fov_normalization", {}).get("applied", False)),
     )
     backgrounds = None if context.runtime.background is None else context.runtime.background.contiguous()
-    should_sync = device.startswith("cuda") and torch.cuda.is_available()
-    if should_sync:
-        torch.cuda.synchronize()
-    start = time.perf_counter()
+    return RtgsCrOneShotState(
+        device=device,
+        adjacent_viewmats=adjacent_viewmats,
+        snapshot=snapshot,
+        K=K,
+        rtgs_projection_adapter=rtgs_projection_adapter,
+        backgrounds=backgrounds,
+        dynamic_geometry_timing=dynamic_geometry_timing,
+        dynamic_color_ms=float(dynamic_color_ms),
+    )
+
+
+def render_rtgs_cr_one_shot_viewport_image(context: Any, state: RtgsCrOneShotState, lookup: CRLookupArrays):
+    import torch
+    from coherent_raster.utils.utils_coherent_raster import unpad, unpatchify_image_shape_matrix
+    from gsplat.rendering_coherent_raster import rasterization_CR
+
+    device = str(state.device)
+    view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=device)
     with torch.no_grad():
-        rendered, _, _ = rasterization_CR(
-            means=snapshot.means,
+        rendered, _, cr_meta = rasterization_CR(
+            means=state.snapshot.means,
             quats=None,
             scales=None,
-            opacities=snapshot.opacities,
-            colors=snapshot.colors,
-            adjacent_viewmats=adjacent_viewmats,
-            Ks=K.unsqueeze(0).contiguous(),
+            opacities=state.snapshot.opacities,
+            colors=state.snapshot.colors,
+            adjacent_viewmats=state.adjacent_viewmats,
+            Ks=state.K.unsqueeze(0).contiguous(),
             view_idx_matrix=view_idx_matrix,
             subpixel_coord_matrix=subpixel_coord_matrix,
             width=int(context.render_width),
@@ -212,20 +332,64 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
             sh_degree=None,
             near_plane=float(context.args.near_plane),
             far_plane=float(context.args.far_plane),
-            backgrounds=backgrounds,
+            backgrounds=state.backgrounds,
             camera_model=str(context.args.camera_model),
             tile_size=int(context.args.tile_size),
             is_debug=bool(context.args.debug_cr),
-            covars=snapshot.covars,
-            rtgs_projection_adapter=rtgs_projection_adapter,
+            covars=state.snapshot.covars,
+            rtgs_projection_adapter=state.rtgs_projection_adapter,
+            return_timing=True,
         )
+        unpatchify_start = _stage_start(device)
         viewport_image = unpatchify_image_shape_matrix(rendered)
+        lkg_unpatchify_ms = _stage_elapsed_ms(unpatchify_start, device)
+        unpad_start = _stage_start(device)
         viewport_image = unpad(viewport_image, int(context.render_height), int(context.render_width)).clamp(0.0, 1.0).contiguous()
-        panel_image = paste_viewport_image_into_panel(
-            viewport_image,
-            context.viewport,
-            background=context.runtime.background,
-        ).clamp(0.0, 1.0)
-    if should_sync:
-        torch.cuda.synchronize()
-    return panel_image.contiguous(), (time.perf_counter() - start) * 1000.0
+        lkg_unpad_ms = _stage_elapsed_ms(unpad_start, device)
+    cr_timing = dict((cr_meta or {}).get("timing_ms", {}))
+    timing = RtgsCrFrameTiming(
+        dynamic_geometry_ms=float(state.dynamic_geometry_timing.get("dynamic_geometry_ms", 0.0)),
+        temporal_opacity_ms=float(state.dynamic_geometry_timing.get("temporal_opacity_ms", 0.0)),
+        snapshot_compaction_ms=float(state.dynamic_geometry_timing.get("snapshot_compaction_ms", 0.0)),
+        dynamic_color_ms=float(state.dynamic_color_ms),
+        cr_projection_ms=float(cr_timing.get("cr_projection_ms", 0.0)),
+        cr_keygen_ms=float(cr_timing.get("cr_keygen_ms", 0.0)),
+        cr_sort_ms=float(cr_timing.get("cr_sort_ms", 0.0)),
+        cr_blend_ms=float(cr_timing.get("cr_blend_ms", 0.0)),
+        lkg_unpatchify_ms=float(lkg_unpatchify_ms),
+        lkg_unpad_ms=float(lkg_unpad_ms),
+        lkg_panel_paste_ms=0.0,
+    )
+    return viewport_image.contiguous(), timing
+
+
+def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
+    state = prepare_rtgs_cr_one_shot_state(context, variant=variant)
+    lookup = build_viewport_cr_lookup(
+        context.viewpoint_index,
+        context.viewport,
+        tile_size=int(context.args.tile_size),
+        use_remapping=bool(variant.use_remapping),
+    )
+    viewport_image, timing = render_rtgs_cr_one_shot_viewport_image(context, state, lookup)
+    paste_start = _stage_start(state.device)
+    panel_image = paste_viewport_image_into_panel(
+        viewport_image,
+        context.viewport,
+        background=context.runtime.background,
+    ).clamp(0.0, 1.0)
+    lkg_panel_paste_ms = _stage_elapsed_ms(paste_start, state.device)
+    timing = RtgsCrFrameTiming(
+        dynamic_geometry_ms=timing.dynamic_geometry_ms,
+        temporal_opacity_ms=timing.temporal_opacity_ms,
+        snapshot_compaction_ms=timing.snapshot_compaction_ms,
+        dynamic_color_ms=timing.dynamic_color_ms,
+        cr_projection_ms=timing.cr_projection_ms,
+        cr_keygen_ms=timing.cr_keygen_ms,
+        cr_sort_ms=timing.cr_sort_ms,
+        cr_blend_ms=timing.cr_blend_ms,
+        lkg_unpatchify_ms=timing.lkg_unpatchify_ms,
+        lkg_unpad_ms=timing.lkg_unpad_ms,
+        lkg_panel_paste_ms=float(lkg_panel_paste_ms),
+    )
+    return panel_image.contiguous(), timing

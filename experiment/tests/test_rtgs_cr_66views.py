@@ -33,6 +33,7 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertTrue(args.write_interlaced)
         self.assertTrue(args.compare_official_sampled)
         self.assertEqual(args.aspect_fit, "contain")
+        self.assertEqual(args.camera_aspect_mode, "expand")
 
     def test_evenly_spaced_sample_indices_cover_first_middle_last(self):
         self.assertEqual(cr_66views.resolve_sample_view_indices(66, 5, None), [0, 16, 32, 49, 65])
@@ -108,6 +109,41 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertEqual(viewport.offset_x, 0)
         self.assertEqual(viewport.offset_y, 0)
         self.assertAlmostEqual(viewport.scale, 2560.0 / 1014.0)
+
+    def test_resolve_lkg_camera_viewport_expand_uses_full_9_16_panel_camera(self):
+        viewport = cr_66views.resolve_lkg_camera_viewport(
+            source_width=1352,
+            source_height=1014,
+            target_width=1440,
+            target_height=2560,
+            aspect_fit="contain",
+            camera_aspect_mode="expand",
+        )
+
+        self.assertEqual(viewport.panel_width, 1440)
+        self.assertEqual(viewport.panel_height, 2560)
+        self.assertEqual(viewport.render_width, 1440)
+        self.assertEqual(viewport.render_height, 2560)
+        self.assertEqual(viewport.offset_x, 0)
+        self.assertEqual(viewport.offset_y, 0)
+        self.assertEqual(viewport.aspect_fit, "fit")
+        self.assertAlmostEqual(viewport.scale, 1440.0 / 1352.0)
+        self.assertFalse(cr_66views.camera_crop_to_fill_for_viewport(viewport, no_crop_to_fill=False))
+
+    def test_resolve_lkg_camera_viewport_preserve_keeps_contain_letterbox(self):
+        viewport = cr_66views.resolve_lkg_camera_viewport(
+            source_width=1352,
+            source_height=1014,
+            target_width=1440,
+            target_height=2560,
+            aspect_fit="contain",
+            camera_aspect_mode="preserve",
+        )
+
+        self.assertEqual(viewport.render_width, 1440)
+        self.assertEqual(viewport.render_height, 1080)
+        self.assertEqual(viewport.offset_y, 740)
+        self.assertEqual(viewport.aspect_fit, "contain")
 
     def test_accumulate_interlaced_view_respects_content_viewport(self):
         interlaced = torch.zeros((3, 4, 5), dtype=torch.float32)

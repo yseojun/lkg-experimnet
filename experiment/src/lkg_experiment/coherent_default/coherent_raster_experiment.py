@@ -15,6 +15,7 @@ from PIL import Image
 
 
 RGB_SUBPIXELS = 3
+REFERENCE_INTERLACED_VARIANT_NAME = "without_reuse"
 DEFAULT_CLUSTERS = (2, 4, 8, 16)
 
 
@@ -155,6 +156,14 @@ def image_artifact_path(variant_name: str, image_name: str, *, output_prefix: st
     return Path("images") / safe_variant / filename
 
 
+def reference_interlaced_artifact_path(*, output_prefix: str = "") -> Path:
+    return image_artifact_path(
+        REFERENCE_INTERLACED_VARIANT_NAME,
+        "reference_interlaced.png",
+        output_prefix=output_prefix,
+    )
+
+
 def read_metrics_csv(path: Path | str) -> list[dict[str, str]]:
     metrics_path = Path(path).expanduser()
     if not metrics_path.is_file():
@@ -247,17 +256,48 @@ class ArtifactWriter:
             path.write_text("", encoding="utf-8")
             return path
         preferred = [
+            "dataset_kind",
+            "scene",
+            "checkpoint",
             "camera_split",
             "camera_index",
+            "frame_index",
+            "timestamp",
             "output_prefix",
             "variant",
+            "engine",
             "group",
+            "render_width",
+            "render_height",
+            "source_views",
+            "saved_views",
             "cluster_size",
+            "color_eval_views",
             "use_remapping",
             "reuse_enabled",
+            "tile_size",
+            "map_mode",
+            "camera_aspect_mode",
+            "dynamic_geometry_ms",
+            "temporal_opacity_ms",
+            "snapshot_compaction_ms",
+            "dynamic_color_ms",
+            "rtgs_dynamic_total_ms",
+            "cr_projection_ms",
+            "cr_keygen_ms",
+            "cr_sort_ms",
+            "cr_blend_ms",
+            "cr_core_total_ms",
+            "lkg_unpatchify_ms",
+            "lkg_unpad_ms",
+            "lkg_panel_paste_ms",
+            "lkg_interlace_post_ms",
+            "frame_ms_without_lkg",
+            "fps_without_lkg",
+            "frame_ms_with_lkg_interlace",
+            "fps_with_lkg_interlace",
             "fps",
             "frame_ms",
-            "peak_vram_gb",
             "psnr_mean",
             "psnr_std",
             "ssim_mean",
@@ -265,6 +305,10 @@ class ArtifactWriter:
             "lpips_mean",
             "lpips_std",
             "metric_view_count",
+            "total_gaussians",
+            "active_gaussians",
+            "active_gaussian_ratio",
+            "peak_vram_gb",
         ]
         fieldnames = [field for field in preferred if any(field in row for row in rows)]
         for row in rows:

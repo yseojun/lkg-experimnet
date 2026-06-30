@@ -14,6 +14,7 @@ SUMMARY_COLUMNS = [
     "scene",
     "camera_split",
     "camera_index",
+    "output_prefix",
     "run_id",
     "variant",
     "group",
@@ -44,6 +45,7 @@ def status_row(
     scene: str,
     camera_split: str = "",
     camera_index: int | str | None = None,
+    output_prefix: str = "",
     message: str = "",
     run_dir: Path | str | None = None,
 ) -> dict[str, str]:
@@ -56,6 +58,7 @@ def status_row(
             "scene": str(scene),
             "camera_split": str(camera_split),
             "camera_index": "" if camera_index is None else str(camera_index),
+            "output_prefix": str(output_prefix),
             "message": str(message),
         }
     )
@@ -74,6 +77,7 @@ def metrics_rows_from_run(
     scene: str,
     camera_split: str = "",
     camera_index: int | str | None = None,
+    output_prefix: str = "",
     message: str = "",
 ) -> list[dict[str, str]]:
     run_path = Path(run_dir).expanduser()
@@ -89,7 +93,7 @@ def metrics_rows_from_run(
     with metrics_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for metric_row in reader:
-            if not _matches_camera(metric_row, camera_split=camera_split, camera_index=camera_index):
+            if not _matches_camera(metric_row, camera_split=camera_split, camera_index=camera_index, output_prefix=output_prefix):
                 continue
             row = status_row(
                 status="ok",
@@ -98,6 +102,7 @@ def metrics_rows_from_run(
                 scene=scene,
                 camera_split=camera_split,
                 camera_index=camera_index,
+                output_prefix=output_prefix,
                 message=message,
             )
             for column in SUMMARY_COLUMNS:
@@ -109,6 +114,7 @@ def metrics_rows_from_run(
             row["scene"] = str(scene)
             row["camera_split"] = str(camera_split)
             row["camera_index"] = "" if camera_index is None else str(camera_index)
+            row["output_prefix"] = str(metric_row.get("output_prefix", output_prefix) or "")
             row["run_id"] = run_id
             row["artifact_root"] = artifact_root
             row["metrics_csv"] = str(metrics_path)
@@ -123,6 +129,7 @@ def metrics_rows_from_run(
                 scene=scene,
                 camera_split=camera_split,
                 camera_index=camera_index,
+                output_prefix=output_prefix,
                 message=f"metrics.csv has no rows: {metrics_path}",
                 run_dir=run_path,
             )
@@ -155,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene", required=True, help="Scene name")
     parser.add_argument("--camera-split", default="", help="Dataset split used for the camera")
     parser.add_argument("--camera-index", default="", help="Camera index within the selected split")
+    parser.add_argument("--output-prefix", default="", help="Optional output_prefix row filter")
     parser.add_argument("--run-dir", help="Experiment artifact run directory")
     parser.add_argument("--status", default="ok", help="ok, missing, failed, or another status label")
     parser.add_argument("--message", default="", help="Optional status/failure message")
@@ -173,6 +181,7 @@ def main() -> None:
             scene=args.scene,
             camera_split=args.camera_split,
             camera_index=args.camera_index,
+            output_prefix=args.output_prefix,
             message=args.message,
         )
     else:
@@ -184,6 +193,7 @@ def main() -> None:
                 scene=args.scene,
                 camera_split=args.camera_split,
                 camera_index=args.camera_index,
+                output_prefix=args.output_prefix,
                 message=args.message,
                 run_dir=args.run_dir,
             )
@@ -221,14 +231,18 @@ def _tsv_ready(value: Any) -> str:
     return str(value)
 
 
-def _matches_camera(metric_row: Mapping[str, Any], *, camera_split: str, camera_index: int | str | None) -> bool:
+def _matches_camera(metric_row: Mapping[str, Any], *, camera_split: str, camera_index: int | str | None, output_prefix: str = "") -> bool:
     wanted_split = str(camera_split)
     wanted_index = "" if camera_index is None else str(camera_index)
+    wanted_prefix = str(output_prefix)
     row_split = str(metric_row.get("camera_split", "") or "")
     row_index = str(metric_row.get("camera_index", "") or "")
+    row_prefix = str(metric_row.get("output_prefix", "") or "")
     if wanted_split and row_split and row_split != wanted_split:
         return False
     if wanted_index and row_index and row_index != wanted_index:
+        return False
+    if wanted_prefix and row_prefix and row_prefix != wanted_prefix:
         return False
     return True
 

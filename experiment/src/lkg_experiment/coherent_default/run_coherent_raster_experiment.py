@@ -46,6 +46,7 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import (
     load_viewpoint_index_file,
     parse_cluster_values,
     read_metrics_csv,
+    reference_interlaced_artifact_path,
     reference_interlace_from_views,
     remove_matching_metric_rows,
     select_metric_view_indices,
@@ -360,6 +361,10 @@ def main() -> None:
             tile_size=args.tile_size,
             chunk_size=args.view_chunk_size,
         )
+        writer.save_tensor_image(
+            reference_interlaced_artifact_path(output_prefix=args.output_prefix),
+            reference_interlaced,
+        )
 
     cluster_indices = {
         variant.name: cluster_index_from_view_index(viewpoint_index, variant.cluster_size)
@@ -432,10 +437,6 @@ def main() -> None:
             interlaced,
         )
         if reference_interlaced is not None:
-            writer.save_tensor_image(
-                image_artifact_path(variant.name, "reference_interlaced.png", output_prefix=args.output_prefix),
-                reference_interlaced,
-            )
             writer.save_tensor_image(
                 image_artifact_path(variant.name, "abs_error.png", output_prefix=args.output_prefix),
                 (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0),

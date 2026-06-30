@@ -46,7 +46,7 @@ class RtgsSixtySixLkgScriptTest(unittest.TestCase):
 
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("rtgs_cr_experiment.py", proc.stderr)
-            self.assertIn("--engine compose", proc.stderr)
+            self.assertNotIn("--engine compose", proc.stderr)
             self.assertIn(f"--torch-extensions-dir {root / 'generated' / 'torch_extensions_lkg_rtgs' / 'rtgs_official'}", proc.stderr)
             self.assertIn("--clusters 2\\,4", proc.stderr)
             self.assertIn("--warmup-iters 0", proc.stderr)
@@ -55,6 +55,101 @@ class RtgsSixtySixLkgScriptTest(unittest.TestCase):
             self.assertIn(f"--model-path {model_root / 'jumpingjacks'}", proc.stderr)
             self.assertIn(f"--model-path {model_root / 'coffee_martini'}", proc.stderr)
             self.assertIn(f"--artifact-dir {artifact_root / 'rtgs_cr_exp_test'}", proc.stderr)
+
+    def test_full_view_cr_script_runs_all_dnerf_test_cameras_in_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_root = root / "result" / "RTGS"
+            dnerf_root = root / "dataset" / "dnerf"
+            checkpoint = model_root / "jumpingjacks" / "checkpoints" / "chkpnt_best.pth"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint")
+            scene_root = dnerf_root / "jumpingjacks"
+            scene_root.mkdir(parents=True)
+            (scene_root / "transforms_test.json").write_text(
+                '{"frames": [{"file_path": "r_000"}, {"file_path": "r_001"}]}',
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "MODEL_ROOT": str(model_root),
+                    "DNERF_ROOT": str(dnerf_root),
+                    "DNERF_SCENES": "jumpingjacks",
+                    "RTGS_SCENES": "jumpingjacks",
+                    "PYTHON_BIN": sys.executable,
+                    "MAP_MODE": "linear",
+                    "APPEND_SUMMARY": "0",
+                }
+            )
+
+            proc = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "scripts" / "run_rtgs_cr_experiments_all_full_views.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr.count("rtgs_cr_experiment.py"), 2)
+            self.assertIn("--dataset-kind dnerf", proc.stderr)
+            self.assertIn("--split test", proc.stderr)
+            self.assertNotIn("--split train", proc.stderr)
+            self.assertIn("--camera-index 0", proc.stderr)
+            self.assertIn("--camera-index 1", proc.stderr)
+            self.assertIn("--output-prefix test_cam000", proc.stderr)
+            self.assertIn("--output-prefix test_cam001", proc.stderr)
+            self.assertIn("--run-id jumpingjacks_one_shot_test_all_views", proc.stderr)
+            self.assertIn("--append-metrics", proc.stderr)
+
+    def test_full_view_cr_script_runs_n3dv_test_frames_for_heldout_camera(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_root = root / "result" / "RTGS"
+            n3dv_root = root / "dataset" / "N3DV"
+            checkpoint = model_root / "coffee_martini" / "checkpoints" / "chkpnt_best.pth"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint")
+            (model_root / "coffee_martini" / "cameras.json").write_text(
+                '[{"img_name": "cam00_0000"}, {"img_name": "cam01_0000"}, {"img_name": "cam00_0001"}]',
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "MODEL_ROOT": str(model_root),
+                    "N3DV_ROOT": str(n3dv_root),
+                    "N3DV_SCENES": "coffee_martini",
+                    "RTGS_SCENES": "coffee_martini",
+                    "PYTHON_BIN": sys.executable,
+                    "MAP_MODE": "linear",
+                    "APPEND_SUMMARY": "0",
+                }
+            )
+
+            proc = subprocess.run(
+                ["bash", str(Path(__file__).resolve().parents[1] / "scripts" / "run_rtgs_cr_experiments_all_full_views.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr.count("rtgs_cr_experiment.py"), 2)
+            self.assertIn("--dataset-kind n3dv", proc.stderr)
+            self.assertIn("--split test", proc.stderr)
+            self.assertEqual(proc.stderr.count("--camera-index 0"), 2)
+            self.assertIn("--n3dv-frame-index 0", proc.stderr)
+            self.assertIn("--n3dv-frame-index 1", proc.stderr)
+            self.assertNotIn("--n3dv-frame-index 2", proc.stderr)
+            self.assertIn("--output-prefix test_frame0000_cam000", proc.stderr)
+            self.assertIn("--output-prefix test_frame0001_cam000", proc.stderr)
+            self.assertIn("--run-id coffee_martini_one_shot_test_all_views", proc.stderr)
+            self.assertIn("--append-metrics", proc.stderr)
 
     def test_dry_run_emits_lkg_only_command_for_each_rtgs_scene(self):
         with tempfile.TemporaryDirectory() as tmp:

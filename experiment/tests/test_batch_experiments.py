@@ -101,6 +101,53 @@ class BatchExperimentsTest(unittest.TestCase):
         self.assertEqual(rows[0]["artifact_root"], "/tmp/artifacts/run_a")
         self.assertTrue(rows[0]["metrics_csv"].endswith("run_a/metrics.csv"))
 
+    def test_metrics_rows_from_run_can_filter_by_output_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run_a"
+            run_dir.mkdir()
+            (run_dir / "manifest.json").write_text(
+                '{"run_id": "run_a", "artifact_root": "/tmp/artifacts/run_a"}',
+                encoding="utf-8",
+            )
+            with (run_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["variant", "camera_split", "camera_index", "output_prefix", "fps"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "variant": "cluster_1",
+                        "camera_split": "test",
+                        "camera_index": "0",
+                        "output_prefix": "test_frame0000_cam000",
+                        "fps": "10.0",
+                    }
+                )
+                writer.writerow(
+                    {
+                        "variant": "cluster_1",
+                        "camera_split": "test",
+                        "camera_index": "0",
+                        "output_prefix": "test_frame0001_cam000",
+                        "fps": "11.0",
+                    }
+                )
+
+            rows = metrics_rows_from_run(
+                run_dir,
+                suite="rtgs",
+                result_group="group",
+                scene="coffee_martini",
+                camera_split="test",
+                camera_index=0,
+                output_prefix="test_frame0001_cam000",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["output_prefix"], "test_frame0001_cam000")
+        self.assertEqual(rows[0]["fps"], "11.0")
+
     def test_write_summary_tsv_is_excel_pasteable(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "summary.txt"

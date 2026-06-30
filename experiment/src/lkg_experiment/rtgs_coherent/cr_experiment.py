@@ -5,6 +5,7 @@ import inspect
 import math
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -15,6 +16,7 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import (
     ArtifactWriter,
     ExperimentVariant,
     MetricStats,
+    REFERENCE_INTERLACED_VARIANT_NAME,
     TimingStats,
     build_experiment_variants,
     build_experiment_web_assets,
@@ -22,6 +24,7 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import (
     image_artifact_path,
     parse_cluster_values,
     read_metrics_csv,
+    reference_interlaced_artifact_path,
     remove_matching_metric_rows,
     select_metric_view_indices,
 )
@@ -32,6 +35,14 @@ from lkg_experiment.rtgs_coherent.cr_1view import adapt_snapshot_for_rtgs_compat
 
 DEFAULT_RTGS_CR_EXPERIMENT_ROOT = DEFAULT_GENERATED_ROOT / "rtgs_cr_experiments"
 ENGINE_CHOICES = ("one_shot",)
+
+
+@dataclass(frozen=True)
+class RtgsCrTimingStats:
+    fps: float
+    frame_ms: float
+    peak_vram_gb: float
+    detailed_metrics: Mapping[str, float]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="one_shot",
         help="Experiment engine. Only one_shot grouped CoherentRaster rendering is supported.",
     )
-    parser.add_argument("--clusters", default="1,2,4,8,16")
+    parser.add_argument("--clusters", default="2,4,8,16")
     parser.add_argument("--ablation-cluster", default=8, type=int)
     parser.add_argument("--no-without-remap", action="store_true")
     parser.add_argument("--no-without-reuse", action="store_true")
@@ -55,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measure-iters", default=5, type=int)
     parser.add_argument("--metric-view-stride", default=1, type=int)
     parser.add_argument("--max-metric-views", default=5, type=int)
+    parser.add_argument(
+        "--all-metric-views",
+        action="store_true",
+        help="Evaluate metrics on all rendered source views; overrides --max-metric-views.",
+    )
     parser.add_argument("--skip-metrics", action="store_true")
     parser.add_argument("--no-reference-interlaced", action="store_true")
     parser.add_argument("--skip-web-assets", action="store_true")
@@ -91,16 +107,16 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
     writer = ArtifactWriter(artifact_root)
 
     variants = resolve_experiment_variants(args)
-    metric_view_indices = select_metric_view_indices(
-        int(context.source_view_count),
-        max_metric_views=int(args.max_metric_views),
-        stride=int(args.metric_view_stride),
-    )
+    metric_view_indices = resolve_metric_view_indices(int(context.source_view_count), args)
 
     reference_interlaced = None
     if not bool(args.no_reference_interlaced):
         print("Rendering official RTGS reference interlaced image...", file=sys.stderr, flush=True)
         reference_interlaced = render_official_reference_interlaced(context)
+        writer.save_tensor_image(
+            reference_interlaced_artifact_path(output_prefix=str(args.output_prefix)),
+            reference_interlaced,
+        )
 
     if args.append_metrics:
         rows: list[dict[str, Any]] = remove_matching_metric_rows(
@@ -129,30 +145,39 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-        interlaced, timing = time_one_shot_renderer(
-            context,
-            variant=variant,
-            warmup_iters=int(args.warmup_iters),
-            measure_iters=int(args.measure_iters),
-        )
+        if is_reference_gt_variant(variant):
+            if reference_interlaced is None:
+                raise ValueError("without_reuse is the GT/reference variant and requires reference_interlaced")
+            interlaced = reference_interlaced
+            timing = reference_gt_timing_stats()
+        else:
+            interlaced, timing = time_one_shot_renderer(
+                context,
+                variant=variant,
+                warmup_iters=int(args.warmup_iters),
+                measure_iters=int(args.measure_iters),
+            )
         last_interlaced = interlaced
         writer.save_tensor_image(
             image_artifact_path(variant.name, "looking_glass_tensor.png", output_prefix=str(args.output_prefix)),
             interlaced,
         )
         if reference_interlaced is not None:
-            writer.save_tensor_image(
-                image_artifact_path(variant.name, "reference_interlaced.png", output_prefix=str(args.output_prefix)),
-                reference_interlaced,
-            )
+            if is_reference_gt_variant(variant):
+                abs_error = interlaced.new_zeros(interlaced.shape)
+            else:
+                abs_error = (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0)
             writer.save_tensor_image(
                 image_artifact_path(variant.name, "abs_error.png", output_prefix=str(args.output_prefix)),
-                (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0),
+                abs_error,
             )
 
         metrics = None
         if not bool(args.skip_metrics):
-            metrics = compute_sampled_view_metric_stats(context, metric_view_indices)
+            if is_reference_gt_variant(variant):
+                metrics = reference_gt_metric_stats(metric_view_indices)
+            else:
+                metrics = compute_sampled_view_metric_stats(context, metric_view_indices)
         rows.append(
             build_metric_row(
                 variant=variant,
@@ -162,6 +187,7 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
                 output_prefix=str(args.output_prefix),
                 timing=timing,
                 metrics=metrics,
+                context=context,
             )
         )
         writer.write_metrics_csv(rows)
@@ -215,6 +241,35 @@ def resolve_experiment_variants(args: argparse.Namespace) -> list[ExperimentVari
     )
 
 
+def is_reference_gt_variant(variant: Any) -> bool:
+    return str(getattr(variant, "name", "")) == REFERENCE_INTERLACED_VARIANT_NAME and int(getattr(variant, "cluster_size", 0)) == 1
+
+
+def reference_gt_timing_stats() -> TimingStats:
+    return TimingStats(fps=float("nan"), frame_ms=float("nan"), peak_vram_gb=float("nan"))
+
+
+def reference_gt_metric_stats(metric_view_indices: Sequence[int]) -> MetricStats:
+    return MetricStats(
+        psnr_mean=float("inf"),
+        psnr_std=0.0,
+        ssim_mean=1.0,
+        ssim_std=0.0,
+        lpips_mean=float("nan"),
+        lpips_std=float("nan"),
+        metric_view_count=int(len(metric_view_indices)),
+    )
+
+
+def resolve_metric_view_indices(source_view_count: int, args: argparse.Namespace) -> list[int]:
+    max_metric_views = 0 if bool(args.all_metric_views) else int(args.max_metric_views)
+    return select_metric_view_indices(
+        int(source_view_count),
+        max_metric_views=max_metric_views,
+        stride=int(args.metric_view_stride),
+    )
+
+
 def make_run_id(
     *,
     model_path: Path,
@@ -241,7 +296,13 @@ def build_metric_row(
     output_prefix: str,
     timing: TimingStats,
     metrics: MetricStats | None,
+    context: cr_66views.RtgsCr66RenderContext | None = None,
 ) -> dict[str, Any]:
+    detailed_metrics = dict(getattr(timing, "detailed_metrics", {}) or {})
+    legacy_frame_ms = float(timing.frame_ms)
+    legacy_fps = float(timing.fps)
+    frame_ms = float(detailed_metrics.get("frame_ms_with_lkg_interlace", legacy_frame_ms))
+    fps = float(detailed_metrics.get("fps_with_lkg_interlace", legacy_fps))
     row: dict[str, Any] = {
         "camera_split": str(camera_split),
         "camera_index": int(camera_index),
@@ -252,13 +313,50 @@ def build_metric_row(
         "cluster_size": int(variant.cluster_size),
         "use_remapping": bool(variant.use_remapping),
         "reuse_enabled": bool(variant.reuse_enabled),
-        "fps": float(timing.fps),
-        "frame_ms": float(timing.frame_ms),
+        "fps": fps,
+        "frame_ms": frame_ms,
         "peak_vram_gb": float(timing.peak_vram_gb),
     }
+    if context is not None:
+        row.update(_context_metric_columns(context, variant=variant))
+    row.update(detailed_metrics)
+    if "frame_ms_with_lkg_interlace" in detailed_metrics:
+        row["frame_ms"] = float(detailed_metrics["frame_ms_with_lkg_interlace"])
+    if "fps_with_lkg_interlace" in detailed_metrics:
+        row["fps"] = float(detailed_metrics["fps_with_lkg_interlace"])
     if metrics is not None:
         row.update(metrics.__dict__)
     return row
+
+
+def _context_metric_columns(context: cr_66views.RtgsCr66RenderContext, *, variant: Any) -> dict[str, Any]:
+    args = context.args
+    official = context.runtime.official
+    total_gaussians = int(official.gaussians.get_xyz.shape[0])
+    active_gaussians = int(context.geometry.means.shape[0])
+    source_views = int(context.source_view_count)
+    if bool(variant.reuse_enabled):
+        color_eval_views = int(math.ceil(source_views / float(int(variant.cluster_size))))
+    else:
+        color_eval_views = source_views
+    return {
+        "dataset_kind": str(getattr(official.scene_paths, "dataset_kind", getattr(args, "dataset_kind", ""))),
+        "scene": str(official.scene_name),
+        "checkpoint": str(official.checkpoint_path),
+        "frame_index": int(getattr(args, "n3dv_frame_index", 0)),
+        "timestamp": float(context.timestamp),
+        "render_width": int(context.render_width),
+        "render_height": int(context.render_height),
+        "source_views": source_views,
+        "saved_views": int(getattr(args, "sample_save_views", 0)),
+        "color_eval_views": color_eval_views,
+        "tile_size": int(getattr(args, "tile_size", 0)),
+        "map_mode": str(getattr(args, "map_mode", "")),
+        "camera_aspect_mode": str(getattr(args, "camera_aspect_mode", "")),
+        "total_gaussians": total_gaussians,
+        "active_gaussians": active_gaussians,
+        "active_gaussian_ratio": float(active_gaussians / total_gaussians) if total_gaussians else float("nan"),
+    }
 
 
 def time_one_shot_renderer(
@@ -267,7 +365,7 @@ def time_one_shot_renderer(
     variant: Any | None = None,
     warmup_iters: int,
     measure_iters: int,
-    render_fn: Callable[[cr_66views.RtgsCr66RenderContext], tuple[Any, float]] | None = None,
+    render_fn: Callable[[cr_66views.RtgsCr66RenderContext], tuple[Any, Any]] | None = None,
     progress_label: str | None = None,
 ) -> tuple[Any, TimingStats]:
     if int(warmup_iters) < 0 or int(measure_iters) <= 0:
@@ -282,17 +380,34 @@ def time_one_shot_renderer(
     last = None
     total_ms = 0.0
     count = 0
+    detailed_totals: dict[str, float] = {}
     total_iterations = int(warmup_iters) + int(measure_iters)
     for iteration in range(total_iterations):
         phase = "warmup" if iteration < int(warmup_iters) else "measure"
         if progress_label:
             print(f"{progress_label} timing {iteration + 1}/{total_iterations} {phase}", file=sys.stderr, flush=True)
-        last, render_ms = _call_render_fn(render_fn, context, progress_label=progress_label)
+        last, render_timing = _call_render_fn(render_fn, context, progress_label=progress_label)
+        render_ms, detailed = _render_timing_values(render_timing)
         if iteration >= int(warmup_iters):
             total_ms += float(render_ms)
+            for key, value in detailed.items():
+                detailed_totals[key] = detailed_totals.get(key, 0.0) + float(value)
             count += 1
     average_ms = total_ms / float(count) if count else math.inf
+    detailed_average = {key: value / float(count) for key, value in detailed_totals.items()} if count else {}
+    detailed_average = _normalize_averaged_timing_metrics(detailed_average)
+    if "frame_ms_with_lkg_interlace" in detailed_average:
+        average_ms = float(detailed_average["frame_ms_with_lkg_interlace"])
     fps = 1000.0 / average_ms if average_ms > 0.0 and math.isfinite(average_ms) else 0.0
+    if detailed_average:
+        detailed_average["frame_ms_with_lkg_interlace"] = float(average_ms)
+        detailed_average["fps_with_lkg_interlace"] = float(fps)
+        return last, RtgsCrTimingStats(
+            fps=fps,
+            frame_ms=average_ms,
+            peak_vram_gb=_peak_vram_gb(),
+            detailed_metrics=detailed_average,
+        )
     return last, TimingStats(fps=fps, frame_ms=average_ms, peak_vram_gb=_peak_vram_gb())
 
 
@@ -383,11 +498,8 @@ def compute_sampled_view_metric_stats(
     )
 
 
-def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderContext):
-    import torch
-    from gaussian_renderer import render
-
-    flat_viewmats = cr_66views.synthesize_flat_viewmats(
+def _reference_flat_viewmats(context: cr_66views.RtgsCr66RenderContext):
+    return cr_66views.synthesize_flat_viewmats(
         c2w=context.anchor_c2w,
         orbit_center=context.orbit_center,
         source_view_count=int(context.source_view_count),
@@ -395,6 +507,41 @@ def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderConte
         orbit_direction=int(context.orbit_direction),
         device=str(context.args.device),
     )
+
+
+def render_official_reference_view(
+    context: cr_66views.RtgsCr66RenderContext,
+    view_id: int,
+    *,
+    flat_viewmats: Any | None = None,
+):
+    from gaussian_renderer import render
+
+    if flat_viewmats is None:
+        flat_viewmats = _reference_flat_viewmats(context)
+    synthetic_camera = cr_66views.synthetic_camera_from_viewmat_preserving_rtgs_contract(
+        context.cr_anchor_camera_cuda,
+        flat_viewmats[int(view_id)],
+        uid=int(view_id),
+        image_name=f"reference_view_{int(view_id):03d}",
+        timestamp=float(context.timestamp),
+        device=str(context.args.device),
+        width=int(context.render_width),
+        height=int(context.render_height),
+        crop_to_fill=bool(context.crop_to_fill),
+    ).cuda()
+    return (
+        render(synthetic_camera, context.runtime.official.gaussians, context.runtime.pipe, context.runtime.background)["render"]
+        .detach()
+        .clamp(0.0, 1.0)
+        .contiguous()
+    )
+
+
+def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderContext):
+    import torch
+
+    flat_viewmats = _reference_flat_viewmats(context)
     interlaced = torch.zeros(
         (3, int(context.panel_height), int(context.panel_width)),
         dtype=torch.float32,
@@ -402,23 +549,7 @@ def render_official_reference_interlaced(context: cr_66views.RtgsCr66RenderConte
     )
     with torch.no_grad():
         for view_id in range(int(context.source_view_count)):
-            synthetic_camera = cr_66views.synthetic_camera_from_viewmat_preserving_rtgs_contract(
-                context.cr_anchor_camera_cuda,
-                flat_viewmats[view_id],
-                uid=int(view_id),
-                image_name=f"reference_view_{view_id:03d}",
-                timestamp=float(context.timestamp),
-                device=str(context.args.device),
-                width=int(context.render_width),
-                height=int(context.render_height),
-                crop_to_fill=bool(context.crop_to_fill),
-            ).cuda()
-            image = (
-                render(synthetic_camera, context.runtime.official.gaussians, context.runtime.pipe, context.runtime.background)["render"]
-                .detach()
-                .clamp(0.0, 1.0)
-                .contiguous()
-            )
+            image = render_official_reference_view(context, view_id, flat_viewmats=flat_viewmats)
             cr_66views.accumulate_interlaced_view(
                 interlaced,
                 image,
@@ -465,6 +596,7 @@ def build_manifest(
         "source_view_count": int(context.source_view_count),
         "render_view_count": int(context.source_view_count),
         "render_image_shape": shape,
+        "camera_aspect_mode": str(args.camera_aspect_mode),
         "content_viewport": context.viewport.to_manifest(),
         "view_degree": float(context.view_degree),
         "orbit_direction": int(context.orbit_direction),
@@ -484,11 +616,11 @@ def build_manifest(
 
 
 def _call_render_fn(
-    render_fn: Callable[..., tuple[Any, float]],
+    render_fn: Callable[..., tuple[Any, Any]],
     context: cr_66views.RtgsCr66RenderContext,
     *,
     progress_label: str | None,
-) -> tuple[Any, float]:
+) -> tuple[Any, Any]:
     try:
         parameters = inspect.signature(render_fn).parameters
     except (TypeError, ValueError):
@@ -498,11 +630,65 @@ def _call_render_fn(
     return render_fn(context)
 
 
+def _render_timing_values(render_timing: Any) -> tuple[float, dict[str, float]]:
+    if hasattr(render_timing, "to_metric_dict"):
+        detailed = {str(key): float(value) for key, value in render_timing.to_metric_dict().items()}
+        return float(detailed.get("frame_ms_with_lkg_interlace", getattr(render_timing, "frame_ms", 0.0))), detailed
+    if isinstance(render_timing, Mapping):
+        detailed = {str(key): float(value) for key, value in render_timing.items()}
+        return float(detailed.get("frame_ms_with_lkg_interlace", detailed.get("frame_ms", 0.0))), detailed
+    return float(render_timing), {}
+
+
+def _normalize_averaged_timing_metrics(values: Mapping[str, float]) -> dict[str, float]:
+    normalized = {str(key): float(value) for key, value in values.items()}
+    if not normalized:
+        return {}
+    normalized["rtgs_dynamic_total_ms"] = float(
+        normalized.get("dynamic_geometry_ms", 0.0)
+        + normalized.get("temporal_opacity_ms", 0.0)
+        + normalized.get("snapshot_compaction_ms", 0.0)
+        + normalized.get("dynamic_color_ms", 0.0)
+    )
+    normalized["cr_core_total_ms"] = float(
+        normalized.get("cr_projection_ms", 0.0)
+        + normalized.get("cr_keygen_ms", 0.0)
+        + normalized.get("cr_sort_ms", 0.0)
+        + normalized.get("cr_blend_ms", 0.0)
+    )
+    normalized["lkg_interlace_post_ms"] = float(
+        normalized.get("lkg_unpatchify_ms", 0.0)
+        + normalized.get("lkg_unpad_ms", 0.0)
+        + normalized.get("lkg_panel_paste_ms", 0.0)
+    )
+    normalized["frame_ms_without_lkg"] = float(normalized["rtgs_dynamic_total_ms"] + normalized["cr_core_total_ms"])
+    normalized["fps_without_lkg"] = (
+        1000.0 / normalized["frame_ms_without_lkg"]
+        if normalized["frame_ms_without_lkg"] > 0.0 and math.isfinite(normalized["frame_ms_without_lkg"])
+        else 0.0
+    )
+    normalized["frame_ms_with_lkg_interlace"] = float(normalized["frame_ms_without_lkg"] + normalized["lkg_interlace_post_ms"])
+    normalized["fps_with_lkg_interlace"] = (
+        1000.0 / normalized["frame_ms_with_lkg_interlace"]
+        if normalized["frame_ms_with_lkg_interlace"] > 0.0 and math.isfinite(normalized["frame_ms_with_lkg_interlace"])
+        else 0.0
+    )
+    return normalized
+
+
 def _engine_notes(engine: str) -> dict[str, Any]:
     return {
         "cluster_affects_render": True,
         "description": "One-shot grouped CoherentRaster path with RTGS-compatible projection adapter support for sentinel-FoV cameras.",
     }
+
+
+def _should_report_view_progress(view_id: int, *, source_view_count: int, every: int) -> bool:
+    if int(source_view_count) <= 0:
+        return False
+    if int(view_id) == 0 or int(view_id) == int(source_view_count) - 1:
+        return True
+    return int(every) > 0 and (int(view_id) + 1) % int(every) == 0
 
 
 def _reset_cuda_peak_memory() -> None:

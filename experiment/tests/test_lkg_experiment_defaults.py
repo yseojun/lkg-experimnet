@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,14 +7,16 @@ from unittest.mock import patch
 import numpy as np
 
 from lkg_experiment.build_web_index import build_parser as build_web_index_parser
-from lkg_experiment.open_experiment import build_experiment_url, resolve_experiment_target
-from lkg_experiment.run_coherent_raster_experiment import build_parser
 from lkg_experiment.coherent_raster_experiment import (
     build_experiment_variants,
+    build_experiment_web_index,
     cluster_index_from_view_index,
     image_artifact_path,
     parse_cluster_values,
+    reference_interlaced_artifact_path,
 )
+from lkg_experiment.open_experiment import build_experiment_url, resolve_experiment_target
+from lkg_experiment.run_coherent_raster_experiment import build_parser
 
 
 class LkgExperimentDefaultsTest(unittest.TestCase):
@@ -137,6 +140,49 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
         self.assertEqual(
             image_artifact_path("cluster_8", "looking_glass_tensor.png"),
             Path("images/cluster_8/looking_glass_tensor.png"),
+        )
+
+    def test_reference_interlaced_artifact_path_uses_without_reuse_folder(self):
+        self.assertEqual(
+            reference_interlaced_artifact_path(output_prefix="test/17"),
+            Path("images/without_reuse/test_17_reference_interlaced.png"),
+        )
+        self.assertEqual(
+            reference_interlaced_artifact_path(),
+            Path("images/without_reuse/reference_interlaced.png"),
+        )
+
+    def test_web_index_discovers_shared_reference_without_reuse_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "experiments"
+            run = root / "run_a"
+            (run / "images" / "without_reuse").mkdir(parents=True)
+            (run / "images" / "without_reuse" / "reference_interlaced.png").write_bytes(b"png")
+            (run / "images" / "cluster_2").mkdir(parents=True)
+            (run / "images" / "cluster_2" / "looking_glass_tensor.png").write_bytes(b"png")
+            (run / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run_a",
+                        "variants": [
+                            {"name": "cluster_2", "cluster_size": 2},
+                            {"name": "without_reuse", "cluster_size": 1},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            index = build_experiment_web_index(root)
+
+        variants = {variant["name"]: variant for variant in index["runs"][0]["variants"]}
+        self.assertEqual(
+            variants["without_reuse"]["images"]["reference_interlaced"],
+            "run_a/images/without_reuse/reference_interlaced.png",
+        )
+        self.assertEqual(
+            variants["cluster_2"]["images"]["looking_glass_tensor"],
+            "run_a/images/cluster_2/looking_glass_tensor.png",
         )
 
     def test_web_index_parser_defaults_to_external_generated_root(self):

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+RUN_GROUP="${RUN_GROUP:-rtgs_cr_full_view_experiments_$(date +%Y%m%d_%H%M%S)}"
+SPLIT="${SPLIT:-test}"
+ALL_TEST_VIEWS="${ALL_TEST_VIEWS:-1}"
+ALL_METRIC_VIEWS="${ALL_METRIC_VIEWS:-1}"
+SAMPLE_SAVE_VIEWS="${SAMPLE_SAVE_VIEWS:-66}"
+METRIC_VIEW_STRIDE="${METRIC_VIEW_STRIDE:-1}"
+MAX_METRIC_VIEWS="${MAX_METRIC_VIEWS:-0}"
+SKIP_METRICS="${SKIP_METRICS:-0}"
+NO_REFERENCE_INTERLACED="${NO_REFERENCE_INTERLACED:-0}"
+CAMERA_ASPECT_MODE="${CAMERA_ASPECT_MODE:-expand}"
+VIEWS="${VIEWS:-66}"
+
+export RUN_GROUP
+export SPLIT
+export ALL_TEST_VIEWS
+export ALL_METRIC_VIEWS
+export SAMPLE_SAVE_VIEWS
+export METRIC_VIEW_STRIDE
+export MAX_METRIC_VIEWS
+export SKIP_METRICS
+export NO_REFERENCE_INTERLACED
+export CAMERA_ASPECT_MODE
+export VIEWS
+
+exec bash "$SCRIPT_DIR/run_rtgs_cr_experiments_all.sh"

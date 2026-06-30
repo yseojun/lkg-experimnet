@@ -24,5 +24,6 @@ dist/
 .venv/
 venv/
 *.log
+.DS_Store
 
 /coherentraster_paper_summary
