@@ -27,6 +27,11 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import (
     load_viewpoint_index_file,
     tensor_to_hwc_uint8,
 )
+from lkg_experiment.coherent_default.cuda_gl_texture import (
+    TEXTURE_UPLOAD_AUTO,
+    TEXTURE_UPLOAD_CHOICES,
+    create_panel_texture_uploader,
+)
 from lkg_experiment.fourdgs.fourdgs_bridge import DEFAULT_4DGS_CODE_ROOT, load_4dgs_checkpoint
 from lkg_experiment.coherent_default.run_coherent_raster_experiment import (
     DEFAULT_BRIDGE_SDK_ROOT,
@@ -57,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iteration", type=int, help="Checkpoint iteration; omitted means latest rank0 checkpoint")
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gsplat-root", default=str(DEFAULT_GSPLAT_ROOT))
+    parser.add_argument("--torch-extensions-dir", default=None, help="Optional torch extension cache directory")
     parser.add_argument("--bridge-sdk-root", default=str(DEFAULT_BRIDGE_SDK_ROOT))
     parser.add_argument("--four-dgs-model-path", help="4DGaussians model directory; overrides --checkpoint-path")
     parser.add_argument("--four-dgs-code-root", default=str(DEFAULT_4DGS_CODE_ROOT))
@@ -115,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PANEL_RENDERER_CHOICES,
         default=PANEL_RENDERER_FIXED,
         help="OpenGL panel blit path; fixed avoids shader compilation for fragile Bridge/OpenGL stacks.",
+    )
+    parser.add_argument(
+        "--texture-upload-mode",
+        choices=TEXTURE_UPLOAD_CHOICES,
+        default=TEXTURE_UPLOAD_AUTO,
+        help="Texture upload path: auto tries CUDA-GL interop, cpu keeps the legacy path, cuda-gl fails if interop is unavailable.",
     )
     parser.add_argument("--max-frames", default=0, type=int, help="0 means hold until the panel window is closed")
     parser.add_argument("--stats", action="store_true")
@@ -713,6 +725,7 @@ def main() -> None:
     bootstrap_window = None
     window = None
     texture = None
+    texture_uploader = None
     program = None
     vao = None
     vbo = None
@@ -746,6 +759,13 @@ def main() -> None:
         bootstrap_window = None
         texture = init_panel_texture(width, height)
         program, vao, vbo = create_panel_renderer_resources(args, texture)
+        texture_uploader = create_panel_texture_uploader(
+            mode=args.texture_upload_mode,
+            texture=texture,
+            width=width,
+            height=height,
+            torch_extensions_dir=args.torch_extensions_dir,
+        )
 
         viewpoint_index, source_view_count, render_view_count, view_labels, mapping_label = build_viewpoint_index(
             args,
@@ -862,8 +882,7 @@ def main() -> None:
             torch.cuda.synchronize()
             render_elapsed = time.perf_counter() - t0
 
-        rgba = rendered_to_rgba(rendered)
-        upload_direct(texture, width, height, rgba)
+        texture_uploader.upload(rendered)
         draw_panel_texture(window, program, vao, texture)
         import glfw
 
@@ -896,6 +915,11 @@ def main() -> None:
             if args.max_frames and total_frames >= args.max_frames:
                 break
     finally:
+        if texture_uploader is not None:
+            try:
+                texture_uploader.close()
+            except Exception:
+                pass
         try:
             delete_panel_renderer_resources(program, vao, vbo)
             from OpenGL import GL

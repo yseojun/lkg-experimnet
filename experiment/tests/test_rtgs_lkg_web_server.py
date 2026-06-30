@@ -144,6 +144,7 @@ class RtgsLkgWebServerTest(unittest.TestCase):
     def test_publish_render_frame_does_not_require_web_preview_jpeg(self):
         state = lkg_web_server.InteractiveState()
         tensor = object()
+        upload_event = object()
         playback = lkg_web_server.PlaybackStatus(
             frame_index=2,
             frame_count=5,
@@ -152,13 +153,17 @@ class RtgsLkgWebServerTest(unittest.TestCase):
             n3dv_frame_index=11,
         )
 
-        state.publish_render_frame(tensor=tensor, render_ms=20.0, playback=playback)
+        state.publish_render_frame(tensor=tensor, render_ms=20.0, playback=playback, upload_event=upload_event)
 
         seq, latest_tensor = state.latest_tensor_snapshot()
+        display_seq, display_tensor, display_event = state.latest_display_tensor_snapshot()
         jpeg_seq, latest_jpeg = state.latest_jpeg_snapshot()
         payload = state.status_payload()
         self.assertEqual(seq, 1)
         self.assertIs(latest_tensor, tensor)
+        self.assertEqual(display_seq, 1)
+        self.assertIs(display_tensor, tensor)
+        self.assertIs(display_event, upload_event)
         self.assertEqual(jpeg_seq, 1)
         self.assertIsNone(latest_jpeg)
         self.assertEqual(payload["playback"]["frame_index"], 2)
@@ -172,8 +177,10 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         state.publish_preview_jpeg(seq=1, jpeg=b"jpg")
 
         seq, latest_jpeg = state.latest_jpeg_snapshot()
+        payload = state.status_payload()
         self.assertEqual(seq, 1)
         self.assertEqual(latest_jpeg, b"jpg")
+        self.assertTrue(payload["preview_available"])
 
     def test_playback_cursor_loops_over_timeline(self):
         timeline = [
@@ -272,9 +279,17 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertEqual(status_code, 200)
         self.assertEqual(status_type, "application/json")
         self.assertEqual(status_body["active_checkpoint"]["id"], option.id)
+        self.assertFalse(status_body["preview_available"])
         self.assertEqual(checkpoints_code, 200)
         self.assertEqual(checkpoints_type, "application/json")
         self.assertEqual(checkpoints_body["checkpoints"][0]["id"], option.id)
+
+    def test_index_html_does_not_request_preview_until_status_reports_available(self):
+        html = lkg_web_server._index_html()
+
+        self.assertNotIn('src="/frame.jpg"', html)
+        self.assertIn("data.preview_available", html)
+        self.assertIn("frame.removeAttribute('src')", html)
 
     def test_main_dispatches_to_interactive_server(self):
         with mock.patch.object(lkg_web_server, "run_interactive_server", return_value=0) as run:
@@ -291,6 +306,12 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertEqual(args.playback_fps, 0.0)
         self.assertEqual(args.web_preview_fps, 5.0)
         self.assertEqual(args.rtgs_context_loader, "lite")
+        self.assertEqual(args.texture_upload_mode, "auto")
+
+    def test_parser_accepts_cuda_gl_texture_upload_mode(self):
+        args = lkg_web_server.build_parser().parse_args(["--texture-upload-mode", "cuda-gl"])
+
+        self.assertEqual(args.texture_upload_mode, "cuda-gl")
 
     def test_wrapper_script_exists_and_uses_module_main(self):
         script = Path(__file__).resolve().parents[1] / "rtgs_lkg_web_server.py"

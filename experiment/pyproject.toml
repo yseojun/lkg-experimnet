@@ -19,6 +19,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["lkg_experiment*"]
 
+[tool.setuptools.package-data]
+"lkg_experiment.coherent_default" = ["cuda_gl_texture_ext/*.cpp", "cuda_gl_texture_ext/*.cu"]
+
 [project.scripts]
 lkg-run-coherent-raster = "lkg_experiment.coherent_default.run_coherent_raster_experiment:main"
 lkg-build-web-index = "lkg_experiment.experiment.build_web_index:main"

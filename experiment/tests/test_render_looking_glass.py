@@ -158,6 +158,12 @@ class RenderLookingGlassTest(unittest.TestCase):
         args = build_parser().parse_args([])
 
         self.assertEqual(args.panel_renderer, "fixed")
+        self.assertEqual(args.texture_upload_mode, "auto")
+
+    def test_parser_accepts_cuda_gl_texture_upload_mode(self):
+        args = build_parser().parse_args(["--texture-upload-mode", "cuda-gl"])
+
+        self.assertEqual(args.texture_upload_mode, "cuda-gl")
 
     def test_prepare_pyopengl_before_bridge_imports_gl_without_shader_entrypoints(self):
         from lkg_experiment.render_looking_glass import prepare_pyopengl_before_bridge

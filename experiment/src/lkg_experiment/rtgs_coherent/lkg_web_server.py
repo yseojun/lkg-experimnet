@@ -14,6 +14,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from lkg_experiment.coherent_default.cuda_gl_texture import (
+    TEXTURE_UPLOAD_AUTO,
+    TEXTURE_UPLOAD_CHOICES,
+)
+
 
 DEFAULT_CHECKPOINT_ROOT = Path("/data/ysj/result/4dgs/RTGS")
 DEFAULT_RTGS_CODE_ROOT = Path(__file__).resolve().parents[4] / "4d-gaussian-splatting"
@@ -191,6 +196,7 @@ class InteractiveState:
         self.latest_jpeg: bytes | None = None
         self.latest_jpeg_seq = 0
         self.latest_tensor: Any = None
+        self.latest_upload_event: Any = None
         self.playback_status: PlaybackStatus | None = None
         self.runtime_bundle: RuntimeBundle | None = None
 
@@ -224,9 +230,17 @@ class InteractiveState:
         with self._lock:
             self.last_error = message
 
-    def publish_render_frame(self, *, tensor: Any, render_ms: float, playback: PlaybackStatus | None) -> None:
+    def publish_render_frame(
+        self,
+        *,
+        tensor: Any,
+        render_ms: float,
+        playback: PlaybackStatus | None,
+        upload_event: Any = None,
+    ) -> None:
         with self._lock:
             self.latest_tensor = tensor
+            self.latest_upload_event = upload_event
             self.frame_seq += 1
             self.latest_jpeg_seq = self.frame_seq
             if playback is not None:
@@ -241,6 +255,10 @@ class InteractiveState:
     def latest_tensor_snapshot(self) -> tuple[int, Any]:
         with self._lock:
             return self.frame_seq, self.latest_tensor
+
+    def latest_display_tensor_snapshot(self) -> tuple[int, Any, Any]:
+        with self._lock:
+            return self.frame_seq, self.latest_tensor, self.latest_upload_event
 
     def latest_jpeg_snapshot(self) -> tuple[int, bytes | None]:
         with self._lock:
@@ -261,6 +279,8 @@ class InteractiveState:
                 "playback": None if self.playback_status is None else self.playback_status.to_json(),
                 "render_fps": self.render_fps.to_json(),
                 "display_fps": self.display_fps.to_json(),
+                "preview_available": self.latest_jpeg is not None,
+                "preview_seq": int(self.latest_jpeg_seq),
             }
 
 
@@ -326,6 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playback-mode", choices=("auto", "static"), default="auto")
     parser.add_argument("--playback-fps", default=0.0, type=float)
     parser.add_argument("--web-preview-fps", default=5.0, type=float)
+    parser.add_argument(
+        "--texture-upload-mode",
+        choices=TEXTURE_UPLOAD_CHOICES,
+        default=TEXTURE_UPLOAD_AUTO,
+        help="LKG panel texture upload path: auto tries CUDA-GL interop, cpu keeps the legacy path, cuda-gl fails if unavailable.",
+    )
     parser.add_argument(
         "--rtgs-context-loader",
         choices=("lite", "official"),
@@ -755,6 +781,30 @@ def _playback_sleep_seconds(playback_fps: float, render_start: float) -> float:
     return max(0.0, (1.0 / fps) - (time.perf_counter() - float(render_start)))
 
 
+def record_cuda_ready_event(tensor: Any) -> Any:
+    if not bool(getattr(tensor, "is_cuda", False)):
+        return None
+    import torch
+
+    device = getattr(tensor, "device", None)
+    event = torch.cuda.Event(blocking=False)
+    event.record(torch.cuda.current_stream(device))
+    return event
+
+
+def wait_cuda_ready_event(event: Any, tensor: Any) -> None:
+    if event is None:
+        return
+    if bool(getattr(tensor, "is_cuda", False)):
+        import torch
+
+        device = getattr(tensor, "device", None)
+        torch.cuda.current_stream(device).wait_event(event)
+        return
+    if hasattr(event, "synchronize"):
+        event.synchronize()
+
+
 def poll_panel_window_events(glfw: Any, window: Any, stop_event: threading.Event) -> bool:
     glfw.poll_events()
     if glfw.window_should_close(window):
@@ -849,10 +899,13 @@ class RenderingWorker(threading.Thread):
                         orbit_state=self.state.orbit_snapshot(),
                         debug=bool(self.args.debug_cr),
                     )
+                    frame = frame.detach()
+                    upload_event = record_cuda_ready_event(frame)
                 self.state.publish_render_frame(
-                    tensor=frame.detach(),
+                    tensor=frame,
                     render_ms=render_ms,
                     playback=bundle.cursor.current_status(),
+                    upload_event=upload_event,
                 )
             except Exception as exc:
                 self.state.set_error(str(exc))
@@ -933,6 +986,7 @@ class DisplayWorker(threading.Thread):
         from lkg_experiment.coherent_default.render_looking_glass import (
             configure_x11_environment,
             create_panel_renderer_resources,
+            create_panel_texture_uploader,
             delete_panel_renderer_resources,
             destroy_glfw_bootstrap_context,
             draw_panel_texture,
@@ -940,10 +994,8 @@ class DisplayWorker(threading.Thread):
             init_panel_texture,
             init_panel_window,
             prepare_pyopengl_before_bridge,
-            rendered_to_rgba,
             resolve_bridge_or_fallback_display,
             resolve_panel_render_size,
-            upload_direct,
             wake_x11_display_for_panel,
         )
 
@@ -956,6 +1008,7 @@ class DisplayWorker(threading.Thread):
         bridge = None
         window = None
         texture = None
+        texture_uploader = None
         program = None
         vao = None
         vbo = None
@@ -984,6 +1037,13 @@ class DisplayWorker(threading.Thread):
             bootstrap_window = None
             texture = init_panel_texture(width, height)
             program, vao, vbo = create_panel_renderer_resources(self.args, texture)
+            texture_uploader = create_panel_texture_uploader(
+                mode=self.args.texture_upload_mode,
+                texture=texture,
+                width=width,
+                height=height,
+                torch_extensions_dir=self.args.torch_extensions_dir,
+            )
             last_seq = -1
             last_wake = time.perf_counter()
             import glfw
@@ -995,12 +1055,12 @@ class DisplayWorker(threading.Thread):
                     last_wake = now
                 if not poll_panel_window_events(glfw, window, self.stop_event):
                     break
-                seq, tensor = self.state.latest_tensor_snapshot()
+                seq, tensor, upload_event = self.state.latest_display_tensor_snapshot()
                 if tensor is not None and seq != last_seq:
                     start = time.perf_counter()
                     with self.gpu_lock:
-                        rgba = rendered_to_rgba(tensor)
-                    upload_direct(texture, width, height, rgba)
+                        wait_cuda_ready_event(upload_event, tensor)
+                        texture_uploader.upload(tensor)
                     draw_panel_texture(window, program, vao, texture)
                     glfw.swap_buffers(window)
                     self.state.record_display_frame((time.perf_counter() - start) * 1000.0)
@@ -1010,6 +1070,11 @@ class DisplayWorker(threading.Thread):
                     glfw.swap_buffers(window)
                     time.sleep(0.005)
         finally:
+            if texture_uploader is not None:
+                try:
+                    texture_uploader.close()
+                except Exception:
+                    pass
             _cleanup_glfw(
                 window=window,
                 bootstrap_window=bootstrap_window,
@@ -1161,7 +1226,7 @@ def _index_html() -> str:
 <body>
 <div id="app">
   <main id="stage">
-    <img id="frame" tabindex="0" src="/frame.jpg">
+    <img id="frame" tabindex="0">
     <div id="overlay"><div class="spinner"></div><span>{LOADING_TEXT}</span></div>
   </main>
   <aside>
@@ -1194,9 +1259,11 @@ async function refreshStatus() {{
   const data = await (await fetch('/api/status')).json();
   overlay.classList.toggle('visible', !!data.loading_checkpoint);
   if (data.active_checkpoint) select.value = data.active_checkpoint.id;
-  if (data.frame_seq !== seq) {{
-    seq = data.frame_seq;
-    frame.src = `/frame.jpg?seq=${{seq}}`;
+  if (data.preview_available && data.preview_seq !== seq) {{
+    seq = data.preview_seq;
+    frame.src = `/frame.jpg?seq=${{data.preview_seq}}`;
+  }} else if (!data.preview_available && frame.hasAttribute('src')) {{
+    frame.removeAttribute('src');
   }}
   stats.textContent = JSON.stringify(data, null, 2);
 }}
