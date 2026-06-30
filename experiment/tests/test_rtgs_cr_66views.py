@@ -228,7 +228,7 @@ class RtgsCr66ViewsTest(unittest.TestCase):
         self.assertTrue(torch.allclose(updated_c2w, c2w))
         self.assertTrue(torch.allclose(updated_center, orbit_center))
 
-    def test_render_interlaced_frame_compose_api_uses_viewpoint_index(self):
+    def test_render_interlaced_frame_uses_one_shot_renderer_and_orbit_context(self):
         viewpoint_index = torch.zeros((2, 2, 3), dtype=torch.long)
         viewpoint_index[:, :, 1] = 1
         context = cr_66views.RtgsCr66RenderContext(
@@ -239,6 +239,8 @@ class RtgsCr66ViewsTest(unittest.TestCase):
                 far_plane=100.0,
                 camera_model="pinhole",
                 rtgs_compat_projection=True,
+                cluster_size=2,
+                cr_remapping="on",
             ),
             runtime=SimpleNamespace(official=SimpleNamespace(gaussians=object()), background=None),
             cr_anchor_camera_cuda=SimpleNamespace(camera_center=torch.zeros(3)),
@@ -271,32 +273,28 @@ class RtgsCr66ViewsTest(unittest.TestCase):
             view_degree=10.0,
             orbit_direction=-1,
         )
-        rendered_values = [0.25, 0.75]
+        one_shot_image = torch.full((3, 2, 2), 0.5, dtype=torch.float32)
+        one_shot_timing = SimpleNamespace(frame_ms_with_lkg_interlace=12.5)
+        orbit = SimpleNamespace(yaw_deg=10.0, pitch_deg=0.0, pan_x=0.0, pan_y=0.0, distance_scale=1.0)
 
-        def fake_render_rtgs_coherent(**_kwargs):
-            value = rendered_values.pop(0)
-            return torch.full((3, 2, 2), value, dtype=torch.float32)
+        def fake_one_shot(received_context, *, variant):
+            self.assertEqual(variant.name, "interactive_one_shot")
+            self.assertEqual(variant.cluster_size, 2)
+            self.assertTrue(variant.use_remapping)
+            self.assertTrue(variant.reuse_enabled)
+            self.assertFalse(torch.allclose(received_context.anchor_c2w, context.anchor_c2w))
+            return one_shot_image, one_shot_timing
 
-        with (
-            mock.patch.object(cr_66views, "synthesize_flat_viewmats", return_value=torch.eye(4).repeat(2, 1, 1)),
-            mock.patch.object(cr_66views, "synthetic_camera_from_viewmat_preserving_rtgs_contract") as make_camera,
-            mock.patch.object(cr_66views, "rtgs_camera_to_gsplat_inputs", return_value=(torch.eye(4), torch.eye(3))),
-            mock.patch.object(cr_66views, "evaluate_rtgs_colors", return_value=torch.zeros((1, 3))),
-            mock.patch.object(cr_66views, "snapshot_from_geometry", return_value=SimpleNamespace()),
-            mock.patch.object(
-                cr_66views,
-                "adapt_snapshot_for_rtgs_compat_projection",
-                return_value=(SimpleNamespace(), torch.eye(3), {"applied": False}),
-            ),
-            mock.patch.object(cr_66views, "render_rtgs_coherent", side_effect=fake_render_rtgs_coherent),
-        ):
-            make_camera.return_value.cuda.return_value = SimpleNamespace(camera_center=torch.zeros(3))
-            image, render_ms = cr_66views.render_rtgs_cr_66_interlaced_frame(context)
+        with mock.patch(
+            "lkg_experiment.rtgs_coherent.cr_one_shot.render_rtgs_cr_one_shot_interlaced_once",
+            side_effect=fake_one_shot,
+        ) as render_one_shot:
+            image, render_ms = cr_66views.render_rtgs_cr_66_interlaced_frame(context, orbit_state=orbit)
 
+        render_one_shot.assert_called_once()
         self.assertGreaterEqual(render_ms, 0.0)
-        self.assertTrue(torch.allclose(image[0], torch.full((2, 2), 0.25)))
-        self.assertTrue(torch.allclose(image[1], torch.full((2, 2), 0.75)))
-        self.assertTrue(torch.allclose(image[2], torch.full((2, 2), 0.25)))
+        self.assertAlmostEqual(render_ms, 12.5)
+        self.assertTrue(torch.allclose(image, one_shot_image))
 
 
 if __name__ == "__main__":

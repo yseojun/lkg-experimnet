@@ -5,9 +5,10 @@ import math
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -573,85 +574,50 @@ def render_rtgs_cr_66_interlaced_frame(
     progress_every_views: int = 0,
 ) -> tuple[Any, float]:
     import torch
+    from lkg_experiment.rtgs_coherent import cr_one_shot
 
     args = context.args
-    if orbit_state is None:
-        c2w = context.anchor_c2w
-        orbit_center = context.orbit_center
-    else:
+    render_context = context
+    if orbit_state is not None:
         c2w, orbit_center = apply_orbit_state_to_c2w(context.anchor_c2w, context.orbit_center, orbit_state)
-    flat_viewmats = synthesize_flat_viewmats(
-        c2w=c2w,
-        orbit_center=orbit_center,
-        source_view_count=int(context.source_view_count),
-        view_degree=float(context.view_degree),
-        orbit_direction=int(context.orbit_direction),
-        device=str(args.device),
-    )
-    interlaced = torch.zeros(
-        (3, int(context.panel_height), int(context.panel_width)),
-        dtype=torch.float32,
-        device=context.viewpoint_index_t.device,
-    )
+        render_context = replace(context, anchor_c2w=c2w, orbit_center=orbit_center)
     should_sync = str(args.device).startswith("cuda") and torch.cuda.is_available()
     if should_sync:
         torch.cuda.synchronize()
     start = time.perf_counter()
-    for view_id in range(int(context.source_view_count)):
-        if progress_label and _should_report_view_progress(
-            view_id,
-            source_view_count=int(context.source_view_count),
-            every=int(progress_every_views),
-        ):
-            print(
-                f"{progress_label} view {view_id + 1}/{int(context.source_view_count)}",
-                file=sys.stderr,
-                flush=True,
-            )
-        synthetic_camera = synthetic_camera_from_viewmat_preserving_rtgs_contract(
-            context.cr_anchor_camera_cuda,
-            flat_viewmats[view_id],
-            uid=view_id,
-            image_name=f"view_{view_id:03d}",
-            timestamp=float(context.timestamp),
-            device=str(args.device),
-            width=int(context.render_width),
-            height=int(context.render_height),
-            crop_to_fill=bool(context.crop_to_fill),
-        ).cuda()
-        viewmat, K = rtgs_camera_to_gsplat_inputs(synthetic_camera, device=str(args.device))
-        colors = evaluate_rtgs_colors(
-            context.runtime.official.gaussians,
-            timestamp=float(context.timestamp),
-            camera_center=synthetic_camera.camera_center,
-            mask=context.geometry.mask,
-        )
-        snapshot = snapshot_from_geometry(context.geometry, colors=colors)
-        cr_snapshot, cr_K, _cr_projection_adapter = adapt_snapshot_for_rtgs_compat_projection(
-            snapshot,
-            camera=synthetic_camera,
-            viewmat=viewmat,
-            K=K,
-            enabled=bool(args.rtgs_compat_projection) and not bool(context.fov_normalization["applied"]),
-        )
-        cr_image = render_rtgs_coherent(
-            snapshot=cr_snapshot,
-            viewmat=viewmat,
-            K=cr_K,
-            width=int(context.render_width),
-            height=int(context.render_height),
-            tile_size=int(args.tile_size),
-            near_plane=float(args.near_plane),
-            far_plane=float(args.far_plane),
-            camera_model=str(args.camera_model),
-            background=context.runtime.background,
-            debug=bool(debug),
-        )
-        accumulate_interlaced_view(interlaced, cr_image, context.viewpoint_index_t, view_id=view_id, viewport=context.viewport)
+    if progress_label:
+        print(f"{progress_label} one-shot render", file=sys.stderr, flush=True)
+    interlaced, timing = cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(
+        render_context,
+        variant=interactive_one_shot_variant(args),
+    )
     if should_sync:
         torch.cuda.synchronize()
-    render_ms = (time.perf_counter() - start) * 1000.0
+    measured_ms = (time.perf_counter() - start) * 1000.0
+    render_ms = _one_shot_render_ms(timing, fallback_ms=measured_ms)
     return interlaced.clamp(0.0, 1.0).contiguous(), render_ms
+
+
+def interactive_one_shot_variant(args: Any) -> Any:
+    return SimpleNamespace(
+        name="interactive_one_shot",
+        cluster_size=int(getattr(args, "cluster_size", 1)),
+        use_remapping=str(getattr(args, "cr_remapping", "on")) != "off",
+        reuse_enabled=True,
+        group="interactive",
+    )
+
+
+def _one_shot_render_ms(timing: Any, *, fallback_ms: float) -> float:
+    if hasattr(timing, "frame_ms_with_lkg_interlace"):
+        value = float(timing.frame_ms_with_lkg_interlace)
+    elif hasattr(timing, "frame_ms"):
+        value = float(timing.frame_ms)
+    elif isinstance(timing, Mapping):
+        value = float(timing.get("frame_ms_with_lkg_interlace", timing.get("frame_ms", fallback_ms)))
+    else:
+        value = float(fallback_ms)
+    return value if math.isfinite(value) and value >= 0.0 else float(fallback_ms)
 
 
 def _should_report_view_progress(view_id: int, *, source_view_count: int, every: int) -> bool:
