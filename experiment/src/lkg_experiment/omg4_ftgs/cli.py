@@ -14,7 +14,15 @@ from PIL import Image
 
 from lkg_experiment.omg4_ftgs.camera import load_pose_camera, load_test_frames
 from lkg_experiment.omg4_ftgs.model import load_dynamic_gaussians
-from lkg_experiment.omg4_ftgs.render import install_gsplat_root, render_splats_coherent, render_splats_gsplat
+from lkg_experiment.omg4_ftgs.render import (
+    build_interlaced_viewpoint_index,
+    estimate_orbit_center,
+    install_gsplat_root,
+    render_splats_coherent,
+    render_splats_gsplat,
+    render_splats_interlaced_coherent,
+    synthesize_interlaced_viewmats,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -24,11 +32,12 @@ DEFAULT_DATA_PATH = Path("/data/ysj/dataset/N3DV/cook_spinach")
 DEFAULT_OUTPUT_ROOT = Path("/data/ysj/result/coherent-raster/generated/omg4_ftgs")
 DEFAULT_GSPLAT_ROOT = REPO_ROOT / "gsplat"
 DEFAULT_OMG4_ROOT = REPO_ROOT / "OMG4"
+DEFAULT_VIEWPOINT_INDEX_PATH = Path("/data/ysj/result/coherent-raster/generated/lkg_go_1440x2560_66_views_lkg_calibration.npz")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render OMG4-FTGS 1-view images and same-camera videos")
-    parser.add_argument("--mode", choices=("single", "video", "both"), default="both")
+    parser.add_argument("--mode", choices=("single", "video", "both", "interlaced"), default="both")
     parser.add_argument("--renderer", choices=("gsplat", "coherent", "both"), default="gsplat")
     parser.add_argument("--checkpoint-path", default=str(DEFAULT_CHECKPOINT_PATH))
     parser.add_argument("--data-path", default=str(DEFAULT_DATA_PATH))
@@ -46,6 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--far-plane", type=float, default=100.0)
     parser.add_argument("--camera-model", choices=("pinhole", "ortho", "fisheye"), default="pinhole")
     parser.add_argument("--debug-cr", action="store_true")
+    parser.add_argument("--views", type=int, default=66)
+    parser.add_argument("--panel-width", type=int, default=1440)
+    parser.add_argument("--panel-height", type=int, default=2560)
+    parser.add_argument("--map-mode", choices=("file", "linear"), default="file")
+    parser.add_argument("--viewpoint-index-path", default=str(DEFAULT_VIEWPOINT_INDEX_PATH))
+    parser.add_argument("--cluster-size", type=int, default=8)
+    parser.add_argument("--view-degree", type=float, default=53.0)
+    parser.add_argument("--orbit-direction", type=int, default=-1)
+    parser.add_argument("--orbit-center-distance", type=float, default=0.0)
+    parser.add_argument("--coherent-quantize", choices=("floor", "nearest"), default="floor")
     parser.add_argument("--gsplat-root", default=str(DEFAULT_GSPLAT_ROOT))
     parser.add_argument("--omg4-root", default=str(DEFAULT_OMG4_ROOT))
     parser.add_argument("--device", default="cuda")
@@ -71,23 +90,26 @@ def run(args: argparse.Namespace) -> int:
     manifest: dict[str, Any] = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "mode": str(args.mode),
-        "renderer": str(args.renderer),
+        "renderer": "coherent" if args.mode == "interlaced" else str(args.renderer),
         "checkpoint_path": str(Path(args.checkpoint_path).expanduser()),
         "data_path": str(Path(args.data_path).expanduser()),
         "camera_index": int(args.camera_index),
         "frame_index": int(args.frame_index),
         "resolution": float(args.resolution),
-        "width": int(_render_width(args, camera_set)),
-        "height": int(_render_height(args, camera_set)),
+        "width": int(args.panel_width) if args.mode == "interlaced" else int(_render_width(args, camera_set)),
+        "height": int(args.panel_height) if args.mode == "interlaced" else int(_render_height(args, camera_set)),
         "output_dir": str(output_dir),
         "single": None,
         "video": None,
+        "interlaced": None,
     }
 
     if args.mode in {"single", "both"}:
         manifest["single"] = _render_single(args, dynamic_model, camera_set, frames, output_dir)
     if args.mode in {"video", "both"}:
         manifest["video"] = _render_video(args, dynamic_model, camera_set, frames, output_dir)
+    if args.mode == "interlaced":
+        manifest["interlaced"] = _render_interlaced(args, dynamic_model, camera_set, frames, output_dir)
 
     _write_manifest(output_dir / "manifest.json", manifest)
     return 0
@@ -186,6 +208,73 @@ def _render_video(args: argparse.Namespace, dynamic_model: Any, camera_set: Any,
     }
 
 
+def _render_interlaced(args: argparse.Namespace, dynamic_model: Any, camera_set: Any, frames: list[Any], output_dir: Path) -> dict[str, Any]:
+    import torch
+
+    panel_width = int(args.panel_width)
+    panel_height = int(args.panel_height)
+    if panel_width <= 0 or panel_height <= 0:
+        raise ValueError("--panel-width and --panel-height must be positive")
+    frame = _select_frame(frames, int(args.frame_index))
+    splats = dynamic_model.materialize(float(frame.timestamp))
+    viewpoint_index, map_metadata = build_interlaced_viewpoint_index(args, width=panel_width, height=panel_height)
+
+    source_viewmat = torch.as_tensor(camera_set.viewmat_at(int(args.camera_index)), dtype=torch.float32, device=str(args.device)).contiguous()
+    c2w = torch.linalg.inv(source_viewmat)
+    orbit_center = estimate_orbit_center(
+        c2w=c2w,
+        splat_means=splats.means,
+        orbit_center_distance=float(args.orbit_center_distance),
+    )
+    adjacent_viewmats = synthesize_interlaced_viewmats(
+        c2w=c2w,
+        orbit_center=orbit_center,
+        views=int(args.views),
+        cluster_size=int(args.cluster_size),
+        view_degree=float(args.view_degree),
+        orbit_direction=int(args.orbit_direction),
+        device=str(args.device),
+    )
+    K = _scaled_panel_K(args, camera_set)
+
+    _sync_device(str(args.device))
+    start = time.perf_counter()
+    image = render_splats_interlaced_coherent(
+        splats,
+        adjacent_viewmats=adjacent_viewmats,
+        K=K,
+        viewpoint_index=viewpoint_index,
+        width=panel_width,
+        height=panel_height,
+        device=str(args.device),
+        tile_size=int(args.tile_size),
+        near_plane=float(args.near_plane),
+        far_plane=float(args.far_plane),
+        camera_model=str(args.camera_model),
+        debug=bool(args.debug_cr),
+    )
+    _sync_device(str(args.device))
+    render_ms = (time.perf_counter() - start) * 1000.0
+    output = output_dir / "omg4_ftgs_lkg_interlaced.png"
+    _save_tensor_image(output, image)
+    return {
+        "path": str(output),
+        "frame_index": int(frame.index),
+        "timestamp": float(frame.timestamp),
+        "panel_width": panel_width,
+        "panel_height": panel_height,
+        "views": int(args.views),
+        "cluster_size": int(args.cluster_size),
+        "map_metadata": map_metadata,
+        "view_degree": float(args.view_degree),
+        "orbit_direction": int(args.orbit_direction),
+        "orbit_center_distance": float(args.orbit_center_distance),
+        "orbit_center": _tensor_to_float_list(orbit_center),
+        "render_ms": float(render_ms),
+        "gaussians": int(splats.means.shape[0]),
+    }
+
+
 def _render_timestamp(args: argparse.Namespace, dynamic_model: Any, camera_set: Any, *, timestamp: float):
     splats = dynamic_model.materialize(float(timestamp))
     return _render_materialized(args, splats, camera_set, renderer=str(args.renderer))
@@ -271,6 +360,25 @@ def _scaled_K(args: argparse.Namespace, camera_set: Any):
     return K
 
 
+def _scaled_panel_K(args: argparse.Namespace, camera_set: Any):
+    panel_width = int(args.panel_width)
+    panel_height = int(args.panel_height)
+    if panel_width <= 0 or panel_height <= 0:
+        raise ValueError("--panel-width and --panel-height must be positive")
+    K = np.asarray(camera_set.K, dtype=np.float32).copy()
+    scale_w = float(panel_width) / float(camera_set.width)
+    scale_h = float(panel_height) / float(camera_set.height)
+    scale = max(scale_w, scale_h)
+    K[0, 0] *= scale
+    K[1, 1] *= scale
+    K[0, 2] = float(panel_width) / 2.0
+    K[1, 2] = float(panel_height) / 2.0
+    K[0, 1] = 0.0
+    K[1, 0] = 0.0
+    K[2, :] = [0.0, 0.0, 1.0]
+    return K
+
+
 def _save_tensor_image(path: Path, image: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     array = image.detach().clamp(0.0, 1.0).cpu().numpy() if hasattr(image, "detach") else np.asarray(image)
@@ -300,6 +408,24 @@ def _compute_pair_metrics(a: Any, b: Any) -> dict[str, float]:
         "mae": mae,
         "psnr": float("inf") if mse == 0.0 else float(10.0 * math.log10(1.0 / mse)),
     }
+
+
+def _sync_device(device: str) -> None:
+    if not str(device).startswith("cuda"):
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        return
+
+
+def _tensor_to_float_list(value: Any) -> list[float]:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return [float(item) for item in np.asarray(value).reshape(-1).tolist()]
 
 
 def _encode_video_from_frames(frames_dir: Path, output_path: Path, *, fps: float) -> dict[str, Any]:
