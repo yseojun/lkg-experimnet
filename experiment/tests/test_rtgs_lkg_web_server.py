@@ -5,6 +5,8 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
@@ -307,11 +309,13 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertEqual(args.web_preview_fps, 5.0)
         self.assertEqual(args.rtgs_context_loader, "lite")
         self.assertEqual(args.texture_upload_mode, "auto")
+        self.assertIsNone(args.texture_upload_cuda_device)
 
     def test_parser_accepts_cuda_gl_texture_upload_mode(self):
-        args = lkg_web_server.build_parser().parse_args(["--texture-upload-mode", "cuda-gl"])
+        args = lkg_web_server.build_parser().parse_args(["--texture-upload-mode", "cuda-gl", "--texture-upload-cuda-device", "0"])
 
         self.assertEqual(args.texture_upload_mode, "cuda-gl")
+        self.assertEqual(args.texture_upload_cuda_device, 0)
 
     def test_wrapper_script_exists_and_uses_module_main(self):
         script = Path(__file__).resolve().parents[1] / "rtgs_lkg_web_server.py"
@@ -350,6 +354,25 @@ class RtgsLkgWebServerTest(unittest.TestCase):
         self.assertTrue(stop_event.is_set())
         glfw.poll_events.assert_called_once_with()
         glfw.window_should_close.assert_called_once_with(window)
+
+    def test_display_worker_logs_exception_before_stopping_server(self):
+        state = lkg_web_server.InteractiveState()
+        stop_event = threading.Event()
+        worker = lkg_web_server.DisplayWorker(
+            args=SimpleNamespace(display_mode="glfw"),
+            state=state,
+            gpu_lock=threading.Lock(),
+            stop_event=stop_event,
+        )
+
+        stderr = StringIO()
+        with mock.patch.object(worker, "_run_glfw", side_effect=RuntimeError("panel init failed")):
+            with redirect_stderr(stderr):
+                worker.run()
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(state.status_payload()["last_error"], "panel init failed")
+        self.assertIn("DisplayWorker failed: panel init failed", stderr.getvalue())
 
     def test_stop_http_server_skips_shutdown_when_web_thread_is_not_running(self):
         server = SimpleNamespace(shutdown=mock.Mock(), server_close=mock.Mock())

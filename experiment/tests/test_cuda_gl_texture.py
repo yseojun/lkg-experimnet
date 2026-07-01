@@ -29,6 +29,20 @@ class FakeCudaGlExtension:
         self.uploads.append((int(resource), tensor, int(width), int(height)))
 
 
+class DeviceSelectiveExtension(FakeCudaGlExtension):
+    def __init__(self, *, devices: list[int], valid_device: int) -> None:
+        super().__init__(devices=devices)
+        self.valid_device = int(valid_device)
+        self.register_attempts: list[int] = []
+
+    def register_gl_texture(self, texture: int, cuda_device: int | None = None) -> int:
+        device = -1 if cuda_device is None else int(cuda_device)
+        self.register_attempts.append(device)
+        if device != self.valid_device:
+            raise RuntimeError("cudaGraphicsGLRegisterImage failed: invalid device ordinal")
+        return super().register_gl_texture(texture, cuda_device)
+
+
 class CudaGlTextureUploaderTest(unittest.TestCase):
     def test_cpu_uploader_uses_existing_rgba_upload_path(self) -> None:
         converter = mock.Mock(return_value="rgba")
@@ -112,6 +126,63 @@ class CudaGlTextureUploaderTest(unittest.TestCase):
         self.assertEqual(str(tensor.copy_device), "cuda:2")
         self.assertTrue(tensor.copy_non_blocking)
         self.assertEqual(extension.uploads, [(1011, copied, 1440, 2560)])
+
+    def test_cuda_gl_uploader_uses_explicit_device_when_gl_probe_fails(self) -> None:
+        class ProbeFailExtension(FakeCudaGlExtension):
+            def gl_cuda_devices(self) -> list[int]:
+                raise RuntimeError("cudaGLGetDevices failed: no CUDA-capable device is detected")
+
+        extension = ProbeFailExtension()
+        with mock.patch.object(cuda_gl_texture, "_visible_torch_cuda_devices", return_value=[0]):
+            uploader = cuda_gl_texture.CudaGlTextureUploader(
+                texture=11,
+                width=1440,
+                height=2560,
+                cuda_device=0,
+                extension_loader=lambda: extension,
+            )
+        try:
+            self.assertEqual(extension.register_device, 0)
+        finally:
+            uploader.close()
+
+    def test_cuda_gl_uploader_uses_current_torch_device_when_gl_probe_fails(self) -> None:
+        class ProbeFailExtension(FakeCudaGlExtension):
+            def gl_cuda_devices(self) -> list[int]:
+                raise RuntimeError("cudaGLGetDevices failed: no CUDA-capable device is detected")
+
+        extension = ProbeFailExtension()
+        with mock.patch.object(cuda_gl_texture, "_current_torch_cuda_device", return_value=0), mock.patch.object(
+            cuda_gl_texture,
+            "_visible_torch_cuda_devices",
+            return_value=[0],
+        ):
+            uploader = cuda_gl_texture.CudaGlTextureUploader(
+                texture=11,
+                width=1440,
+                height=2560,
+                extension_loader=lambda: extension,
+            )
+        try:
+            self.assertEqual(extension.register_device, 0)
+        finally:
+            uploader.close()
+
+    def test_cuda_gl_uploader_tries_visible_devices_when_first_registration_device_is_invalid(self) -> None:
+        extension = DeviceSelectiveExtension(devices=[0, 1], valid_device=1)
+
+        uploader = cuda_gl_texture.CudaGlTextureUploader(
+            texture=11,
+            width=1440,
+            height=2560,
+            cuda_device=0,
+            extension_loader=lambda: extension,
+        )
+        try:
+            self.assertEqual(extension.register_attempts, [0, 1])
+            self.assertEqual(extension.register_device, 1)
+        finally:
+            uploader.close()
 
     def test_auto_mode_falls_back_to_cpu_when_cuda_gl_registration_fails(self) -> None:
         warnings: list[str] = []

@@ -18,6 +18,171 @@ RGB_SUBPIXELS = 3
 REFERENCE_INTERLACED_VARIANT_NAME = "without_reuse"
 DEFAULT_CLUSTERS = (2, 4, 8, 16)
 
+COMMON_CONTEXT_COLUMNS = [
+    "status",
+    "dataset_kind",
+    "scene",
+    "checkpoint",
+    "camera_split",
+    "camera_index",
+    "frame_index",
+    "timestamp",
+    "output_prefix",
+    "engine",
+    "variant",
+    "group",
+    "render_width",
+    "render_height",
+    "source_views",
+    "saved_views",
+    "cluster_size",
+    "color_eval_views",
+    "use_remapping",
+    "reuse_enabled",
+    "tile_size",
+    "map_mode",
+]
+
+COMMON_FRAME_TIMING_COLUMNS = [
+    "fps",
+    "frame_ms",
+    "frame_ms_end_to_end",
+    "fps_end_to_end",
+    "frame_ms_with_lkg_interlace",
+    "fps_with_lkg_interlace",
+]
+
+COMMON_CR_TIMING_COLUMNS = [
+    "cr_core_total_ms",
+    "cr_projection_ms",
+    "cr_isect_ms",
+    "cr_keygen_ms",
+    "cr_sort_ms",
+    "cr_offset_ms",
+    "cr_blend_ms",
+    "cr_timing_source",
+]
+
+COMMON_QUALITY_METRIC_COLUMNS = [
+    "psnr_mean",
+    "psnr_std",
+    "ssim_mean",
+    "ssim_std",
+    "lpips_mean",
+    "lpips_std",
+    "metric_view_count",
+    "metric_reference_variant",
+    "metric_scope",
+]
+
+COMMON_RESOURCE_COLUMNS = [
+    "total_gaussians",
+    "active_gaussians",
+    "active_gaussian_ratio",
+    "peak_vram_gb",
+]
+
+COMMON_MEASUREMENT_COLUMN_GROUPS = {
+    "frame_timing": tuple(COMMON_FRAME_TIMING_COLUMNS),
+    "cr_timing": tuple(COMMON_CR_TIMING_COLUMNS),
+    "quality_metrics": tuple(COMMON_QUALITY_METRIC_COLUMNS),
+    "resources": tuple(COMMON_RESOURCE_COLUMNS),
+}
+
+COMMON_EXPERIMENT_COLUMNS = (
+    COMMON_CONTEXT_COLUMNS
+    + COMMON_FRAME_TIMING_COLUMNS
+    + COMMON_CR_TIMING_COLUMNS
+    + COMMON_QUALITY_METRIC_COLUMNS
+    + COMMON_RESOURCE_COLUMNS
+)
+
+RTGS_CONTEXT_COLUMNS = [
+    "camera_aspect_mode",
+]
+
+RTGS_DYNAMIC_TIMING_COLUMNS = [
+    "dynamic_geometry_ms",
+    "temporal_opacity_ms",
+    "snapshot_compaction_ms",
+    "dynamic_color_ms",
+    "rtgs_dynamic_total_ms",
+]
+
+RTGS_LKG_TIMING_COLUMNS = [
+    "lkg_unpatchify_ms",
+    "lkg_unpad_ms",
+    "lkg_panel_paste_ms",
+    "lkg_interlace_post_ms",
+    "frame_ms_without_lkg",
+    "fps_without_lkg",
+]
+
+RTGS_MEASUREMENT_COLUMN_GROUPS = {
+    "dynamic_timing": tuple(RTGS_DYNAMIC_TIMING_COLUMNS),
+    "lkg_timing": tuple(RTGS_LKG_TIMING_COLUMNS),
+}
+
+RTGS_SPECIFIC_EXPERIMENT_COLUMNS = RTGS_CONTEXT_COLUMNS + RTGS_DYNAMIC_TIMING_COLUMNS + RTGS_LKG_TIMING_COLUMNS
+
+OMG4_CONTEXT_COLUMNS = [
+    "dataset_scene",
+    "weight_group",
+    "panel_width",
+    "panel_height",
+    "views",
+]
+
+OMG4_FRAME_TIMING_COLUMNS = [
+    "frame_ms_excluding_lookup",
+    "frame_ms_including_lookup",
+    "fps_including_lookup",
+]
+
+OMG4_SETUP_TIMING_COLUMNS = [
+    "materialize_ms",
+    "view_setup_ms",
+    "cr_render_ms",
+    "cr_core_ms",
+    "viewpoint_index_ms",
+    "lookup_cpu_ms",
+    "lookup_h2d_ms",
+    "post_ms",
+]
+
+OMG4_RESOURCE_COLUMNS = [
+    "gaussians",
+]
+
+OMG4_ARTIFACT_COLUMNS = [
+    "output_dir",
+    "image_path",
+    "manifest_path",
+    "checkpoint_path",
+    "data_path",
+    "message",
+]
+
+OMG4_MEASUREMENT_COLUMN_GROUPS = {
+    "frame_timing": tuple(OMG4_FRAME_TIMING_COLUMNS),
+    "setup_and_lookup_timing": tuple(OMG4_SETUP_TIMING_COLUMNS),
+    "resources": tuple(OMG4_RESOURCE_COLUMNS),
+}
+
+OMG4_SPECIFIC_EXPERIMENT_COLUMNS = (
+    OMG4_CONTEXT_COLUMNS
+    + OMG4_FRAME_TIMING_COLUMNS
+    + OMG4_SETUP_TIMING_COLUMNS
+    + OMG4_RESOURCE_COLUMNS
+    + OMG4_ARTIFACT_COLUMNS
+)
+
+EXPERIMENT_MEASUREMENT_COLUMN_GROUPS = {
+    **{f"common.{name}": columns for name, columns in COMMON_MEASUREMENT_COLUMN_GROUPS.items()},
+    **{f"rtgs.{name}": columns for name, columns in RTGS_MEASUREMENT_COLUMN_GROUPS.items()},
+    **{f"omg4.{name}": columns for name, columns in OMG4_MEASUREMENT_COLUMN_GROUPS.items()},
+}
+
 
 @dataclass(frozen=True)
 class ExperimentVariant:
@@ -255,62 +420,8 @@ class ArtifactWriter:
         if not rows:
             path.write_text("", encoding="utf-8")
             return path
-        preferred = [
-            "dataset_kind",
-            "scene",
-            "checkpoint",
-            "camera_split",
-            "camera_index",
-            "frame_index",
-            "timestamp",
-            "output_prefix",
-            "variant",
-            "engine",
-            "group",
-            "render_width",
-            "render_height",
-            "source_views",
-            "saved_views",
-            "cluster_size",
-            "color_eval_views",
-            "use_remapping",
-            "reuse_enabled",
-            "tile_size",
-            "map_mode",
-            "camera_aspect_mode",
-            "dynamic_geometry_ms",
-            "temporal_opacity_ms",
-            "snapshot_compaction_ms",
-            "dynamic_color_ms",
-            "rtgs_dynamic_total_ms",
-            "cr_projection_ms",
-            "cr_keygen_ms",
-            "cr_sort_ms",
-            "cr_blend_ms",
-            "cr_core_total_ms",
-            "lkg_unpatchify_ms",
-            "lkg_unpad_ms",
-            "lkg_panel_paste_ms",
-            "lkg_interlace_post_ms",
-            "frame_ms_without_lkg",
-            "fps_without_lkg",
-            "frame_ms_with_lkg_interlace",
-            "fps_with_lkg_interlace",
-            "fps",
-            "frame_ms",
-            "psnr_mean",
-            "psnr_std",
-            "ssim_mean",
-            "ssim_std",
-            "lpips_mean",
-            "lpips_std",
-            "metric_view_count",
-            "total_gaussians",
-            "active_gaussians",
-            "active_gaussian_ratio",
-            "peak_vram_gb",
-        ]
-        fieldnames = [field for field in preferred if any(field in row for row in rows)]
+        preferred = COMMON_EXPERIMENT_COLUMNS + RTGS_SPECIFIC_EXPERIMENT_COLUMNS + OMG4_SPECIFIC_EXPERIMENT_COLUMNS
+        fieldnames = list(dict.fromkeys(preferred))
         for row in rows:
             for field in row:
                 if field not in fieldnames:
@@ -656,6 +767,7 @@ def time_interlaced_render(
     if warmup_iters < 0 or measure_iters <= 0:
         raise ValueError("warmup_iters must be non-negative and measure_iters must be positive")
     if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     last = None
     total = 0.0
@@ -684,7 +796,7 @@ def time_interlaced_render(
     fps = count / total if total > 0.0 else 0.0
     peak_vram_gb = 0.0
     if torch.cuda.is_available():
-        peak_vram_gb = torch.cuda.max_memory_reserved() / float(2**30)
+        peak_vram_gb = torch.cuda.max_memory_allocated() / float(2**30)
     return last, TimingStats(fps=fps, frame_ms=(1000.0 / fps if fps > 0.0 else math.inf), peak_vram_gb=peak_vram_gb)
 
 
@@ -750,6 +862,66 @@ def compute_metric_stats(
         lpips_std=_std(lpips_values),
         metric_view_count=len(metric_view_indices),
     )
+
+
+def compute_interlaced_metric_stats(
+    image: Any,
+    reference: Any,
+    *,
+    require_lpips: bool = False,
+) -> MetricStats:
+    import torch
+
+    image_t = _as_chw_float_image(image)
+    reference_t = _as_chw_float_image(reference).to(device=image_t.device, dtype=image_t.dtype)
+    if tuple(image_t.shape) != tuple(reference_t.shape):
+        raise ValueError(f"image and reference shapes must match, got {tuple(image_t.shape)} and {tuple(reference_t.shape)}")
+
+    psnr_values = [_psnr_torch(image_t, reference_t)]
+    ssim_values: list[float] = []
+    lpips_values: list[float] = []
+    ssim_metric = _make_ssim_metric(device=image_t.device)
+    lpips_metric = _make_lpips_metric(device=image_t.device, required=require_lpips)
+
+    with torch.no_grad():
+        if ssim_metric is not None:
+            try:
+                ssim_values.append(float(ssim_metric(image_t.unsqueeze(0), reference_t.unsqueeze(0)).item()))
+            except Exception:
+                pass
+        if lpips_metric is not None:
+            try:
+                lpips_values.append(float(lpips_metric(image_t.unsqueeze(0), reference_t.unsqueeze(0)).item()))
+            except Exception:
+                if require_lpips:
+                    raise
+
+    return MetricStats(
+        psnr_mean=_mean(psnr_values),
+        psnr_std=_std(psnr_values),
+        ssim_mean=_mean(ssim_values),
+        ssim_std=_std(ssim_values),
+        lpips_mean=_mean(lpips_values),
+        lpips_std=_std(lpips_values),
+        metric_view_count=1,
+    )
+
+
+def _as_chw_float_image(image: Any):
+    import torch
+
+    if hasattr(image, "detach"):
+        tensor = image.detach()
+    else:
+        tensor = torch.as_tensor(image)
+    tensor = tensor.float().clamp(0.0, 1.0)
+    if tensor.ndim != 3:
+        raise ValueError(f"image must have shape [3,H,W] or [H,W,3], got {tuple(tensor.shape)}")
+    if int(tensor.shape[0]) != RGB_SUBPIXELS and int(tensor.shape[-1]) == RGB_SUBPIXELS:
+        tensor = tensor.permute(2, 0, 1).contiguous()
+    if int(tensor.shape[0]) != RGB_SUBPIXELS:
+        raise ValueError(f"image must have three RGB channels, got {tuple(tensor.shape)}")
+    return tensor.contiguous()
 
 
 def compact_viewpoint_index(viewpoint_index: np.ndarray, source_view_count: int) -> tuple[np.ndarray, np.ndarray]:

@@ -101,6 +101,62 @@ class BatchExperimentsTest(unittest.TestCase):
         self.assertEqual(rows[0]["artifact_root"], "/tmp/artifacts/run_a")
         self.assertTrue(rows[0]["metrics_csv"].endswith("run_a/metrics.csv"))
 
+    def test_metrics_rows_from_run_preserves_detailed_measurement_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run_a"
+            run_dir.mkdir()
+            (run_dir / "manifest.json").write_text(
+                '{"run_id": "run_a", "artifact_root": "/tmp/artifacts/run_a"}',
+                encoding="utf-8",
+            )
+            with (run_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "variant",
+                        "camera_split",
+                        "camera_index",
+                        "cr_projection_ms",
+                        "cr_sort_ms",
+                        "cr_offset_ms",
+                        "cr_core_total_ms",
+                        "frame_ms_with_lkg_interlace",
+                        "fps_with_lkg_interlace",
+                        "lookup_h2d_ms",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "variant": "cluster_2",
+                        "camera_split": "test",
+                        "camera_index": "0",
+                        "cr_projection_ms": "1.0",
+                        "cr_sort_ms": "2.0",
+                        "cr_offset_ms": "3.0",
+                        "cr_core_total_ms": "6.0",
+                        "frame_ms_with_lkg_interlace": "12.5",
+                        "fps_with_lkg_interlace": "80.0",
+                        "lookup_h2d_ms": "0.25",
+                    }
+                )
+
+            rows = metrics_rows_from_run(
+                run_dir,
+                suite="rtgs",
+                result_group="paper",
+                scene="coffee_martini",
+                camera_split="test",
+                camera_index=0,
+            )
+
+        self.assertIn("cr_sort_ms", SUMMARY_COLUMNS)
+        self.assertIn("lookup_h2d_ms", SUMMARY_COLUMNS)
+        self.assertEqual(rows[0]["cr_sort_ms"], "2.0")
+        self.assertEqual(rows[0]["cr_offset_ms"], "3.0")
+        self.assertEqual(rows[0]["frame_ms_with_lkg_interlace"], "12.5")
+        self.assertEqual(rows[0]["lookup_h2d_ms"], "0.25")
+
     def test_metrics_rows_from_run_can_filter_by_output_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run_a"

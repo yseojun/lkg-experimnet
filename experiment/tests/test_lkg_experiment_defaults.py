@@ -5,15 +5,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from lkg_experiment.build_web_index import build_parser as build_web_index_parser
 from lkg_experiment.coherent_raster_experiment import (
+    ArtifactWriter,
+    COMMON_EXPERIMENT_COLUMNS,
+    COMMON_MEASUREMENT_COLUMN_GROUPS,
+    OMG4_MEASUREMENT_COLUMN_GROUPS,
+    RTGS_MEASUREMENT_COLUMN_GROUPS,
     build_experiment_variants,
     build_experiment_web_index,
     cluster_index_from_view_index,
     image_artifact_path,
     parse_cluster_values,
     reference_interlaced_artifact_path,
+    time_interlaced_render,
 )
 from lkg_experiment.open_experiment import build_experiment_url, resolve_experiment_target
 from lkg_experiment.run_coherent_raster_experiment import build_parser
@@ -141,6 +148,122 @@ class LkgExperimentDefaultsTest(unittest.TestCase):
             image_artifact_path("cluster_8", "looking_glass_tensor.png"),
             Path("images/cluster_8/looking_glass_tensor.png"),
         )
+
+    def test_metrics_csv_orders_common_columns_before_specific_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ArtifactWriter(Path(tmp))
+            writer.write_metrics_csv(
+                [
+                    {
+                        "dataset_kind": "n3dv",
+                        "scene": "coffee_martini",
+                        "checkpoint": "/weights/model.pth",
+                        "camera_index": 0,
+                        "frame_index": 1,
+                        "timestamp": 0.25,
+                        "engine": "one_shot",
+                        "variant": "cluster_2",
+                        "group": "cluster_sweep",
+                        "render_width": 1440,
+                        "render_height": 2560,
+                        "source_views": 66,
+                        "cluster_size": 2,
+                        "use_remapping": True,
+                        "reuse_enabled": True,
+                        "color_eval_views": 33,
+                        "tile_size": 16,
+                        "map_mode": "file",
+                        "fps": 20.0,
+                        "frame_ms": 50.0,
+                        "cr_core_total_ms": 40.0,
+                        "cr_projection_ms": 5.0,
+                        "total_gaussians": 10,
+                        "dynamic_geometry_ms": 1.0,
+                        "materialize_ms": 2.0,
+                    }
+                ]
+            )
+            header = (Path(tmp) / "metrics.csv").read_text(encoding="utf-8").splitlines()[0].split(",")
+
+        self.assertLess(header.index("variant"), header.index("dynamic_geometry_ms"))
+        self.assertLess(header.index("cr_core_total_ms"), header.index("dynamic_geometry_ms"))
+        self.assertLess(header.index("dynamic_geometry_ms"), header.index("materialize_ms"))
+
+    def test_metrics_csv_writes_stable_full_experiment_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = ArtifactWriter(Path(tmp))
+            writer.write_metrics_csv([{"variant": "cluster_2", "fps": 20.0}])
+            header = (Path(tmp) / "metrics.csv").read_text(encoding="utf-8").splitlines()[0].split(",")
+
+        self.assertIn("status", header)
+        self.assertIn("cr_sort_ms", header)
+        self.assertIn("dynamic_geometry_ms", header)
+        self.assertIn("lookup_h2d_ms", header)
+        self.assertLess(header.index("status"), header.index("variant"))
+        self.assertLess(header.index("cr_sort_ms"), header.index("dynamic_geometry_ms"))
+        self.assertLess(header.index("dynamic_geometry_ms"), header.index("lookup_h2d_ms"))
+
+    def test_measurement_column_groups_cover_schema_measurements(self):
+        common_grouped = [
+            column
+            for columns in COMMON_MEASUREMENT_COLUMN_GROUPS.values()
+            for column in columns
+        ]
+        self.assertIn("cr_sort_ms", common_grouped)
+        self.assertIn("frame_ms_end_to_end", common_grouped)
+        self.assertIn("fps_end_to_end", common_grouped)
+        self.assertIn("peak_vram_gb", common_grouped)
+        self.assertIn("psnr_mean", common_grouped)
+        for column in common_grouped:
+            self.assertIn(column, COMMON_EXPERIMENT_COLUMNS)
+        self.assertEqual(len(common_grouped), len(set(common_grouped)))
+
+        rtgs_grouped = [
+            column
+            for columns in RTGS_MEASUREMENT_COLUMN_GROUPS.values()
+            for column in columns
+        ]
+        self.assertIn("dynamic_geometry_ms", rtgs_grouped)
+        self.assertIn("lkg_panel_paste_ms", rtgs_grouped)
+        self.assertEqual(len(rtgs_grouped), len(set(rtgs_grouped)))
+
+        omg4_grouped = [
+            column
+            for columns in OMG4_MEASUREMENT_COLUMN_GROUPS.values()
+            for column in columns
+        ]
+        self.assertIn("frame_ms_including_lookup", omg4_grouped)
+        self.assertIn("lookup_h2d_ms", omg4_grouped)
+        self.assertEqual(len(omg4_grouped), len(set(omg4_grouped)))
+
+    def test_time_interlaced_render_peak_vram_uses_allocated_memory_not_reserved_cache(self):
+        renderer = unittest.mock.Mock()
+        renderer.render.return_value = object()
+
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "synchronize"),
+            patch.object(torch.cuda, "empty_cache") as empty_cache,
+            patch.object(torch.cuda, "reset_peak_memory_stats") as reset_peak,
+            patch.object(torch.cuda, "max_memory_allocated", return_value=2 * 2**30),
+            patch.object(torch.cuda, "max_memory_reserved", return_value=9 * 2**30),
+        ):
+            _image, timing = time_interlaced_render(
+                renderer,
+                adjacent_viewmats=object(),
+                K=object(),
+                view_idx_matrix=object(),
+                subpixel_coord_matrix=object(),
+                width=2,
+                height=2,
+                tile_size=1,
+                warmup_iters=0,
+                measure_iters=1,
+            )
+
+        empty_cache.assert_called_once()
+        reset_peak.assert_called_once()
+        self.assertAlmostEqual(timing.peak_vram_gb, 2.0)
 
     def test_reference_interlaced_artifact_path_uses_without_reuse_folder(self):
         self.assertEqual(

@@ -353,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="LKG panel texture upload path: auto tries CUDA-GL interop, cpu keeps the legacy path, cuda-gl fails if unavailable.",
     )
     parser.add_argument(
+        "--texture-upload-cuda-device",
+        type=int,
+        default=None,
+        help="CUDA device ordinal to use for CUDA-GL texture upload when cudaGLGetDevices cannot report one.",
+    )
+    parser.add_argument(
         "--rtgs-context-loader",
         choices=("lite", "official"),
         default="lite",
@@ -979,6 +985,7 @@ class DisplayWorker(threading.Thread):
             self._run_glfw()
         except Exception as exc:
             self.state.set_error(str(exc))
+            print(f"DisplayWorker failed: {exc}", file=sys.stderr, flush=True)
             self.stop_event.set()
 
     def _run_glfw(self) -> None:
@@ -994,7 +1001,7 @@ class DisplayWorker(threading.Thread):
             init_panel_texture,
             init_panel_window,
             prepare_pyopengl_before_bridge,
-            resolve_bridge_or_fallback_display,
+            resolve_bridge_display_for_panel,
             resolve_panel_render_size,
             wake_x11_display_for_panel,
         )
@@ -1017,7 +1024,7 @@ class DisplayWorker(threading.Thread):
             bridge = BridgeAPI()
             if not bridge.initialize("LkgRtgsWebServer"):
                 raise RuntimeError("Bridge initialize failed")
-            display_handle, display_info = resolve_bridge_or_fallback_display(bridge, self.args)
+            display_handle, display_info = resolve_bridge_display_for_panel(bridge, self.args)
             del display_handle
             native_width, native_height = display_info["dimensions"]
             panel_x, panel_y = display_info["position"]
@@ -1043,6 +1050,7 @@ class DisplayWorker(threading.Thread):
                 width=width,
                 height=height,
                 torch_extensions_dir=self.args.torch_extensions_dir,
+                cuda_device=self.args.texture_upload_cuda_device,
             )
             last_seq = -1
             last_wake = time.perf_counter()

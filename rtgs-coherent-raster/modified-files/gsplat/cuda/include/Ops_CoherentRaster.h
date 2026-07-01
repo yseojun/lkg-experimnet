@@ -60,7 +60,7 @@ projection_ewa_3dgs_fused_fwd_CR(
 );
 
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
     const at::Tensor means3d, // [N, 3]
     const at::Tensor means2d,                    // [1, N, 2]
     const at::Tensor radii,                      // [1, N, 2]
@@ -75,7 +75,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> intersect_tile_CR(
     const uint32_t tile_width,
     const uint32_t tile_height,
     const bool sort,
-    const at::optional<at::Tensor> rtgs_projection_adapter
+    const at::optional<at::Tensor> rtgs_projection_adapter,
+    const bool return_timing
 );
 
 at::Tensor intersect_offset_CR(

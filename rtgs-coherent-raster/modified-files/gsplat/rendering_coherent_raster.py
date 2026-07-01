@@ -22,7 +22,7 @@
 # ------------------------------------------------------------------
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import time
 
 import torch
@@ -83,7 +83,7 @@ def rasterization_CR(
     # colors: [N, 16, 3] = [N, K, 3]
     
     meta = {}
-    timing_ms: Dict[str, float] = {}
+    timing_ms: Dict[str, Any] = {}
 
 
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
@@ -205,7 +205,7 @@ def rasterization_CR(
     if is_debug:
         torch.cuda.synchronize()
         tic = time.time()
-    tiles_per_gauss, isect_ids, flatten_ids, translation_values = isect_tiles_CR(
+    isect_result = isect_tiles_CR(
         means,
         means2d,
         radii,
@@ -217,7 +217,10 @@ def rasterization_CR(
         tile_width,
         tile_height,
         rtgs_projection_adapter=rtgs_projection_adapter,
+        return_timing=return_timing,
     )
+    tiles_per_gauss, isect_ids, flatten_ids, translation_values, isect_timing_ms = _unpack_isect_tiles_result(isect_result)
+    isect_stage_ms = _timing_stage_elapsed_ms(keygen_start, return_timing, means)
     if is_debug:
         torch.cuda.synchronize()
         toc = time.time()
@@ -231,13 +234,21 @@ def rasterization_CR(
         torch.cuda.synchronize()
         tic = time.time()
     n_view_group = adjacent_viewmats.shape[0]
+    offset_start = _timing_stage_start(return_timing, means)
     isect_offsets = isect_offset_encode_CR(isect_ids, n_view_group, tile_width, tile_height)
+    offset_ms = _timing_stage_elapsed_ms(offset_start, return_timing, means)
     if is_debug:
         torch.cuda.synchronize()
         toc = time.time()
         print(f"isect_offsets(): {toc-tic:.8f}")
-    timing_ms["cr_keygen_ms"] = _timing_stage_elapsed_ms(keygen_start, return_timing, means)
-    timing_ms["cr_sort_ms"] = 0.0
+    cr_isect_ms, cr_sort_ms = _isect_timing_values(isect_timing_ms)
+    if return_timing and not math.isfinite(cr_isect_ms):
+        cr_isect_ms = isect_stage_ms
+    timing_ms["cr_isect_ms"] = cr_isect_ms
+    timing_ms["cr_sort_ms"] = cr_sort_ms
+    timing_ms["cr_offset_ms"] = offset_ms
+    timing_ms["cr_keygen_ms"] = _finite_sum(cr_isect_ms, cr_sort_ms, offset_ms)
+    timing_ms["cr_timing_source"] = _isect_timing_source(isect_timing_ms)
     
     means2d = means2d.permute(1, 0, 2)
     conics = conics.permute(1, 0, 2)
@@ -281,6 +292,38 @@ def _timing_stage_elapsed_ms(start: float, enabled: bool, reference: Tensor) -> 
     if enabled and reference.is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
     return float((time.perf_counter() - start) * 1000.0) if enabled else 0.0
+
+
+def _unpack_isect_tiles_result(result):
+    if len(result) == 5:
+        return result
+    tiles_per_gauss, isect_ids, flatten_ids, translation_values = result
+    return tiles_per_gauss, isect_ids, flatten_ids, translation_values, None
+
+
+def _isect_timing_values(timing_ms) -> tuple[float, float]:
+    if timing_ms is None:
+        return float("nan"), float("nan")
+    try:
+        if int(timing_ms.numel()) < 2:
+            return float("nan"), float("nan")
+        values = timing_ms.detach().cpu().tolist()
+        return float(values[0]), float(values[1])
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _isect_timing_source(timing_ms) -> str:
+    try:
+        if timing_ms is not None and int(timing_ms.numel()) >= 2:
+            return "extension_events"
+    except Exception:
+        pass
+    return "legacy_stage_fallback"
+
+
+def _finite_sum(*values: float) -> float:
+    return float(sum(float(value) for value in values if math.isfinite(float(value))))
 
 
 def _prepare_colors_for_cr(

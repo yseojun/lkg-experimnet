@@ -100,7 +100,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
                 "rtgs_dynamic_total_ms": 10.0,
                 "cr_projection_ms": 5.0,
                 "cr_keygen_ms": 6.0,
-                "cr_sort_ms": 0.0,
+                "cr_sort_ms": float("nan"),
                 "cr_blend_ms": 7.0,
                 "cr_core_total_ms": 18.0,
                 "lkg_unpatchify_ms": 8.0,
@@ -170,7 +170,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
         self.assertAlmostEqual(row["frame_ms"], row["frame_ms_with_lkg_interlace"])
         self.assertAlmostEqual(row["fps"], row["fps_with_lkg_interlace"])
 
-    def test_resolve_experiment_variants_one_shot_defaults_use_without_reuse_as_reference(self):
+    def test_resolve_experiment_variants_one_shot_defaults_include_ablation_variants(self):
         args = cr_experiment.build_parser().parse_args(["--dataset-kind", "dnerf"])
 
         variants = cr_experiment.resolve_experiment_variants(args)
@@ -180,7 +180,14 @@ class RtgsCrExperimentTest(unittest.TestCase):
             [("cluster_2", 2), ("cluster_4", 4), ("cluster_8", 8), ("cluster_16", 16)],
         )
         self.assertNotIn("cluster_1", [variant.name for variant in variants])
-        self.assertTrue(any(cr_experiment.is_reference_gt_variant(variant) for variant in variants))
+        self.assertEqual(
+            [(variant.name, variant.cluster_size, variant.use_remapping, variant.reuse_enabled) for variant in variants[4:]],
+            [
+                ("without_remap", 8, False, True),
+                ("without_reuse", 1, True, False),
+                ("without_reuse_without_remap", 1, False, False),
+            ],
+        )
 
     def test_resolve_experiment_variants_one_shot_keeps_cluster_sweep(self):
         args = cr_experiment.build_parser().parse_args(
@@ -227,7 +234,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
 
         self.assertEqual(cr_experiment.resolve_metric_view_indices(8, args), [0, 2, 4])
 
-    def test_without_reuse_uses_official_reference_as_gt(self):
+    def test_run_uses_cluster_one_interlaced_as_metric_reference(self):
         args = cr_experiment.build_parser().parse_args(
             [
                 "--dataset-kind",
@@ -235,6 +242,106 @@ class RtgsCrExperimentTest(unittest.TestCase):
                 "--clusters",
                 "2",
                 "--no-without-remap",
+                "--no-without-reuse",
+                "--no-reference-interlaced",
+                "--skip-web-assets",
+                "--artifact-dir",
+                str(Path(tempfile.gettempdir()) / "rtgs_cr_metric_reference_test"),
+                "--run-id",
+                "metric_reference_case",
+                "--warmup-iters",
+                "0",
+                "--measure-iters",
+                "1",
+            ]
+        )
+        args.device = "cpu"
+        fake_context = SimpleNamespace(
+            args=SimpleNamespace(
+                dataset_kind="dnerf",
+                n3dv_frame_index=0,
+                sample_save_views=5,
+                tile_size=16,
+                map_mode="linear",
+                camera_aspect_mode="expand",
+            ),
+            runtime=SimpleNamespace(
+                official=SimpleNamespace(
+                    scene_name="jumpingjacks",
+                    checkpoint_path=Path("/data/checkpoints/chkpnt_best.pth"),
+                    iteration=100,
+                    source_path=Path("/data/dnerf/jumpingjacks"),
+                    scene_paths=SimpleNamespace(
+                        dataset_kind="dnerf",
+                        dataset_path=Path("/data/dnerf/jumpingjacks"),
+                        config_path=Path("/data/configs/jumpingjacks.py"),
+                    ),
+                    gaussians=SimpleNamespace(
+                        get_xyz=torch.zeros((4, 3), dtype=torch.float32),
+                        active_sh_degree=3,
+                        active_sh_degree_t=1,
+                    ),
+                    rtgs_git_commit="abc123",
+                )
+            ),
+            geometry=SimpleNamespace(means=torch.zeros((4, 3), dtype=torch.float32)),
+            viewpoint_index=torch.zeros((2, 2, 3), dtype=torch.int64).numpy(),
+            source_view_count=2,
+            render_width=2,
+            render_height=2,
+            panel_width=2,
+            panel_height=2,
+            timestamp=0.0,
+            viewport=SimpleNamespace(to_manifest=lambda: {"render_width": 2, "render_height": 2}),
+            view_degree=53.0,
+            orbit_direction=-1,
+            view_index_stats={"min": 0, "max": 1},
+            fov_normalization={},
+        )
+        writer = mock.Mock()
+        metric_reference = torch.zeros((3, 2, 2), dtype=torch.float32)
+        cr_render = torch.full((3, 2, 2), 0.5, dtype=torch.float32)
+        timing = cr_experiment.TimingStats(fps=10.0, frame_ms=100.0, peak_vram_gb=0.0)
+        metric_stats = cr_experiment.MetricStats(
+            psnr_mean=12.0,
+            psnr_std=0.0,
+            ssim_mean=0.8,
+            ssim_std=0.0,
+            lpips_mean=0.2,
+            lpips_std=0.0,
+            metric_view_count=1,
+        )
+
+        with (
+            mock.patch.object(cr_experiment, "_cuda_available", return_value=True),
+            mock.patch.object(cr_experiment.cr_66views, "prepare_rtgs_cr_66_context", return_value=fake_context),
+            mock.patch.object(cr_experiment, "render_metric_reference_interlaced", return_value=metric_reference) as render_reference,
+            mock.patch.object(cr_experiment, "time_one_shot_renderer", return_value=(cr_render, timing)),
+            mock.patch.object(cr_experiment, "compute_interlaced_metric_stats", return_value=metric_stats) as compute_metrics,
+            mock.patch.object(cr_experiment, "ArtifactWriter", return_value=writer),
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            rc = cr_experiment.run_rtgs_cr_experiment(args)
+
+        self.assertEqual(rc, 0)
+        render_reference.assert_called_once_with(fake_context)
+        compute_metrics.assert_called_once_with(cr_render, metric_reference, require_lpips=False)
+        final_rows = writer.write_metrics_csv.call_args_list[-1].args[0]
+        self.assertEqual(final_rows[0]["metric_reference_variant"], "cluster_1")
+        self.assertEqual(final_rows[0]["metric_scope"], "interlaced_cluster_reference")
+        self.assertAlmostEqual(final_rows[0]["psnr_mean"], 12.0)
+        self.assertAlmostEqual(final_rows[0]["ssim_mean"], 0.8)
+        self.assertAlmostEqual(final_rows[0]["lpips_mean"], 0.2)
+
+    def test_without_reuse_is_measured_cr_variant(self):
+        args = cr_experiment.build_parser().parse_args(
+            [
+                "--dataset-kind",
+                "dnerf",
+                "--clusters",
+                "2",
+                "--no-without-remap",
+                "--no-reference-interlaced",
                 "--skip-metrics",
                 "--skip-web-assets",
                 "--artifact-dir",
@@ -298,7 +405,7 @@ class RtgsCrExperimentTest(unittest.TestCase):
         with (
             mock.patch.object(cr_experiment, "_cuda_available", return_value=True),
             mock.patch.object(cr_experiment.cr_66views, "prepare_rtgs_cr_66_context", return_value=fake_context),
-            mock.patch.object(cr_experiment, "render_official_reference_interlaced", return_value=reference),
+            mock.patch.object(cr_experiment, "render_official_reference_interlaced", return_value=reference) as render_reference,
             mock.patch.object(cr_experiment, "time_one_shot_renderer", return_value=(cr_render, timing)) as render_cr,
             mock.patch.object(cr_experiment, "ArtifactWriter", return_value=writer),
             mock.patch("sys.stderr", io.StringIO()),
@@ -306,20 +413,16 @@ class RtgsCrExperimentTest(unittest.TestCase):
             rc = cr_experiment.run_rtgs_cr_experiment(args)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(render_cr.call_count, 2)
+        render_reference.assert_not_called()
+        self.assertEqual(render_cr.call_count, 3)
         self.assertEqual(
             [call.kwargs["variant"].name for call in render_cr.call_args_list],
-            ["cluster_2", "without_reuse_without_remap"],
+            ["cluster_2", "without_reuse", "without_reuse_without_remap"],
         )
         saved = {call.args[0]: call.args[1] for call in writer.save_tensor_image.call_args_list}
-        reference_path = Path("images") / "without_reuse" / "reference_interlaced.png"
         output_path = Path("images") / "without_reuse" / "looking_glass_tensor.png"
-        abs_path = Path("images") / "without_reuse" / "abs_error.png"
-        cluster_two_abs_path = Path("images") / "cluster_2" / "abs_error.png"
-        self.assertTrue(torch.equal(saved[reference_path], reference))
-        self.assertTrue(torch.equal(saved[output_path], reference))
-        self.assertEqual(int(torch.count_nonzero(saved[abs_path]).item()), 0)
-        self.assertGreater(int(torch.count_nonzero(saved[cluster_two_abs_path]).item()), 0)
+        self.assertTrue(torch.equal(saved[output_path], cr_render))
+        self.assertNotIn(Path("images") / "without_reuse" / "abs_error.png", saved)
 
     def test_time_one_shot_renderer_measures_average_and_peak_vram(self):
         calls = []
@@ -341,6 +444,85 @@ class RtgsCrExperimentTest(unittest.TestCase):
         self.assertAlmostEqual(timing.frame_ms, 7.0)
         self.assertAlmostEqual(timing.fps, 1000.0 / 7.0)
         self.assertEqual(timing.peak_vram_gb, 0.0)
+
+    def test_time_one_shot_renderer_averages_only_finite_detailed_measurements(self):
+        samples = [
+            {
+                "cr_sort_ms": float("nan"),
+                "cr_projection_ms": 1.0,
+                "cr_keygen_ms": 3.0,
+                "cr_blend_ms": 5.0,
+                "cr_timing_source": "legacy_stage_fallback",
+            },
+            {
+                "cr_sort_ms": 2.0,
+                "cr_projection_ms": 3.0,
+                "cr_keygen_ms": 5.0,
+                "cr_blend_ms": 7.0,
+                "cr_timing_source": "legacy_stage_fallback",
+            },
+        ]
+
+        def fake_render(_context):
+            sample = samples.pop(0)
+            return torch.zeros((3, 2, 2), dtype=torch.float32), sample
+
+        with mock.patch.object(cr_experiment, "_cuda_available", return_value=False):
+            _image, timing = cr_experiment.time_one_shot_renderer(
+                SimpleNamespace(),
+                render_fn=fake_render,
+                warmup_iters=0,
+                measure_iters=2,
+            )
+
+        self.assertAlmostEqual(timing.detailed_metrics["cr_sort_ms"], 2.0)
+        self.assertAlmostEqual(timing.detailed_metrics["cr_projection_ms"], 2.0)
+        self.assertAlmostEqual(timing.detailed_metrics["cr_keygen_ms"], 4.0)
+        self.assertAlmostEqual(timing.detailed_metrics["cr_core_total_ms"], 12.0)
+        self.assertEqual(timing.detailed_metrics["cr_timing_source"], "legacy_stage_fallback")
+
+    def test_time_one_shot_renderer_reports_outer_end_to_end_timing(self):
+        def fake_render(_context):
+            return torch.zeros((3, 2, 2), dtype=torch.float32), {
+                "frame_ms_with_lkg_interlace": 10.0,
+                "cr_projection_ms": 1.0,
+                "cr_keygen_ms": 2.0,
+                "cr_blend_ms": 7.0,
+            }
+
+        with (
+            mock.patch.object(cr_experiment, "_cuda_available", return_value=False),
+            mock.patch.object(cr_experiment.time, "perf_counter", side_effect=[1.0, 1.05, 2.0, 2.09]),
+        ):
+            _image, timing = cr_experiment.time_one_shot_renderer(
+                SimpleNamespace(),
+                render_fn=fake_render,
+                warmup_iters=0,
+                measure_iters=2,
+            )
+
+        self.assertAlmostEqual(timing.frame_ms, 10.0)
+        self.assertAlmostEqual(timing.detailed_metrics["frame_ms_end_to_end"], 70.0)
+        self.assertAlmostEqual(timing.detailed_metrics["fps_end_to_end"], 1000.0 / 70.0)
+
+    def test_cuda_peak_vram_uses_allocated_memory_not_reserved_cache(self):
+        with (
+            mock.patch.object(cr_experiment, "_cuda_available", return_value=True),
+            mock.patch.object(torch.cuda, "max_memory_allocated", return_value=2 * 2**30),
+            mock.patch.object(torch.cuda, "max_memory_reserved", return_value=9 * 2**30),
+        ):
+            self.assertAlmostEqual(cr_experiment._peak_vram_gb(), 2.0)
+
+    def test_cuda_peak_reset_clears_allocator_cache(self):
+        with (
+            mock.patch.object(cr_experiment, "_cuda_available", return_value=True),
+            mock.patch.object(torch.cuda, "empty_cache") as empty_cache,
+            mock.patch.object(torch.cuda, "reset_peak_memory_stats") as reset_peak,
+        ):
+            cr_experiment._reset_cuda_peak_memory()
+
+        empty_cache.assert_called_once()
+        reset_peak.assert_called_once()
 
     def test_time_one_shot_renderer_reports_iteration_progress(self):
         def fake_render(_context, *, progress_label=None):

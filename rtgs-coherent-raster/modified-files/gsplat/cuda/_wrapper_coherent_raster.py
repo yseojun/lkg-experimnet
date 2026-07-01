@@ -141,7 +141,8 @@ def isect_tiles_CR(
     camera_ids: Tensor | None = None,
     gaussian_ids: Tensor | None = None,
     rtgs_projection_adapter: Tensor | None = None,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    return_timing: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
 
     if packed:
         nnz = means2d.size(0)
@@ -164,7 +165,8 @@ def isect_tiles_CR(
         assert rtgs_projection_adapter.size() == (6,), rtgs_projection_adapter.size()
         rtgs_projection_adapter = rtgs_projection_adapter.to(device=means3d.device, dtype=means3d.dtype).contiguous()
 
-    tiles_per_gauss, isect_ids, flatten_ids, translation_values = _make_lazy_cuda_func("intersect_tile_CR")(
+    intersect_tile = _make_lazy_cuda_func("intersect_tile_CR")
+    args = (
         means3d.contiguous(),
         means2d.contiguous(),
         radii.contiguous(),
@@ -181,9 +183,19 @@ def isect_tiles_CR(
         sort,
         rtgs_projection_adapter,
     )
+    try:
+        result = intersect_tile(*args, bool(return_timing))
+    except TypeError:
+        result = intersect_tile(*args)
+
+    if len(result) == 5:
+        tiles_per_gauss, isect_ids, flatten_ids, translation_values, timing_ms = result
+    else:
+        tiles_per_gauss, isect_ids, flatten_ids, translation_values = result
+        timing_ms = None
 
     
-    return tiles_per_gauss, isect_ids, flatten_ids, translation_values
+    return tiles_per_gauss, isect_ids, flatten_ids, translation_values, timing_ms
 
 
 @torch.no_grad()

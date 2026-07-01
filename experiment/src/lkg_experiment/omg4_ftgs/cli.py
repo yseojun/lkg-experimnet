@@ -18,6 +18,7 @@ from lkg_experiment.omg4_ftgs.render import (
     build_interlaced_viewpoint_index,
     estimate_orbit_center,
     install_gsplat_root,
+    prepare_cr_lookup_tensors,
     render_splats_coherent,
     render_splats_gsplat,
     render_splats_interlaced_coherent,
@@ -216,9 +217,26 @@ def _render_interlaced(args: argparse.Namespace, dynamic_model: Any, camera_set:
     if panel_width <= 0 or panel_height <= 0:
         raise ValueError("--panel-width and --panel-height must be positive")
     frame = _select_frame(frames, int(args.frame_index))
+    _sync_device(str(args.device))
+    materialize_start = time.perf_counter()
     splats = dynamic_model.materialize(float(frame.timestamp))
-    viewpoint_index, map_metadata = build_interlaced_viewpoint_index(args, width=panel_width, height=panel_height)
+    _sync_device(str(args.device))
+    materialize_ms = (time.perf_counter() - materialize_start) * 1000.0
 
+    _sync_device(str(args.device))
+    viewpoint_start = time.perf_counter()
+    viewpoint_index, map_metadata = build_interlaced_viewpoint_index(args, width=panel_width, height=panel_height)
+    _sync_device(str(args.device))
+    viewpoint_index_ms = (time.perf_counter() - viewpoint_start) * 1000.0
+    prepared_lookup = prepare_cr_lookup_tensors(
+        viewpoint_index,
+        device=str(args.device),
+        tile_size=int(args.tile_size),
+        use_remapping=True,
+    )
+
+    _sync_device(str(args.device))
+    view_setup_start = time.perf_counter()
     source_viewmat = torch.as_tensor(camera_set.viewmat_at(int(args.camera_index)), dtype=torch.float32, device=str(args.device)).contiguous()
     c2w = torch.linalg.inv(source_viewmat)
     orbit_center = estimate_orbit_center(
@@ -236,14 +254,18 @@ def _render_interlaced(args: argparse.Namespace, dynamic_model: Any, camera_set:
         device=str(args.device),
     )
     K = _scaled_panel_K(args, camera_set)
+    _sync_device(str(args.device))
+    view_setup_ms = (time.perf_counter() - view_setup_start) * 1000.0
 
     _sync_device(str(args.device))
-    start = time.perf_counter()
-    image = render_splats_interlaced_coherent(
+    render_start = time.perf_counter()
+    render_result = render_splats_interlaced_coherent(
         splats,
         adjacent_viewmats=adjacent_viewmats,
         K=K,
         viewpoint_index=viewpoint_index,
+        view_idx_matrix=prepared_lookup.view_idx_matrix,
+        subpixel_coord_matrix=prepared_lookup.subpixel_coord_matrix,
         width=panel_width,
         height=panel_height,
         device=str(args.device),
@@ -252,9 +274,26 @@ def _render_interlaced(args: argparse.Namespace, dynamic_model: Any, camera_set:
         far_plane=float(args.far_plane),
         camera_model=str(args.camera_model),
         debug=bool(args.debug_cr),
+        return_meta=True,
+        return_timing=True,
     )
     _sync_device(str(args.device))
-    render_ms = (time.perf_counter() - start) * 1000.0
+    cr_render_ms = (time.perf_counter() - render_start) * 1000.0
+    if isinstance(render_result, tuple) and len(render_result) == 2:
+        image, render_meta = render_result
+    else:
+        image, render_meta = render_result, {}
+    cr_timing_ms = dict((render_meta or {}).get("timing_ms", {}))
+    cr_core_ms = _finite_sum(
+        cr_timing_ms.get("cr_projection_ms", 0.0),
+        cr_timing_ms.get("cr_keygen_ms", 0.0),
+        cr_timing_ms.get("cr_blend_ms", 0.0),
+    )
+    post_ms = float((render_meta or {}).get("post_ms", 0.0))
+    frame_ms_excluding_lookup = float(materialize_ms + view_setup_ms + cr_render_ms)
+    frame_ms_including_lookup = float(
+        frame_ms_excluding_lookup + viewpoint_index_ms + prepared_lookup.lookup_cpu_ms + prepared_lookup.lookup_h2d_ms
+    )
     output = output_dir / "omg4_ftgs_lkg_interlaced.png"
     _save_tensor_image(output, image)
     return {
@@ -270,7 +309,19 @@ def _render_interlaced(args: argparse.Namespace, dynamic_model: Any, camera_set:
         "orbit_direction": int(args.orbit_direction),
         "orbit_center_distance": float(args.orbit_center_distance),
         "orbit_center": _tensor_to_float_list(orbit_center),
-        "render_ms": float(render_ms),
+        "render_ms": float(frame_ms_excluding_lookup),
+        "frame_ms": float(frame_ms_excluding_lookup),
+        "frame_ms_excluding_lookup": float(frame_ms_excluding_lookup),
+        "frame_ms_including_lookup": float(frame_ms_including_lookup),
+        "materialize_ms": float(materialize_ms),
+        "viewpoint_index_ms": float(viewpoint_index_ms),
+        "view_setup_ms": float(view_setup_ms),
+        "cr_render_ms": float(cr_render_ms),
+        "lookup_cpu_ms": float(prepared_lookup.lookup_cpu_ms),
+        "lookup_h2d_ms": float(prepared_lookup.lookup_h2d_ms),
+        "cr_core_ms": float(cr_core_ms),
+        "cr_timing_ms": cr_timing_ms,
+        "post_ms": float(post_ms),
         "gaussians": int(splats.means.shape[0]),
     }
 
@@ -461,6 +512,17 @@ def _resolve_output_dir(args: argparse.Namespace) -> Path:
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_ready(manifest), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _finite_sum(*values: Any) -> float:
+    return float(sum(float(value) for value in values if _is_finite_number(value)))
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _json_ready(value: Any) -> Any:

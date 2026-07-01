@@ -128,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=TEXTURE_UPLOAD_AUTO,
         help="Texture upload path: auto tries CUDA-GL interop, cpu keeps the legacy path, cuda-gl fails if interop is unavailable.",
     )
+    parser.add_argument(
+        "--texture-upload-cuda-device",
+        type=int,
+        default=None,
+        help="CUDA device ordinal to use for CUDA-GL texture upload when cudaGLGetDevices cannot report one.",
+    )
     parser.add_argument("--max-frames", default=0, type=int, help="0 means hold until the panel window is closed")
     parser.add_argument("--stats", action="store_true")
     return parser
@@ -304,6 +310,54 @@ def resolve_bridge_or_fallback_display(bridge: Any, args: argparse.Namespace) ->
                 "--allow-bridge-display-fallback plus explicit --width/--height and optional --window-x/--window-y."
             ) from exc
         return fallback_display_info(args, str(exc))
+
+
+def resolve_bridge_display_for_panel(
+    bridge: Any,
+    args: argparse.Namespace,
+    *,
+    wake_display: Any = None,
+    sleep: Any = None,
+    max_wake_attempts: int = 3,
+    retry_delay_s: float = 0.25,
+) -> tuple[int, dict[str, Any]]:
+    handle, info = resolve_bridge_or_fallback_display(bridge, args)
+    requested = _requested_panel_size(args)
+    if requested is None or bool(getattr(args, "allow_non_native_panel_size", False)):
+        return handle, info
+    if _display_dimensions_match(info, requested):
+        return handle, info
+
+    wake = wake_display or wake_x11_display_for_panel
+    delay = sleep or time.sleep
+    for _attempt in range(max(0, int(max_wake_attempts))):
+        native_width, native_height = info["dimensions"]
+        print(
+            "Bridge reported display dimensions "
+            f"{int(native_width)}x{int(native_height)} for requested panel "
+            f"{requested[0]}x{requested[1]}; waking display and retrying.",
+            file=sys.stderr,
+            flush=True,
+        )
+        wake()
+        delay(float(retry_delay_s))
+        handle, info = resolve_bridge_or_fallback_display(bridge, args)
+        if _display_dimensions_match(info, requested):
+            return handle, info
+    return handle, info
+
+
+def _requested_panel_size(args: argparse.Namespace) -> tuple[int, int] | None:
+    width = int(getattr(args, "width", 0) or 0)
+    height = int(getattr(args, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _display_dimensions_match(info: dict[str, Any], requested: tuple[int, int]) -> bool:
+    native_width, native_height = info["dimensions"]
+    return int(native_width) == int(requested[0]) and int(native_height) == int(requested[1])
 
 
 def fallback_display_info(args: argparse.Namespace, reason: str = "") -> tuple[int, dict[str, Any]]:
@@ -734,7 +788,7 @@ def main() -> None:
         bridge = BridgeAPI()
         if not bridge.initialize("LkgExperimentRenderPanel"):
             raise RuntimeError("Bridge initialize failed")
-        display_handle, display_info = resolve_bridge_or_fallback_display(bridge, args)
+        display_handle, display_info = resolve_bridge_display_for_panel(bridge, args)
         native_width, native_height = display_info["dimensions"]
         panel_x, panel_y = display_info["position"]
         if args.window_x is not None:
@@ -765,6 +819,7 @@ def main() -> None:
             width=width,
             height=height,
             torch_extensions_dir=args.torch_extensions_dir,
+            cuda_device=args.texture_upload_cuda_device,
         )
 
         viewpoint_index, source_view_count, render_view_count, view_labels, mapping_label = build_viewpoint_index(

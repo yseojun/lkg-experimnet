@@ -1,12 +1,15 @@
 import unittest
 import os
+from contextlib import redirect_stderr
 from argparse import Namespace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from lkg_experiment.render_looking_glass import (
     build_parser,
+    resolve_bridge_display_for_panel,
     resolve_bridge_or_fallback_display,
     resolve_effective_view_count,
     resolve_panel_render_size,
@@ -133,6 +136,54 @@ class RenderLookingGlassTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "--width and --height"):
             resolve_bridge_or_fallback_display(EmptyBridge(), args)
 
+    def test_resolve_bridge_display_for_panel_wakes_and_retries_mismatched_native_size(self):
+        class SleepyBridge:
+            def __init__(self):
+                self.get_dimensions_for_display = mock.Mock(side_effect=[(720, 480), (1440, 2560)])
+
+            def get_displays(self):
+                return [7]
+
+            def get_device_name_for_display(self, _handle):
+                return "Looking Glass"
+
+            def get_device_serial_for_display(self, _handle):
+                return "LKG-E15445"
+
+            def get_window_position_for_display(self, _handle):
+                return (100, 200)
+
+            def get_default_quilt_settings_for_display(self, _handle):
+                return None
+
+        args = Namespace(
+            display_index=0,
+            allow_bridge_display_fallback=False,
+            allow_non_native_panel_size=False,
+            width=1440,
+            height=2560,
+            window_x=None,
+            window_y=None,
+        )
+        wake_display = mock.Mock()
+        sleep = mock.Mock()
+        stderr = StringIO()
+
+        with redirect_stderr(stderr):
+            handle, info = resolve_bridge_display_for_panel(
+                SleepyBridge(),
+                args,
+                wake_display=wake_display,
+                sleep=sleep,
+                retry_delay_s=0.01,
+            )
+
+        self.assertEqual(handle, 7)
+        self.assertEqual(info["dimensions"], (1440, 2560))
+        self.assertIn("waking display and retrying", stderr.getvalue())
+        wake_display.assert_called_once_with()
+        sleep.assert_called_once_with(0.01)
+
     def test_panel_wrapper_script_exists_and_uses_render_entrypoint(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "run_drums_panel.sh"
 
@@ -159,11 +210,13 @@ class RenderLookingGlassTest(unittest.TestCase):
 
         self.assertEqual(args.panel_renderer, "fixed")
         self.assertEqual(args.texture_upload_mode, "auto")
+        self.assertIsNone(args.texture_upload_cuda_device)
 
     def test_parser_accepts_cuda_gl_texture_upload_mode(self):
-        args = build_parser().parse_args(["--texture-upload-mode", "cuda-gl"])
+        args = build_parser().parse_args(["--texture-upload-mode", "cuda-gl", "--texture-upload-cuda-device", "0"])
 
         self.assertEqual(args.texture_upload_mode, "cuda-gl")
+        self.assertEqual(args.texture_upload_cuda_device, 0)
 
     def test_prepare_pyopengl_before_bridge_imports_gl_without_shader_entrypoints(self):
         from lkg_experiment.render_looking_glass import prepare_pyopengl_before_bridge

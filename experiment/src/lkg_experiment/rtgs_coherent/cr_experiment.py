@@ -16,11 +16,11 @@ from lkg_experiment.coherent_default.coherent_raster_experiment import (
     ArtifactWriter,
     ExperimentVariant,
     MetricStats,
-    REFERENCE_INTERLACED_VARIANT_NAME,
     TimingStats,
     build_experiment_variants,
     build_experiment_web_assets,
     cluster_index_from_view_index,
+    compute_interlaced_metric_stats,
     image_artifact_path,
     parse_cluster_values,
     read_metrics_csv,
@@ -42,7 +42,7 @@ class RtgsCrTimingStats:
     fps: float
     frame_ms: float
     peak_vram_gb: float
-    detailed_metrics: Mapping[str, float]
+    detailed_metrics: Mapping[str, Any]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluate metrics on all rendered source views; overrides --max-metric-views.",
     )
     parser.add_argument("--skip-metrics", action="store_true")
+    parser.add_argument("--require-lpips", action="store_true")
     parser.add_argument("--no-reference-interlaced", action="store_true")
     parser.add_argument("--skip-web-assets", action="store_true")
     parser.add_argument("--write-mapping-artifacts", action="store_true")
@@ -117,6 +118,14 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
             reference_interlaced_artifact_path(output_prefix=str(args.output_prefix)),
             reference_interlaced,
         )
+    metric_reference_interlaced = None
+    if not bool(args.skip_metrics):
+        print("Rendering cluster_1 metric reference interlaced image...", file=sys.stderr, flush=True)
+        metric_reference_interlaced = render_metric_reference_interlaced(context)
+        writer.save_tensor_image(
+            image_artifact_path("cluster_1", "metric_reference.png", output_prefix=str(args.output_prefix)),
+            metric_reference_interlaced,
+        )
 
     if args.append_metrics:
         rows: list[dict[str, Any]] = remove_matching_metric_rows(
@@ -145,28 +154,19 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-        if is_reference_gt_variant(variant):
-            if reference_interlaced is None:
-                raise ValueError("without_reuse is the GT/reference variant and requires reference_interlaced")
-            interlaced = reference_interlaced
-            timing = reference_gt_timing_stats()
-        else:
-            interlaced, timing = time_one_shot_renderer(
-                context,
-                variant=variant,
-                warmup_iters=int(args.warmup_iters),
-                measure_iters=int(args.measure_iters),
-            )
+        interlaced, timing = time_one_shot_renderer(
+            context,
+            variant=variant,
+            warmup_iters=int(args.warmup_iters),
+            measure_iters=int(args.measure_iters),
+        )
         last_interlaced = interlaced
         writer.save_tensor_image(
             image_artifact_path(variant.name, "looking_glass_tensor.png", output_prefix=str(args.output_prefix)),
             interlaced,
         )
         if reference_interlaced is not None:
-            if is_reference_gt_variant(variant):
-                abs_error = interlaced.new_zeros(interlaced.shape)
-            else:
-                abs_error = (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0)
+            abs_error = (interlaced - reference_interlaced).abs().mul(8.0).clamp(0.0, 1.0)
             writer.save_tensor_image(
                 image_artifact_path(variant.name, "abs_error.png", output_prefix=str(args.output_prefix)),
                 abs_error,
@@ -174,10 +174,11 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
 
         metrics = None
         if not bool(args.skip_metrics):
-            if is_reference_gt_variant(variant):
-                metrics = reference_gt_metric_stats(metric_view_indices)
-            else:
-                metrics = compute_sampled_view_metric_stats(context, metric_view_indices)
+            metrics = compute_interlaced_metric_stats(
+                interlaced,
+                metric_reference_interlaced,
+                require_lpips=bool(args.require_lpips),
+            )
         rows.append(
             build_metric_row(
                 variant=variant,
@@ -188,6 +189,8 @@ def run_rtgs_cr_experiment(args: argparse.Namespace) -> int:
                 timing=timing,
                 metrics=metrics,
                 context=context,
+                metric_reference_variant="cluster_1" if metrics is not None else None,
+                metric_scope="interlaced_cluster_reference" if metrics is not None else None,
             )
         )
         writer.write_metrics_csv(rows)
@@ -241,26 +244,6 @@ def resolve_experiment_variants(args: argparse.Namespace) -> list[ExperimentVari
     )
 
 
-def is_reference_gt_variant(variant: Any) -> bool:
-    return str(getattr(variant, "name", "")) == REFERENCE_INTERLACED_VARIANT_NAME and int(getattr(variant, "cluster_size", 0)) == 1
-
-
-def reference_gt_timing_stats() -> TimingStats:
-    return TimingStats(fps=float("nan"), frame_ms=float("nan"), peak_vram_gb=float("nan"))
-
-
-def reference_gt_metric_stats(metric_view_indices: Sequence[int]) -> MetricStats:
-    return MetricStats(
-        psnr_mean=float("inf"),
-        psnr_std=0.0,
-        ssim_mean=1.0,
-        ssim_std=0.0,
-        lpips_mean=float("nan"),
-        lpips_std=float("nan"),
-        metric_view_count=int(len(metric_view_indices)),
-    )
-
-
 def resolve_metric_view_indices(source_view_count: int, args: argparse.Namespace) -> list[int]:
     max_metric_views = 0 if bool(args.all_metric_views) else int(args.max_metric_views)
     return select_metric_view_indices(
@@ -297,6 +280,8 @@ def build_metric_row(
     timing: TimingStats,
     metrics: MetricStats | None,
     context: cr_66views.RtgsCr66RenderContext | None = None,
+    metric_reference_variant: str | None = None,
+    metric_scope: str | None = None,
 ) -> dict[str, Any]:
     detailed_metrics = dict(getattr(timing, "detailed_metrics", {}) or {})
     legacy_frame_ms = float(timing.frame_ms)
@@ -326,6 +311,10 @@ def build_metric_row(
         row["fps"] = float(detailed_metrics["fps_with_lkg_interlace"])
     if metrics is not None:
         row.update(metrics.__dict__)
+    if metric_reference_variant:
+        row["metric_reference_variant"] = str(metric_reference_variant)
+    if metric_scope:
+        row["metric_scope"] = str(metric_scope)
     return row
 
 
@@ -381,21 +370,55 @@ def time_one_shot_renderer(
     total_ms = 0.0
     count = 0
     detailed_totals: dict[str, float] = {}
+    detailed_counts: dict[str, int] = {}
+    detailed_observed: set[str] = set()
+    detailed_text: dict[str, str] = {}
     total_iterations = int(warmup_iters) + int(measure_iters)
     for iteration in range(total_iterations):
         phase = "warmup" if iteration < int(warmup_iters) else "measure"
         if progress_label:
             print(f"{progress_label} timing {iteration + 1}/{total_iterations} {phase}", file=sys.stderr, flush=True)
+        if _cuda_available():
+            import torch
+
+            torch.cuda.synchronize()
+        end_to_end_start = time.perf_counter()
         last, render_timing = _call_render_fn(render_fn, context, progress_label=progress_label)
+        if _cuda_available():
+            import torch
+
+            torch.cuda.synchronize()
+        end_to_end_ms = float((time.perf_counter() - end_to_end_start) * 1000.0)
         render_ms, detailed = _render_timing_values(render_timing)
+        detailed = dict(detailed)
+        detailed["frame_ms_end_to_end"] = end_to_end_ms
+        detailed["fps_end_to_end"] = 1000.0 / end_to_end_ms if end_to_end_ms > 0.0 and math.isfinite(end_to_end_ms) else 0.0
         if iteration >= int(warmup_iters):
             total_ms += float(render_ms)
             for key, value in detailed.items():
-                detailed_totals[key] = detailed_totals.get(key, 0.0) + float(value)
+                detailed_observed.add(key)
+                if _is_finite_number(value):
+                    detailed_totals[key] = detailed_totals.get(key, 0.0) + float(value)
+                    detailed_counts[key] = detailed_counts.get(key, 0) + 1
+                elif isinstance(value, str) and value:
+                    previous = detailed_text.get(key)
+                    detailed_text[key] = value if previous in (None, value) else "mixed"
             count += 1
     average_ms = total_ms / float(count) if count else math.inf
-    detailed_average = {key: value / float(count) for key, value in detailed_totals.items()} if count else {}
+    detailed_average = (
+        {
+            key: detailed_totals[key] / float(detailed_counts[key])
+            for key in detailed_totals
+            if detailed_counts.get(key, 0) > 0
+        }
+        if count
+        else {}
+    )
     detailed_average = _normalize_averaged_timing_metrics(detailed_average)
+    for key in sorted(detailed_observed):
+        if key not in detailed_average and key not in detailed_text:
+            detailed_average[key] = float("nan")
+    detailed_average.update(detailed_text)
     if "frame_ms_with_lkg_interlace" in detailed_average:
         average_ms = float(detailed_average["frame_ms_with_lkg_interlace"])
     fps = 1000.0 / average_ms if average_ms > 0.0 and math.isfinite(average_ms) else 0.0
@@ -415,6 +438,18 @@ def render_one_shot_interlaced_once(context: cr_66views.RtgsCr66RenderContext, *
     from lkg_experiment.rtgs_coherent import cr_one_shot
 
     return cr_one_shot.render_rtgs_cr_one_shot_interlaced_once(context, variant=variant)
+
+
+def render_metric_reference_interlaced(context: cr_66views.RtgsCr66RenderContext):
+    variant = ExperimentVariant(
+        name="cluster_1",
+        cluster_size=1,
+        use_remapping=True,
+        reuse_enabled=True,
+        group="metric_reference",
+    )
+    image, _timing = render_one_shot_interlaced_once(context, variant=variant)
+    return image
 
 
 def compute_sampled_view_metric_stats(
@@ -630,13 +665,13 @@ def _call_render_fn(
     return render_fn(context)
 
 
-def _render_timing_values(render_timing: Any) -> tuple[float, dict[str, float]]:
+def _render_timing_values(render_timing: Any) -> tuple[float, dict[str, Any]]:
     if hasattr(render_timing, "to_metric_dict"):
-        detailed = {str(key): float(value) for key, value in render_timing.to_metric_dict().items()}
-        return float(detailed.get("frame_ms_with_lkg_interlace", getattr(render_timing, "frame_ms", 0.0))), detailed
+        detailed = {str(key): _timing_metric_value(value) for key, value in render_timing.to_metric_dict().items()}
+        return _float_or_default(detailed.get("frame_ms_with_lkg_interlace"), getattr(render_timing, "frame_ms", 0.0)), detailed
     if isinstance(render_timing, Mapping):
-        detailed = {str(key): float(value) for key, value in render_timing.items()}
-        return float(detailed.get("frame_ms_with_lkg_interlace", detailed.get("frame_ms", 0.0))), detailed
+        detailed = {str(key): _timing_metric_value(value) for key, value in render_timing.items()}
+        return _float_or_default(detailed.get("frame_ms_with_lkg_interlace"), detailed.get("frame_ms", 0.0)), detailed
     return float(render_timing), {}
 
 
@@ -644,35 +679,58 @@ def _normalize_averaged_timing_metrics(values: Mapping[str, float]) -> dict[str,
     normalized = {str(key): float(value) for key, value in values.items()}
     if not normalized:
         return {}
-    normalized["rtgs_dynamic_total_ms"] = float(
-        normalized.get("dynamic_geometry_ms", 0.0)
-        + normalized.get("temporal_opacity_ms", 0.0)
-        + normalized.get("snapshot_compaction_ms", 0.0)
-        + normalized.get("dynamic_color_ms", 0.0)
+    has_staged_timing = any(
+        key in normalized
+        for key in (
+            "dynamic_geometry_ms",
+            "temporal_opacity_ms",
+            "snapshot_compaction_ms",
+            "dynamic_color_ms",
+            "cr_projection_ms",
+            "cr_keygen_ms",
+            "cr_blend_ms",
+            "lkg_unpatchify_ms",
+            "lkg_unpad_ms",
+            "lkg_panel_paste_ms",
+        )
     )
-    normalized["cr_core_total_ms"] = float(
-        normalized.get("cr_projection_ms", 0.0)
-        + normalized.get("cr_keygen_ms", 0.0)
-        + normalized.get("cr_sort_ms", 0.0)
-        + normalized.get("cr_blend_ms", 0.0)
-    )
-    normalized["lkg_interlace_post_ms"] = float(
-        normalized.get("lkg_unpatchify_ms", 0.0)
-        + normalized.get("lkg_unpad_ms", 0.0)
-        + normalized.get("lkg_panel_paste_ms", 0.0)
-    )
-    normalized["frame_ms_without_lkg"] = float(normalized["rtgs_dynamic_total_ms"] + normalized["cr_core_total_ms"])
-    normalized["fps_without_lkg"] = (
-        1000.0 / normalized["frame_ms_without_lkg"]
-        if normalized["frame_ms_without_lkg"] > 0.0 and math.isfinite(normalized["frame_ms_without_lkg"])
-        else 0.0
-    )
-    normalized["frame_ms_with_lkg_interlace"] = float(normalized["frame_ms_without_lkg"] + normalized["lkg_interlace_post_ms"])
-    normalized["fps_with_lkg_interlace"] = (
-        1000.0 / normalized["frame_ms_with_lkg_interlace"]
-        if normalized["frame_ms_with_lkg_interlace"] > 0.0 and math.isfinite(normalized["frame_ms_with_lkg_interlace"])
-        else 0.0
-    )
+    if has_staged_timing:
+        normalized["rtgs_dynamic_total_ms"] = float(
+            normalized.get("dynamic_geometry_ms", 0.0)
+            + normalized.get("temporal_opacity_ms", 0.0)
+            + normalized.get("snapshot_compaction_ms", 0.0)
+            + normalized.get("dynamic_color_ms", 0.0)
+        )
+        normalized["cr_core_total_ms"] = float(
+            _finite_sum(
+                normalized.get("cr_projection_ms", 0.0),
+                normalized.get("cr_keygen_ms", 0.0),
+                normalized.get("cr_blend_ms", 0.0),
+            )
+        )
+        normalized["lkg_interlace_post_ms"] = float(
+            normalized.get("lkg_unpatchify_ms", 0.0)
+            + normalized.get("lkg_unpad_ms", 0.0)
+            + normalized.get("lkg_panel_paste_ms", 0.0)
+        )
+        normalized["frame_ms_without_lkg"] = float(normalized["rtgs_dynamic_total_ms"] + normalized["cr_core_total_ms"])
+        normalized["fps_without_lkg"] = (
+            1000.0 / normalized["frame_ms_without_lkg"]
+            if normalized["frame_ms_without_lkg"] > 0.0 and math.isfinite(normalized["frame_ms_without_lkg"])
+            else 0.0
+        )
+        normalized["frame_ms_with_lkg_interlace"] = float(normalized["frame_ms_without_lkg"] + normalized["lkg_interlace_post_ms"])
+        normalized["fps_with_lkg_interlace"] = (
+            1000.0 / normalized["frame_ms_with_lkg_interlace"]
+            if normalized["frame_ms_with_lkg_interlace"] > 0.0 and math.isfinite(normalized["frame_ms_with_lkg_interlace"])
+            else 0.0
+        )
+    if "frame_ms_end_to_end" in normalized:
+        normalized["fps_end_to_end"] = (
+            1000.0 / normalized["frame_ms_end_to_end"]
+            if normalized["frame_ms_end_to_end"] > 0.0 and math.isfinite(normalized["frame_ms_end_to_end"])
+            else 0.0
+        )
     return normalized
 
 
@@ -696,6 +754,7 @@ def _reset_cuda_peak_memory() -> None:
         return
     import torch
 
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
 
@@ -704,7 +763,32 @@ def _peak_vram_gb() -> float:
         return 0.0
     import torch
 
-    return float(torch.cuda.max_memory_reserved()) / float(2**30)
+    return float(torch.cuda.max_memory_allocated()) / float(2**30)
+
+
+def _finite_sum(*values: float) -> float:
+    return float(sum(float(value) for value in values if math.isfinite(float(value))))
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _timing_metric_value(value: Any) -> Any:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _float_or_default(value: Any, default: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _cuda_available() -> bool:

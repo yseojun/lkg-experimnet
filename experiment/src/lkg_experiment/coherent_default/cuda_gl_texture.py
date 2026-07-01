@@ -78,6 +78,7 @@ class CudaGlTextureUploader:
         width: int,
         height: int,
         torch_extensions_dir: str | Path | None = None,
+        cuda_device: int | None = None,
         extension_loader: Callable[[], Any] | None = None,
     ) -> None:
         self.texture = int(texture)
@@ -89,15 +90,46 @@ class CudaGlTextureUploader:
         loader = extension_loader or (lambda: load_cuda_gl_texture_extension(torch_extensions_dir=torch_extensions_dir))
         try:
             self._extension = loader()
-            self._gl_cuda_devices = [int(device) for device in self._extension.gl_cuda_devices()]
-            if not self._gl_cuda_devices:
-                raise CudaGlTextureError("current GL context does not expose any CUDA devices")
-            self._gl_cuda_device = int(self._gl_cuda_devices[0])
-            self._resource = int(self._extension.register_gl_texture(self.texture, self._gl_cuda_device))
+            self._gl_cuda_devices = self._query_gl_cuda_devices()
+            self._gl_cuda_device, self._resource = self._register_texture(cuda_device)
         except CudaGlTextureError:
             raise
         except Exception as exc:
             raise CudaGlTextureError(f"failed to initialize CUDA-GL texture uploader: {exc}") from exc
+
+    def _query_gl_cuda_devices(self) -> list[int]:
+        try:
+            return [int(device) for device in self._extension.gl_cuda_devices()]
+        except Exception:
+            return []
+
+    def _candidate_cuda_devices(self, cuda_device: int | None) -> list[int]:
+        candidates: list[int] = []
+        if cuda_device is not None:
+            candidates.append(int(cuda_device))
+        candidates.extend(int(device) for device in self._gl_cuda_devices)
+        current = _current_torch_cuda_device()
+        if current is not None:
+            candidates.append(int(current))
+        if not self._gl_cuda_devices:
+            candidates.extend(_visible_torch_cuda_devices())
+        unique: list[int] = []
+        for device in candidates:
+            if device not in unique:
+                unique.append(device)
+        return unique
+
+    def _register_texture(self, cuda_device: int | None) -> tuple[int, int]:
+        candidates = self._candidate_cuda_devices(cuda_device)
+        if not candidates:
+            raise CudaGlTextureError("current GL context does not expose any CUDA devices")
+        errors: list[str] = []
+        for device in candidates:
+            try:
+                return int(device), int(self._extension.register_gl_texture(self.texture, int(device)))
+            except Exception as exc:
+                errors.append(f"cuda:{int(device)}={exc}")
+        raise CudaGlTextureError("failed to register GL texture with CUDA devices: " + "; ".join(errors))
 
     def upload(self, tensor: Any) -> None:
         if self._closed or self._resource is None:
@@ -177,6 +209,7 @@ def create_panel_texture_uploader(
     width: int,
     height: int,
     torch_extensions_dir: str | Path | None = None,
+    cuda_device: int | None = None,
     extension_loader: Callable[[], Any] | None = None,
     warn: Callable[[str], None] | None = None,
 ) -> CpuTextureUploader | CudaGlTextureUploader | AutoTextureUploader:
@@ -194,6 +227,7 @@ def create_panel_texture_uploader(
             width=width,
             height=height,
             torch_extensions_dir=torch_extensions_dir,
+            cuda_device=cuda_device,
             extension_loader=extension_loader,
         )
     except CudaGlTextureError as exc:
@@ -205,6 +239,27 @@ def create_panel_texture_uploader(
     if normalized == TEXTURE_UPLOAD_CUDA_GL:
         return cuda_uploader
     return AutoTextureUploader(cuda_uploader=cuda_uploader, cpu_uploader=cpu_uploader, warn=warn)
+
+
+def _current_torch_cuda_device() -> int | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.current_device())
+    except Exception:
+        return None
+
+
+def _visible_torch_cuda_devices() -> list[int]:
+    try:
+        import torch
+
+        count = int(torch.cuda.device_count())
+    except Exception:
+        count = 0
+    return list(range(max(0, count)))
 
 
 def load_cuda_gl_texture_extension(*, torch_extensions_dir: str | Path | None = None) -> Any:

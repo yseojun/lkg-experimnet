@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OMG4-FTGS + CoherentRaster 구조 해설</title>
+    <link rel="stylesheet" href="assets/styles.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <aside class="toc" aria-label="문서 목차">
+        <div class="toc-title">FTGS + CR</div>
+        <nav>
+          <a href="#overview">전체 구조</a>
+          <a href="#ftgs-materialization">FTGS materialize</a>
+          <a href="#baseline-gsplat-rendering">기존 gsplat</a>
+          <a href="#coherentraster-injection">CR 주입 위치</a>
+          <a href="#single-view-vs-interlaced-cr">single vs interlaced</a>
+          <a href="#cuda-contract">CUDA contract</a>
+          <a href="#recent-lookup-timing-diff">lookup/timing diff</a>
+          <a href="#timing-interpretation">timing 해석</a>
+          <a href="#verification">검증</a>
+          <a href="#final-takeaway">최종 요약</a>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <header class="document-header">
+          <p class="eyebrow">코드 diff 기반 구조 해설</p>
+          <h1>OMG4-FTGS 렌더링에 CoherentRaster가 어디에, 왜 들어갔는가</h1>
+          <p class="lead">
+            핵심은 FTGS model layer를 바꾼 것이 아니라, FTGS가 timestamp별 Gaussian splat을 만든 뒤
+            rasterizer layer를 하나 더 연결했다는 점입니다. 기존 <code>gsplat.rasterization()</code>
+            경로는 비교 기준으로 유지되고, CoherentRaster 경로는 같은 <code>FtgsSplats</code>를
+            <code>rasterization_CR()</code>로 넘겨 LKG interlaced panel target을 직접 렌더링합니다.
+          </p>
+
+          <div class="summary-grid" aria-label="핵심 요약">
+            <div>
+              <span class="tag tag-ftgs">FTGS</span>
+              <strong>모델 stage는 그대로</strong>
+              <p>temporal/appearance 계산을 접어 gsplat과 CR이 함께 쓰는 <code>FtgsSplats</code>를 만든다.</p>
+            </div>
+            <div>
+              <span class="tag tag-cr">CR</span>
+              <strong>주입 위치는 rasterizer</strong>
+              <p><code>FtgsSplats</code> 이후 <code>gsplat</code> 또는 <code>CoherentRaster</code> 중 하나를 선택한다.</p>
+            </div>
+            <div>
+              <span class="tag tag-timing">timing</span>
+              <strong>최근 diff는 측정 보정</strong>
+              <p>viewpoint map/lookup setup과 steady-state dynamic frame 비용을 분리한다.</p>
+            </div>
+          </div>
+        </header>
+
+        <section id="overview" class="section">
+          <div class="section-heading">
+            <p class="section-label">Overview</p>
+            <h2>먼저 전체 파이프라인을 잡기</h2>
+          </div>
+          <p>
+            기존 FTGS 렌더링은 동적 Gaussian 모델에서 특정 시간의 splat tensor를 materialize한 뒤,
+            그것을 일반 gsplat rasterizer에 넣는 흐름이었습니다. CR을 넣은 뒤에도 앞단의 FTGS 계산은
+            동일합니다. 달라진 지점은 materialized splat을 이미지로 바꾸는 rasterization 단계입니다.
+          </p>
+
+          <div class="concept-grid" aria-label="용어 지도">
+            <div>
+              <h3>FTGS</h3>
+              <p>시간 <code>t</code>에서 렌더링할 3D Gaussian 목록을 만드는 model layer입니다.</p>
+            </div>
+            <div>
+              <h3>gsplat</h3>
+              <p>기존 비교 기준입니다. 같은 splat을 단일 camera view의 RGB 이미지로 rasterize합니다.</p>
+            </div>
+            <div>
+              <h3>CoherentRaster</h3>
+              <p>각 panel RGB subpixel이 참조할 view를 lookup으로 고를 수 있는 CR rasterizer입니다.</p>
+            </div>
+            <div>
+              <h3>LKG panel</h3>
+              <p>Looking Glass처럼 RGB subpixel마다 다른 view를 배치해야 하는 interlaced display target입니다.</p>
+            </div>
+          </div>
+
+          <div class="pipeline" aria-label="렌더링 파이프라인">
+            <div class="stage">OMG4 checkpoint</div>
+            <div class="stage">timestamp materialization</div>
+            <div class="stage wide"><code>FtgsSplats(means, quats, scales, opacities, colors)</code></div>
+            <div class="split">
+              <div class="stage">baseline <code>gsplat.rasterization</code></div>
+              <div class="stage">CR <code>rasterization_CR</code></div>
+            </div>
+            <div class="stage wide">single-view validation 또는 interlaced LKG panel output</div>
+            <div class="stage wide">manifest timing / output artifact / diff evidence</div>
+          </div>
+
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>구분</th>
+                <th>렌더링 흐름</th>
+                <th>의미</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>이전 FTGS</td>
+                <td><code>materialize()</code> -> <code>gsplat.rasterization()</code></td>
+                <td>한 camera view를 일반 3DGS 방식으로 이미지화한다.</td>
+              </tr>
+              <tr>
+                <td>FTGS + CR</td>
+                <td><code>materialize()</code> -> <code>rasterization_CR()</code></td>
+                <td>같은 splat을 CR CUDA path에 넣어 RGB subpixel별 view map 기준으로 직접 렌더링한다.</td>
+              </tr>
+              <tr>
+                <td>최근 변경</td>
+                <td>viewpoint map/lookup setup -> <code>materialize()</code> + view setup + CR render</td>
+                <td><code>frame_ms_excluding_lookup</code>은 dynamic steady frame, <code>frame_ms_including_lookup</code>은 first-frame setup까지 포함한 비용으로 해석한다.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="ftgs-materialization" class="section">
+          <div class="section-heading">
+            <p class="section-label">FTGS Materialization</p>
+            <h2>FTGS는 먼저 timestamp별 Gaussian을 만든다</h2>
+          </div>
+          <div class="concept-grid">
+            <div>
+              <h3>개념</h3>
+              <p>
+                <code>DynamicGaussians.materialize(timestamp)</code>는 checkpoint에서 decode된 평균 위치,
+                시간, scale, rotation, duration, velocity, appearance codebook, MLP weight를 사용해
+                특정 timestamp의 splat tensor 묶음을 만듭니다. 여기서 duration과 velocity는 시간에 따른
+                위치/투명도 변화를, appearance codebook과 MLP는 view-dependent color/opacity를 결정하는
+                재료입니다. CR은 이 과정 안으로 들어가지 않습니다.
+              </p>
+            </div>
+            <div>
+              <h3>왜 중요한가</h3>
+              <p>
+                <code>FtgsSplats</code>는 현재 시간의 3D Gaussian 목록입니다. <code>means</code>는 위치,
+                <code>quats</code>는 회전, <code>scales</code>는 크기, <code>opacities</code>는 투명도,
+                <code>colors</code>는 색 계수입니다. FTGS 결과가 잘못되면 gsplat과 CR이 모두 같은 잘못된
+                입력을 받으므로, CR diff를 해석할 때는 모델 stage와 rasterizer stage를 분리해야 합니다.
+              </p>
+            </div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/omg4_ftgs/model.py</code></p>
+            <pre><code>def materialize(self, timestamp: float) -> FtgsSplats:
+    means_t = self.means + (t - self.times) * self.velocities
+    scales = torch.exp(self.scales)
+    temporal_opacity = torch.exp(-0.5 * ((t - self.times) / self.durations.exp()) ** 2)
+    cont_feature = self.mlp_cont(contracted)
+    shs = self.mlp_view(view_feature).reshape(-1, 47, 3).float()
+    dc = self.mlp_dc(space_feature).reshape(-1, 1, 3).float()
+    opacities = torch.sigmoid(self.mlp_opacity(space_feature).float())
+    colors = torch.cat([dc, shs], dim=1)
+    return FtgsSplats(means_t, quats, scales, opacities, colors, sh_degree)</code></pre>
+          </div>
+
+          <div class="inspect">
+            <h3>확인할 것</h3>
+            <p>
+              FTGS 원본 경로는 <code>OMG4/OMG4_FTGS/render.py</code>에서 같은 종류의 dynamic Gaussian을
+              timestamp별로 만들고 rasterizer에 넘기는 구조입니다. 현재 실험 코드는 이 과정을
+              <code>FtgsSplats</code> dataclass로 명시해 이후 backend 교체 지점을 분명하게 만들었습니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="baseline-gsplat-rendering" class="section">
+          <div class="section-heading">
+            <p class="section-label">Baseline Gsplat Rendering</p>
+            <h2>기존 렌더러는 splat을 gsplat에 그대로 넘긴다</h2>
+          </div>
+          <p>
+            baseline 함수 <code>render_splats_gsplat()</code>는 <code>FtgsSplats</code>와 단일 view matrix,
+            intrinsics matrix를 받아 <code>gsplat.rasterization()</code>을 호출합니다. 이 경로는 CR 결과가
+            정상적인지 비교할 기준 이미지로 남아 있습니다.
+          </p>
+
+          <div class="evidence">
+            <div class="evidence-title">기존 경로</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/omg4_ftgs/render.py::render_splats_gsplat</code></p>
+            <pre><code>image, _alpha, _meta = gsplat.rasterization(
+    means=splats.means,
+    quats=splats.quats,
+    scales=splats.scales,
+    opacities=splats.opacities,
+    colors=splats.colors,
+    viewmats=viewmat_t.unsqueeze(0),
+    Ks=K_t.unsqueeze(0),
+    sh_degree=int(splats.sh_degree),
+    width=int(width),
+    height=int(height),
+)</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>왜 남겨야 하나</h3>
+            <p>
+              CR 경로를 추가하면 결과 차이가 FTGS materialization 때문인지, CR lookup/view mapping 때문인지
+              헷갈릴 수 있습니다. baseline gsplat output을 유지하면 같은 <code>FtgsSplats</code>에 대해
+              rasterizer만 바꾼 비교가 가능합니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="coherentraster-injection" class="section">
+          <div class="section-heading">
+            <p class="section-label">CoherentRaster Injection</p>
+            <h2>CR은 FTGS 뒤의 rasterization backend로 주입된다</h2>
+          </div>
+          <p>
+            CR 주입 지점은 FTGS checkpoint decode나 MLP 내부가 아닙니다. FTGS가 만든
+            <code>FtgsSplats</code>를 소비하는 별도 renderer 함수가 생겼고, 그 함수가
+            <code>gsplat.rendering_coherent_raster.rasterization_CR</code>를 호출합니다.
+          </p>
+
+          <div class="diff-panel" aria-label="CR 주입 전후 코드 흐름">
+            <div class="diff-column">
+              <div class="diff-title">Before</div>
+              <pre><code><span class="line same">splats = dynamic_model.materialize(timestamp)</span>
+<span class="line remove">image = render_splats_gsplat(</span>
+<span class="line remove">    splats, viewmat=viewmat, K=K, width=width, height=height</span>
+<span class="line remove">)</span></code></pre>
+            </div>
+            <div class="diff-column">
+              <div class="diff-title">After</div>
+              <pre><code><span class="line same">splats = dynamic_model.materialize(timestamp)</span>
+<span class="line add">image = render_splats_coherent(</span>
+<span class="line add">    splats, viewmat=viewmat, K=K, tile_size=tile_size</span>
+<span class="line add">)</span>
+<span class="line add"># 내부에서 rasterization_CR(...) 호출</span></code></pre>
+            </div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">single-view CR validation</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/omg4_ftgs/render.py::render_splats_coherent</code></p>
+            <pre><code>viewpoint_index = np.zeros((height, width, 3), dtype=np.uint32)
+lookup = build_cr_lookup_arrays(viewpoint_index, tile_size=tile_size, use_remapping=True)
+view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=device)
+adjacent_viewmats = viewmat_t.view(1, 1, 4, 4).contiguous()
+
+colors, _alpha, _meta = rasterization_CR(
+    means=splats.means,
+    colors=splats.colors,
+    adjacent_viewmats=adjacent_viewmats,
+    view_idx_matrix=view_idx_matrix,
+    subpixel_coord_matrix=subpixel_coord_matrix,
+)</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>왜 수정했나</h3>
+            <p>
+              single-view CR은 먼저 “CR kernel이 FTGS splat 입력을 받을 수 있는가”를 검증하는 단계입니다.
+              <code>viewpoint_index[y, x, c] = 0</code>으로 두면 panel의 <code>(x, y)</code> pixel 중
+              <code>c</code>번째 RGB subpixel이 모두 같은 view 0을 가리키므로,
+              LKG interlacing 없이도 CR path 자체를 baseline과 비교할 수 있습니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="single-view-vs-interlaced-cr" class="section">
+          <div class="section-heading">
+            <p class="section-label">Single-View vs Interlaced CR</p>
+            <h2>검증용 CR과 실제 LKG panel CR은 lookup 의미가 다르다</h2>
+          </div>
+          <p>
+            single-view CR은 모든 subpixel이 view 0을 사용합니다. interlaced CR은 panel 해상도
+            <code>HxWx3</code> viewpoint index를 읽고, 각 RGB subpixel이 어떤 adjacent view를 표시해야 하는지
+            CUDA kernel에 알려줍니다.
+          </p>
+
+          <div class="inspect">
+            <h3><code>HxWx3</code> viewpoint index를 읽는 법</h3>
+            <p>
+              <code>H</code>와 <code>W</code>는 panel pixel height/width이고, 마지막 <code>3</code>은 RGB
+              subpixel channel입니다. <code>viewpoint_index[y, x, c] = v</code>는 panel의 <code>(x, y)</code>
+              위치에서 <code>c</code>번째 subpixel이 adjacent view <code>v</code>를 사용한다는 뜻입니다.
+              adjacent view는 source camera 주변에 합성한 근접 시점입니다. 이것은 RGB 이미지 3장을 의미하는
+              것이 아니라, 한 panel 이미지 안의 subpixel별 view assignment입니다. interlaced CR은 여러 view를
+              full image로 모두 렌더링한 뒤 섞지 않고, subpixel별로 필요한 view를 골라 바로 blend합니다.
+            </p>
+          </div>
+
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>항목</th>
+                <th>single-view CR</th>
+                <th>interlaced CR</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>목적</td>
+                <td>CR backend 연결 검증</td>
+                <td>LKG panel용 직접 interlaced render</td>
+              </tr>
+              <tr>
+                <td>viewpoint map</td>
+                <td><code>np.zeros((height, width, 3))</code></td>
+                <td><code>build_interlaced_viewpoint_index()</code> 결과</td>
+              </tr>
+              <tr>
+                <td>view matrices</td>
+                <td><code>adjacent_viewmats.shape == (1, 1, 4, 4)</code>: group 1개, view 1개, 4x4 camera matrix</td>
+                <td><code>synthesize_interlaced_viewmats()</code>로 여러 view 생성</td>
+              </tr>
+              <tr>
+                <td>output</td>
+                <td>일반 RGB 이미지</td>
+                <td>panel subpixel layout에 맞춘 interlaced 이미지</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">interlaced CR path</div>
+            <p class="file-ref">참조: <code>render_splats_interlaced_coherent</code></p>
+            <pre><code>colors, _alpha, cr_meta = rasterization_CR(
+    means=splats.means,
+    quats=splats.quats,
+    scales=splats.scales,
+    opacities=splats.opacities,
+    colors=splats.colors,
+    adjacent_viewmats=viewmats_t,
+    Ks=K_t.unsqueeze(0),
+    view_idx_matrix=view_idx_matrix,
+    subpixel_coord_matrix=subpixel_coord_matrix,
+    return_timing=return_timing,
+)</code></pre>
+          </div>
+        </section>
+
+        <section id="cuda-contract" class="section">
+          <div class="section-heading">
+            <p class="section-label">CUDA Contract</p>
+            <h2>CR CUDA kernel이 추가로 요구하는 계약</h2>
+          </div>
+          <p>
+            기존 gsplat은 한 view의 pixel grid를 기준으로 Gaussian을 alpha blend합니다. CR은 interlaced panel을
+            직접 만들기 때문에 subpixel thread마다 “어느 view를 볼 것인가”와 “원래 panel 좌표가 어디인가”를
+            알아야 합니다.
+          </p>
+
+          <div class="inspect">
+            <h3>CPU lookup이 CUDA 입력이 되는 순서</h3>
+            <p>
+              먼저 panel-sized <code>viewpoint_index[y, x, c]</code>가 만들어집니다. 다음으로 CR helper가
+              이를 CUDA tile/thread 순서에 맞게 patchify/remap해서 <code>view_idx_matrix</code>와
+              <code>subpixel_coord_matrix</code>를 만듭니다. 마지막으로 kernel thread가 이 두 tensor를 읽어
+              “어떤 view를 blend할지”와 “결과를 원래 panel의 어느 <code>(channel, y, x)</code>에 쓸지”를 결정합니다.
+            </p>
+          </div>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>입력</th>
+                <th>shape / 역할</th>
+                <th>왜 필요한가</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>view_idx_matrix</code></td>
+                <td><code>[n_tile_h, n_tile_w, 3, tile_size, tile_size]</code></td>
+                <td>각 tile/subpixel thread가 사용할 view number를 지정한다.</td>
+              </tr>
+              <tr>
+                <td><code>subpixel_coord_matrix</code></td>
+                <td><code>[n_tile_h, n_tile_w, 3, tile_size, tile_size, 3]</code></td>
+                <td>remap 후에도 결과를 원래 channel/y/x 위치에 저장하게 한다.</td>
+              </tr>
+              <tr>
+                <td><code>translation_values</code></td>
+                <td><code>[n_gauss, n_view_group, view_group_size, 2]</code></td>
+                <td>Python 호출부의 직접 인자라기보다 CR projection 단계가 만든 내부 kernel 입력이다. reference view projection에서 adjacent view projection으로 이동할 x/y offset을 담는다.</td>
+              </tr>
+              <tr>
+                <td><code>isect_offsets</code>, <code>flatten_ids</code></td>
+                <td>tile별 Gaussian intersection range</td>
+                <td>각 tile/view group에서 blend할 Gaussian list 범위를 찾는다.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">CUDA kernel에서 쓰이는 방식</div>
+            <p class="file-ref">참조: <code>rtgs-coherent-raster/modified-files/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu</code></p>
+            <pre><code>uint32_t original_x = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][2];
+uint32_t original_y = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][1];
+uint32_t original_z = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][0];
+uint32_t view_number = view_idx_matrix[tile_y][tile_x][channel][ty][tx];
+uint32_t view_group_idx = view_number / view_group_size;
+uint32_t view_idx_in_group = view_number % view_group_size;
+float2 translation_value = translation_values[g][view_group_idx][view_idx_in_group];</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>핵심 해석</h3>
+            <p>
+              CR은 모든 view 이미지를 따로 렌더링한 뒤 나중에 섞는 방식이 아닙니다. target panel의
+              subpixel thread가 필요한 view를 선택하고, projection translation을 적용한 뒤 바로 해당
+              subpixel 값을 blend합니다. <code>translation_values</code>는 이때 reference projection을
+              adjacent view projection으로 보정하기 위한 per-Gaussian 2D 이동값입니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="recent-lookup-timing-diff" class="section">
+          <div class="section-heading">
+            <p class="section-label">Recent Lookup/Timing Diff</p>
+            <h2>최근 변경은 CR 수식 변경이 아니라 lookup 준비 위치 변경이다</h2>
+          </div>
+          <p>
+            현재 working-tree diff의 핵심은 <code>build_cr_lookup_arrays()</code>와
+            <code>lookup_arrays_to_torch()</code>를 <code>render_splats_interlaced_coherent()</code> 내부에서
+            매번 실행하던 구조를, CLI interlaced path에서 먼저 준비해 전달하는 구조로 바꾼 것입니다.
+          </p>
+
+          <div class="inspect">
+            <h3>diff를 읽는 기준</h3>
+            <p>
+              이 변경은 CR 수식을 바꾸지 않습니다. 바뀐 것은 호출 위치와 측정 경계입니다.
+              <code>viewpoint_index_ms</code>는 panel map 생성/로드 시간, <code>lookup_cpu_ms</code>와
+              <code>lookup_h2d_ms</code>는 CR tile layout 변환과 GPU 전송 시간입니다. 이 setup 비용은
+              버리는 것이 아니라 first-frame latency로 따로 보고합니다.
+            </p>
+          </div>
+
+          <div class="diff-panel">
+            <div class="diff-column">
+              <div class="diff-title">Before: render 내부에서 lookup 생성</div>
+              <pre><code><span class="line remove">lookup = build_cr_lookup_arrays(viewpoint_index, tile_size=tile_size)</span>
+<span class="line remove">view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=device)</span>
+<span class="line same">colors, _alpha, _meta = rasterization_CR(...)</span></code></pre>
+            </div>
+            <div class="diff-column">
+              <div class="diff-title">After: CLI에서 prebuilt tensor 전달</div>
+              <pre><code><span class="line add">viewpoint_index_ms = time(build_or_load_viewpoint_index(...))</span>
+<span class="line add">prepared_lookup = prepare_cr_lookup_tensors(viewpoint_index, device=device, tile_size=tile_size)</span>
+<span class="line add">materialize_ms = time(dynamic_model.materialize(timestamp))</span>
+<span class="line add">view_setup_ms = time(synthesize_interlaced_viewmats(...))</span>
+<span class="line add">cr_render_ms = time(render_splats_interlaced_coherent(</span>
+<span class="line add">    view_idx_matrix=prepared_lookup.view_idx_matrix,</span>
+<span class="line add">    subpixel_coord_matrix=prepared_lookup.subpixel_coord_matrix,</span>
+<span class="line add">    return_meta=True, return_timing=True,</span>
+<span class="line add">))</span>
+<span class="line add">frame_ms_excluding_lookup = materialize_ms + view_setup_ms + cr_render_ms</span>
+<span class="line add">frame_ms_including_lookup = frame_ms_excluding_lookup + viewpoint_index_ms + lookup_cpu_ms + lookup_h2d_ms</span></code></pre>
+            </div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">새 helper와 manifest 필드</div>
+            <p class="file-ref">참조: <code>render.py::PreparedCrLookup</code>, <code>cli.py::_render_interlaced</code></p>
+            <pre><code>@dataclass(frozen=True)
+class PreparedCrLookup:
+    view_idx_matrix: Any
+    subpixel_coord_matrix: Any
+    lookup_cpu_ms: float
+    lookup_h2d_ms: float
+
+"materialize_ms": dynamic FTGS splat 생성 시간
+"viewpoint_index_ms": panel viewpoint map 생성/로드 시간
+"view_setup_ms": source camera, orbit center, adjacent viewmat, panel K 준비 시간
+"cr_render_ms": rasterization_CR + unpatchify/unpad 시간
+"frame_ms_excluding_lookup": materialize_ms + view_setup_ms + cr_render_ms
+"frame_ms_including_lookup": frame_ms_excluding_lookup + viewpoint_index_ms + lookup_cpu_ms + lookup_h2d_ms
+"cr_core_ms": cr_projection_ms + cr_keygen_ms + cr_sort_ms + cr_blend_ms</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>왜 수정했나</h3>
+            <p>
+              LKG viewpoint index를 tile layout으로 patchify/remap하고 GPU tensor로 옮기는 비용은 panel
+              설정이 같으면 재사용 가능한 준비 비용입니다. 이 비용을 render timer 안에 넣으면
+              <code>rasterization_CR</code> 자체가 느린 것처럼 보입니다. 그래서 first-frame cost와
+              steady-state dynamic render cost를 분리했습니다. 여기서 steady-state dynamic render는
+              <code>dynamic_model.materialize()</code>로 timestamp별 splat을 만드는 시간과
+              source camera로부터 adjacent view matrix를 준비하는 시간, 그리고 <code>rasterization_CR</code>
+              호출 시간을 함께 포함합니다. PNG 저장과 CPU 파일 I/O는 논문용 렌더링 FPS에서는 제외합니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="timing-interpretation" class="section">
+          <div class="section-heading">
+            <p class="section-label">Timing Interpretation</p>
+            <h2>어떤 시간을 비교해야 하는가</h2>
+          </div>
+          <p>
+            측정값은 목적에 따라 다르게 읽어야 합니다. 한 장만 렌더링하는 비용을 보려면 lookup 포함 값을,
+            같은 panel map을 재사용하는 video/interactive 상황을 보려면 lookup 제외 값을 봐야 합니다.
+            수정 후 lookup 제외 값은 정적인 splat만 그린 시간이 아니라 dynamic materialization, adjacent
+            view setup, CR render/post를 포함한 전체 동적 프레임 비용입니다.
+          </p>
+
+          <p class="file-ref">
+            아래 수치는 lookup 포함 측정이 CR core render처럼 보이던 이전 manifest를 분해해 설명하기 위한
+            예시입니다. 논문 표에는 동일 scene/resolution/repetition 조건에서 생성한 summary/manifest의
+            <code>frame_ms_excluding_lookup</code>과 <code>frame_ms_including_lookup</code>을 분리해 사용합니다.
+          </p>
+
+          <div class="timing-board">
+            <div class="timing-row">
+              <span>previous manifest <code>render_ms</code></span>
+              <strong>1631.56 ms</strong>
+              <div class="bar bar-total"></div>
+            </div>
+            <div class="timing-row">
+              <span>measured <code>lookup_cpu_ms</code></span>
+              <strong>1110.61 ms</strong>
+              <div class="bar bar-lookup"></div>
+            </div>
+            <div class="timing-row">
+              <span>measured <code>lookup_h2d_ms</code></span>
+              <strong>39.23 ms</strong>
+              <div class="bar bar-h2d"></div>
+            </div>
+            <div class="timing-row">
+              <span>measured <code>rasterization_CR</code></span>
+              <strong>42.02 ms</strong>
+              <div class="bar bar-cr"></div>
+            </div>
+            <div class="timing-row">
+              <span>measured postprocess</span>
+              <strong>0.33 ms</strong>
+              <div class="bar bar-post"></div>
+            </div>
+          </div>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>manifest field</th>
+                <th>해석</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>frame_ms_including_lookup</code></td>
+                <td>dynamic materialize + view setup + CR render call + viewpoint map 생성/로드 + lookup CPU 생성 + GPU 전송을 합친 one-shot frame 비용.</td>
+              </tr>
+              <tr>
+                <td><code>frame_ms_excluding_lookup</code></td>
+                <td>lookup tensor와 panel map이 이미 준비되어 있다고 보고 잰 dynamic materialize + view setup + CR render 비용.</td>
+              </tr>
+              <tr>
+                <td><code>materialize_ms</code>, <code>view_setup_ms</code>, <code>cr_render_ms</code></td>
+                <td><code>materialize_ms</code>는 FTGS timestamp splat 생성 시간, <code>view_setup_ms</code>는 adjacent view 준비 시간, <code>cr_render_ms</code>는 CR render/post 비용이다.</td>
+              </tr>
+              <tr>
+                <td><code>viewpoint_index_ms</code></td>
+                <td>file/linear map에서 panel-sized viewpoint index를 만들거나 로드하는 비용이다. 저장 시간은 포함하지 않는다.</td>
+              </tr>
+              <tr>
+                <td><code>lookup_cpu_ms</code>, <code>lookup_h2d_ms</code></td>
+                <td>view map patchify/remap과 host-to-device 전송 비용.</td>
+              </tr>
+              <tr>
+                <td><code>cr_core_ms</code></td>
+                <td><code>cr_projection_ms</code>, <code>cr_keygen_ms</code>, <code>cr_sort_ms</code>, <code>cr_blend_ms</code> 합.</td>
+              </tr>
+              <tr>
+                <td><code>post_ms</code></td>
+                <td><code>unpatchify_image_shape_matrix()</code>, <code>unpad()</code>, clamp/contiguous 후처리 비용.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="verification" class="section">
+          <div class="section-heading">
+            <p class="section-label">Verification</p>
+            <h2>무엇으로 맞는지 확인할 것인가</h2>
+          </div>
+          <p>
+            이 구조를 검증할 때는 단일 결과 이미지보다 “같은 splat이 어디로 들어갔는가”와 “lookup이 재생성되지
+            않았는가”를 확인하는 테스트가 더 중요합니다.
+          </p>
+
+          <div class="check-grid">
+            <div>
+              <h3>테스트 근거</h3>
+              <ul>
+                <li><code>--renderer</code> parser/dispatch 테스트: backend 선택이 의도한 함수로 가는지 확인</li>
+                <li>mocked CR single-view call 테스트: FTGS splat이 CR API를 통과하는지 확인</li>
+                <li>mocked interlaced CR call 테스트: LKG용 view/lookup 인자가 전달되는지 확인</li>
+                <li>prebuilt lookup tensor pass-through 테스트: render 내부 lookup 재생성을 막는지 확인</li>
+                <li>CLI manifest timing field 테스트: first-frame setup과 steady frame 시간이 분리되는지 확인</li>
+              </ul>
+            </div>
+            <div>
+              <h3>manifest에서 볼 필드</h3>
+              <ul>
+                <li><code>viewpoint_index_ms</code>, <code>materialize_ms</code>, <code>view_setup_ms</code>, <code>cr_render_ms</code></li>
+                <li><code>lookup_cpu_ms</code>, <code>lookup_h2d_ms</code></li>
+                <li><code>frame_ms_excluding_lookup</code>, <code>frame_ms_including_lookup</code></li>
+                <li><code>cr_core_ms</code>, <code>cr_timing_ms</code>, <code>post_ms</code></li>
+                <li><code>gaussians</code>, <code>views</code>, <code>cluster_size</code></li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">로컬 검증 명령</div>
+            <pre><code>cd /home/ysj/lkg-experiment/experiment
+env PYTHONPATH=src python -m unittest tests.test_explanatory_web_page -v
+env PYTHONPATH=src python -m unittest tests.test_package_layout tests.test_lkg_experiment_defaults -v</code></pre>
+          </div>
+        </section>
+
+        <section id="final-takeaway" class="section final-section">
+          <div class="section-heading">
+            <p class="section-label">Final Takeaway</p>
+            <h2>최종 요약</h2>
+          </div>
+          <p>
+            FTGS는 timestamp-specific Gaussian splat을 만드는 모델 stage입니다. 기존 코드는 그 splat을
+            <code>gsplat.rasterization()</code>에 넣어 단일 view 이미지를 만들었습니다. 변경된 코드는 같은
+            <code>FtgsSplats</code>를 <code>rasterization_CR()</code>에도 넣을 수 있게 만들고,
+            interlaced mode에서는 <code>view_idx_matrix</code>, <code>subpixel_coord_matrix</code>,
+            <code>translation_values</code> 계약을 통해 LKG panel subpixel을 직접 렌더링합니다.
+          </p>
+          <p>
+            최근 lookup/timing diff는 CR math를 바꾸는 변경이 아닙니다. 재사용 가능한 panel lookup 준비를
+            반복 프레임 측정 경계 밖으로 빼고, <code>frame_ms_including_lookup</code>과
+            <code>frame_ms_excluding_lookup</code>을 나누어 first-frame setup cost와 steady-state dynamic
+            render cost를 따로 읽을 수 있게 만든 변경입니다. 논문 실험의 steady-state FPS는
+            <code>materialize_ms + view_setup_ms + cr_render_ms</code>에 해당하는
+            <code>frame_ms_excluding_lookup</code>로, first-frame latency는 여기에
+            <code>viewpoint_index_ms + lookup_cpu_ms + lookup_h2d_ms</code>를 더한
+            <code>frame_ms_including_lookup</code>로 보고해야 합니다.
+          </p>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

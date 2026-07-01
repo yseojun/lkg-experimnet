@@ -6,8 +6,14 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from lkg_experiment.coherent_default.coherent_raster_experiment import EXPERIMENT_MEASUREMENT_COLUMN_GROUPS
 
-SUMMARY_COLUMNS = [
+
+def _ordered_unique(values: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(str(value) for value in values))
+
+
+SUMMARY_CONTEXT_COLUMNS = [
     "status",
     "suite",
     "result_group",
@@ -21,20 +27,21 @@ SUMMARY_COLUMNS = [
     "cluster_size",
     "use_remapping",
     "reuse_enabled",
-    "fps",
-    "frame_ms",
-    "peak_vram_gb",
-    "psnr_mean",
-    "psnr_std",
-    "ssim_mean",
-    "ssim_std",
-    "lpips_mean",
-    "lpips_std",
-    "metric_view_count",
+]
+
+SUMMARY_ARTIFACT_COLUMNS = [
     "artifact_root",
     "metrics_csv",
     "message",
 ]
+
+SUMMARY_MEASUREMENT_COLUMNS = _ordered_unique(
+    column
+    for columns in EXPERIMENT_MEASUREMENT_COLUMN_GROUPS.values()
+    for column in columns
+)
+
+SUMMARY_COLUMNS = SUMMARY_CONTEXT_COLUMNS + SUMMARY_MEASUREMENT_COLUMNS + SUMMARY_ARTIFACT_COLUMNS
 
 
 def status_row(

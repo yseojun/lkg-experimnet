@@ -257,6 +257,65 @@ class Omg4FtgsTest(unittest.TestCase):
         self.assertIs(calls["colors"], splats.colors)
         self.assertEqual(calls["sh_degree"], 3)
 
+    def test_render_splats_interlaced_coherent_uses_prebuilt_lookup_tensors(self):
+        calls = {}
+        fake_output = torch.full((3, 3, 4), 0.4, dtype=torch.float32)
+        utils_module = types.ModuleType("coherent_raster.utils.utils_coherent_raster")
+        utils_module.unpatchify_image_shape_matrix = lambda image: image
+        utils_module.unpad = lambda image, height, width: image[:, :height, :width]
+        raster_module = types.ModuleType("gsplat.rendering_coherent_raster")
+
+        def fake_rasterization_cr(**kwargs):
+            calls.update(kwargs)
+            return fake_output.clone(), None, {"timing_ms": {"cr_projection_ms": 1.0}}
+
+        raster_module.rasterization_CR = fake_rasterization_cr
+        splats = SimpleNamespace(
+            means=torch.zeros((2, 3), dtype=torch.float32),
+            quats=torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+            scales=torch.ones((2, 3), dtype=torch.float32),
+            opacities=torch.ones(2, dtype=torch.float32),
+            colors=torch.zeros((2, 16, 3), dtype=torch.float32),
+            sh_degree=3,
+        )
+        adjacent_viewmats = torch.eye(4, dtype=torch.float32).reshape(1, 1, 4, 4).repeat(2, 2, 1, 1)
+        view_idx_matrix = torch.full((3, 4, 3), 2, dtype=torch.uint32)
+        subpixel_coord_matrix = torch.full((3, 4, 3), 7, dtype=torch.uint32)
+        bridge_module = types.ModuleType("lkg_experiment.coherent_default.coherent_gsplat_bridge")
+        bridge_module.build_cr_lookup_arrays = mock.Mock(side_effect=AssertionError("lookup rebuilt"))
+        bridge_module.lookup_arrays_to_torch = mock.Mock(side_effect=AssertionError("lookup transferred"))
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "coherent_raster": types.ModuleType("coherent_raster"),
+                "coherent_raster.utils": types.ModuleType("coherent_raster.utils"),
+                "coherent_raster.utils.utils_coherent_raster": utils_module,
+                "gsplat.rendering_coherent_raster": raster_module,
+                "lkg_experiment.coherent_default.coherent_gsplat_bridge": bridge_module,
+            },
+        ):
+            image = render.render_splats_interlaced_coherent(
+                splats,
+                adjacent_viewmats=adjacent_viewmats,
+                K=np.eye(3, dtype=np.float32),
+                viewpoint_index=None,
+                view_idx_matrix=view_idx_matrix,
+                subpixel_coord_matrix=subpixel_coord_matrix,
+                width=4,
+                height=3,
+                device="cpu",
+                tile_size=2,
+                near_plane=0.01,
+                far_plane=100.0,
+                camera_model="pinhole",
+                debug=False,
+            )
+
+        self.assertEqual(tuple(image.shape), (3, 3, 4))
+        self.assertIs(calls["view_idx_matrix"], view_idx_matrix)
+        self.assertIs(calls["subpixel_coord_matrix"], subpixel_coord_matrix)
+
     def test_single_mode_writes_png_and_manifest_with_mock_renderer(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "run"
@@ -328,12 +387,34 @@ class Omg4FtgsTest(unittest.TestCase):
             )
             fake_model = _FakeDynamicModel()
             fake_camera = _FakeCameraSet()
+            prepared_lookup = SimpleNamespace(
+                view_idx_matrix=torch.full((3, 4, 3), 1, dtype=torch.uint32),
+                subpixel_coord_matrix=torch.full((3, 4, 3), 2, dtype=torch.uint32),
+                lookup_cpu_ms=1.25,
+                lookup_h2d_ms=2.5,
+            )
+            rendered = torch.full((3, 3, 4), 0.35)
+            render_meta = {
+                "timing_ms": {
+                    "cr_projection_ms": 0.5,
+                    "cr_keygen_ms": 1.5,
+                    "cr_sort_ms": float("nan"),
+                    "cr_blend_ms": 2.0,
+                },
+                "post_ms": 0.25,
+            }
 
             with mock.patch.object(cli, "load_dynamic_gaussians", return_value=fake_model), mock.patch.object(
                 cli, "load_pose_camera", return_value=fake_camera
             ), mock.patch.object(cli, "load_test_frames", return_value=[camera.TestFrame(0, None, 0.0)]), mock.patch.object(
-                cli, "render_splats_interlaced_coherent", create=True, return_value=torch.full((3, 3, 4), 0.35)
-            ) as render_interlaced:
+                cli, "prepare_cr_lookup_tensors", create=True, return_value=prepared_lookup
+            ) as prepare_lookup, mock.patch.object(
+                cli, "render_splats_interlaced_coherent", create=True, return_value=(rendered, render_meta)
+            ) as render_interlaced, mock.patch.object(
+                cli.time,
+                "perf_counter",
+                side_effect=[10.0, 10.1, 11.0, 11.2, 12.0, 12.3, 20.0, 20.4],
+            ):
                 result = cli.run(args)
 
             self.assertEqual(result, 0)
@@ -347,9 +428,27 @@ class Omg4FtgsTest(unittest.TestCase):
             self.assertEqual(manifest["interlaced"]["views"], 4)
             self.assertEqual(manifest["interlaced"]["cluster_size"], 2)
             self.assertEqual(manifest["interlaced"]["map_metadata"]["mode"], "linear")
+            self.assertEqual(manifest["interlaced"]["lookup_cpu_ms"], 1.25)
+            self.assertEqual(manifest["interlaced"]["lookup_h2d_ms"], 2.5)
+            self.assertEqual(manifest["interlaced"]["cr_timing_ms"]["cr_projection_ms"], 0.5)
+            self.assertEqual(manifest["interlaced"]["post_ms"], 0.25)
+            self.assertAlmostEqual(manifest["interlaced"]["cr_core_ms"], 4.0)
+            self.assertAlmostEqual(manifest["interlaced"]["materialize_ms"], 100.0)
+            self.assertAlmostEqual(manifest["interlaced"]["viewpoint_index_ms"], 200.0)
+            self.assertAlmostEqual(manifest["interlaced"]["view_setup_ms"], 300.0)
+            self.assertAlmostEqual(manifest["interlaced"]["cr_render_ms"], 400.0)
+            self.assertAlmostEqual(manifest["interlaced"]["frame_ms"], 800.0)
+            self.assertAlmostEqual(manifest["interlaced"]["render_ms"], 800.0)
+            self.assertAlmostEqual(manifest["interlaced"]["frame_ms_excluding_lookup"], 800.0)
+            self.assertAlmostEqual(manifest["interlaced"]["frame_ms_including_lookup"], 1003.75)
+            prepare_lookup.assert_called_once()
             render_interlaced.assert_called_once()
             self.assertEqual(tuple(render_interlaced.call_args.kwargs["adjacent_viewmats"].shape), (2, 2, 4, 4))
             self.assertEqual(render_interlaced.call_args.kwargs["viewpoint_index"].shape, (3, 4, 3))
+            self.assertIs(render_interlaced.call_args.kwargs["view_idx_matrix"], prepared_lookup.view_idx_matrix)
+            self.assertIs(render_interlaced.call_args.kwargs["subpixel_coord_matrix"], prepared_lookup.subpixel_coord_matrix)
+            self.assertTrue(render_interlaced.call_args.kwargs["return_meta"])
+            self.assertTrue(render_interlaced.call_args.kwargs["return_timing"])
 
     def test_video_mode_writes_frames_and_manifest_with_mock_renderer(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,9 +21,12 @@ class RtgsCrFrameTiming:
     snapshot_compaction_ms: float = 0.0
     dynamic_color_ms: float = 0.0
     cr_projection_ms: float = 0.0
+    cr_isect_ms: float = 0.0
     cr_keygen_ms: float = 0.0
     cr_sort_ms: float = 0.0
+    cr_offset_ms: float = 0.0
     cr_blend_ms: float = 0.0
+    cr_timing_source: str = ""
     lkg_unpatchify_ms: float = 0.0
     lkg_unpad_ms: float = 0.0
     lkg_panel_paste_ms: float = 0.0
@@ -34,7 +37,13 @@ class RtgsCrFrameTiming:
 
     @property
     def cr_core_total_ms(self) -> float:
-        return float(self.cr_projection_ms + self.cr_keygen_ms + self.cr_sort_ms + self.cr_blend_ms)
+        return float(
+            _finite_sum(
+                self.cr_projection_ms,
+                self.cr_keygen_ms,
+                self.cr_blend_ms,
+            )
+        )
 
     @property
     def lkg_interlace_post_ms(self) -> float:
@@ -56,7 +65,7 @@ class RtgsCrFrameTiming:
     def fps_with_lkg_interlace(self) -> float:
         return 1000.0 / self.frame_ms_with_lkg_interlace if self.frame_ms_with_lkg_interlace > 0.0 else 0.0
 
-    def to_metric_dict(self) -> dict[str, float]:
+    def to_metric_dict(self) -> dict[str, Any]:
         return {
             "dynamic_geometry_ms": float(self.dynamic_geometry_ms),
             "temporal_opacity_ms": float(self.temporal_opacity_ms),
@@ -64,10 +73,13 @@ class RtgsCrFrameTiming:
             "dynamic_color_ms": float(self.dynamic_color_ms),
             "rtgs_dynamic_total_ms": float(self.rtgs_dynamic_total_ms),
             "cr_projection_ms": float(self.cr_projection_ms),
+            "cr_isect_ms": float(self.cr_isect_ms),
             "cr_keygen_ms": float(self.cr_keygen_ms),
             "cr_sort_ms": float(self.cr_sort_ms),
+            "cr_offset_ms": float(self.cr_offset_ms),
             "cr_blend_ms": float(self.cr_blend_ms),
             "cr_core_total_ms": float(self.cr_core_total_ms),
+            "cr_timing_source": str(self.cr_timing_source),
             "lkg_unpatchify_ms": float(self.lkg_unpatchify_ms),
             "lkg_unpad_ms": float(self.lkg_unpad_ms),
             "lkg_panel_paste_ms": float(self.lkg_panel_paste_ms),
@@ -77,6 +89,10 @@ class RtgsCrFrameTiming:
             "frame_ms_with_lkg_interlace": float(self.frame_ms_with_lkg_interlace),
             "fps_with_lkg_interlace": float(self.fps_with_lkg_interlace),
         }
+
+
+def _finite_sum(*values: float) -> float:
+    return float(sum(float(value) for value in values if math.isfinite(float(value))))
 
 
 @dataclass(frozen=True)
@@ -353,9 +369,12 @@ def render_rtgs_cr_one_shot_viewport_image(context: Any, state: RtgsCrOneShotSta
         snapshot_compaction_ms=float(state.dynamic_geometry_timing.get("snapshot_compaction_ms", 0.0)),
         dynamic_color_ms=float(state.dynamic_color_ms),
         cr_projection_ms=float(cr_timing.get("cr_projection_ms", 0.0)),
+        cr_isect_ms=float(cr_timing.get("cr_isect_ms", 0.0)),
         cr_keygen_ms=float(cr_timing.get("cr_keygen_ms", 0.0)),
         cr_sort_ms=float(cr_timing.get("cr_sort_ms", 0.0)),
+        cr_offset_ms=float(cr_timing.get("cr_offset_ms", 0.0)),
         cr_blend_ms=float(cr_timing.get("cr_blend_ms", 0.0)),
+        cr_timing_source=str(cr_timing.get("cr_timing_source", "")),
         lkg_unpatchify_ms=float(lkg_unpatchify_ms),
         lkg_unpad_ms=float(lkg_unpad_ms),
         lkg_panel_paste_ms=0.0,
@@ -385,9 +404,12 @@ def render_rtgs_cr_one_shot_interlaced_once(context: Any, *, variant: Any):
         snapshot_compaction_ms=timing.snapshot_compaction_ms,
         dynamic_color_ms=timing.dynamic_color_ms,
         cr_projection_ms=timing.cr_projection_ms,
+        cr_isect_ms=timing.cr_isect_ms,
         cr_keygen_ms=timing.cr_keygen_ms,
         cr_sort_ms=timing.cr_sort_ms,
+        cr_offset_ms=timing.cr_offset_ms,
         cr_blend_ms=timing.cr_blend_ms,
+        cr_timing_source=timing.cr_timing_source,
         lkg_unpatchify_ms=timing.lkg_unpatchify_ms,
         lkg_unpad_ms=timing.lkg_unpad_ms,
         lkg_panel_paste_ms=float(lkg_panel_paste_ms),

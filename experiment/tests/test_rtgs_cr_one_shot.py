@@ -200,7 +200,7 @@ class RtgsCrOneShotTest(unittest.TestCase):
                 "timing_ms": {
                     "cr_projection_ms": 1.0,
                     "cr_keygen_ms": 2.0,
-                    "cr_sort_ms": 0.0,
+                    "cr_sort_ms": float("nan"),
                     "cr_blend_ms": 3.0,
                 }
             }
@@ -278,8 +278,9 @@ class RtgsCrOneShotTest(unittest.TestCase):
         self.assertGreaterEqual(timing.dynamic_color_ms, 0.0)
         self.assertAlmostEqual(timing.cr_projection_ms, 1.0)
         self.assertAlmostEqual(timing.cr_keygen_ms, 2.0)
-        self.assertAlmostEqual(timing.cr_sort_ms, 0.0)
+        self.assertTrue(math.isnan(timing.cr_sort_ms))
         self.assertAlmostEqual(timing.cr_blend_ms, 3.0)
+        self.assertAlmostEqual(timing.cr_core_total_ms, 6.0)
         self.assertGreaterEqual(timing.lkg_interlace_post_ms, 0.0)
         materialize.assert_called_once()
         self.assertTrue(materialize.call_args.kwargs["return_timing"])

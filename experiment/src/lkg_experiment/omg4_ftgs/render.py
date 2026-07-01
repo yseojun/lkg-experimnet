@@ -1,9 +1,47 @@
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class PreparedCrLookup:
+    view_idx_matrix: Any
+    subpixel_coord_matrix: Any
+    lookup_cpu_ms: float
+    lookup_h2d_ms: float
+
+
+def prepare_cr_lookup_tensors(
+    viewpoint_index: np.ndarray,
+    *,
+    device: str,
+    tile_size: int,
+    use_remapping: bool = True,
+) -> PreparedCrLookup:
+    from lkg_experiment.coherent_default.coherent_gsplat_bridge import build_cr_lookup_arrays, lookup_arrays_to_torch
+
+    _sync_device_if_cuda(device)
+    start = time.perf_counter()
+    lookup = build_cr_lookup_arrays(np.asarray(viewpoint_index), tile_size=int(tile_size), use_remapping=bool(use_remapping))
+    lookup_cpu_ms = (time.perf_counter() - start) * 1000.0
+
+    _sync_device_if_cuda(device)
+    start = time.perf_counter()
+    view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=str(device))
+    _sync_device_if_cuda(device)
+    lookup_h2d_ms = (time.perf_counter() - start) * 1000.0
+
+    return PreparedCrLookup(
+        view_idx_matrix=view_idx_matrix,
+        subpixel_coord_matrix=subpixel_coord_matrix,
+        lookup_cpu_ms=float(lookup_cpu_ms),
+        lookup_h2d_ms=float(lookup_h2d_ms),
+    )
 
 
 def build_interlaced_viewpoint_index(args: Any, *, width: int, height: int) -> tuple[np.ndarray, dict[str, Any]]:
@@ -90,6 +128,18 @@ def install_gsplat_root(gsplat_root: Path | str) -> None:
     root = Path(gsplat_root).expanduser().resolve()
     if root.exists() and str(root) not in sys.path:
         sys.path.insert(0, str(root))
+
+
+def _sync_device_if_cuda(device: str) -> None:
+    if not str(device).startswith("cuda"):
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        return
 
 
 def render_splats_gsplat(
@@ -179,7 +229,9 @@ def render_splats_interlaced_coherent(
     *,
     adjacent_viewmats: Any,
     K: Any,
-    viewpoint_index: np.ndarray,
+    viewpoint_index: np.ndarray | None,
+    view_idx_matrix: Any | None = None,
+    subpixel_coord_matrix: Any | None = None,
     width: int,
     height: int,
     device: str,
@@ -188,20 +240,31 @@ def render_splats_interlaced_coherent(
     far_plane: float,
     camera_model: str,
     debug: bool,
+    return_meta: bool = False,
+    return_timing: bool = False,
 ):
     import torch
     from coherent_raster.utils.utils_coherent_raster import unpad, unpatchify_image_shape_matrix
     from gsplat.rendering_coherent_raster import rasterization_CR
 
-    from lkg_experiment.coherent_default.coherent_gsplat_bridge import build_cr_lookup_arrays, lookup_arrays_to_torch
-
     viewmats_t = torch.as_tensor(adjacent_viewmats, dtype=torch.float32, device=device).contiguous()
     K_t = torch.as_tensor(K, dtype=torch.float32, device=device).contiguous()
-    lookup = build_cr_lookup_arrays(np.asarray(viewpoint_index), tile_size=int(tile_size), use_remapping=True)
-    view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=str(device))
+    if (view_idx_matrix is None) != (subpixel_coord_matrix is None):
+        raise ValueError("view_idx_matrix and subpixel_coord_matrix must be provided together")
+    if view_idx_matrix is None or subpixel_coord_matrix is None:
+        if viewpoint_index is None:
+            raise ValueError("viewpoint_index is required when prebuilt lookup tensors are not provided")
+        prepared_lookup = prepare_cr_lookup_tensors(
+            np.asarray(viewpoint_index),
+            device=str(device),
+            tile_size=int(tile_size),
+            use_remapping=True,
+        )
+        view_idx_matrix = prepared_lookup.view_idx_matrix
+        subpixel_coord_matrix = prepared_lookup.subpixel_coord_matrix
 
     with torch.no_grad():
-        colors, _alpha, _meta = rasterization_CR(
+        colors, _alpha, cr_meta = rasterization_CR(
             means=splats.means,
             quats=splats.quats,
             scales=splats.scales,
@@ -219,7 +282,17 @@ def render_splats_interlaced_coherent(
             camera_model=str(camera_model),
             tile_size=int(tile_size),
             is_debug=bool(debug),
+            return_timing=bool(return_timing),
         )
+        post_start = time.perf_counter()
         image = unpatchify_image_shape_matrix(colors)
         image = unpad(image, int(height), int(width))
-    return image.clamp(0.0, 1.0).contiguous()
+        image = image.clamp(0.0, 1.0).contiguous()
+        _sync_device_if_cuda(device)
+        post_ms = (time.perf_counter() - post_start) * 1000.0
+    if return_meta:
+        meta = dict(cr_meta or {})
+        if return_timing:
+            meta["post_ms"] = float(post_ms)
+        return image, meta
+    return image
