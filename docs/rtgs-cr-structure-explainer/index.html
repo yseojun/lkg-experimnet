@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RTGS + CoherentRaster 구조 해설</title>
+    <link rel="stylesheet" href="assets/styles.css">
+  </head>
+  <body>
+    <div class="page-shell">
+      <aside class="toc" aria-label="문서 목차">
+        <div class="toc-title">RTGS + CR</div>
+        <nav>
+          <a href="#overview">한눈에 보기</a>
+          <a href="#3dgs-basics">GS 기초</a>
+          <a href="#rtgs-dynamics">RTGS dynamics</a>
+          <a href="#camera-contract">camera contract</a>
+          <a href="#official-flow">official flow</a>
+          <a href="#snapshot-materialization">snapshot</a>
+          <a href="#cr-1view-ladder">1-view CR</a>
+          <a href="#lkg-lookup">LKG lookup</a>
+          <a href="#cr-66-compose">66-view compose</a>
+          <a href="#one-shot-cr">one-shot CR</a>
+          <a href="#cuda-contract">CUDA contract</a>
+          <a href="#timing-and-metrics">timing/metrics</a>
+          <a href="#caveats">주의할 해석</a>
+          <a href="#takeaway">최종 요약</a>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <header class="document-header">
+          <p class="eyebrow">코드 기반 렌더링 구조 해설</p>
+          <h1>RTGS 렌더링에 CoherentRaster가 어디에, 어떤 계약으로 들어갔는가</h1>
+          <p class="lead">
+            이 문서는 RTGS를 모르는 독자가 기존 official RTGS render path와 현재 CoherentRaster 적용 방식을
+            함께 이해하도록 만든 설명입니다. 핵심은 RTGS 모델을 바꾼 것이 아니라, timestamp 하나를 골라
+            4D/동적 Gaussian을 3D snapshot으로 접은 뒤 그 snapshot을 CR-compatible tensor로 넘겼다는 점입니다.
+          </p>
+
+          <div class="summary-grid" aria-label="핵심 요약">
+            <div>
+              <span class="tag tag-rtgs">RTGS</span>
+              <strong>official render는 기준선</strong>
+              <p>official <code>Scene</code>, <code>GaussianModel</code>, camera, timestamp, CUDA renderer 흐름을 보존해 baseline을 만든다.</p>
+            </div>
+            <div>
+              <span class="tag tag-snapshot">snapshot</span>
+              <strong>CR 입력은 3D snapshot</strong>
+              <p><code>materialize_rtgs_geometry()</code>가 mean/covariance/opacity를 만들고, color는 camera center 기준으로 평가한다.</p>
+            </div>
+            <div>
+              <span class="tag tag-cr">CR</span>
+              <strong>LKG view selection을 바꿈</strong>
+              <p><code>viewpoint_index</code>를 CR lookup tensor로 바꿔 subpixel별 view를 선택하고 <code>rasterization_CR</code>를 호출한다.</p>
+            </div>
+          </div>
+        </header>
+
+        <section id="overview" class="section">
+          <div class="section-heading">
+            <p class="section-label">Overview</p>
+            <h2>전체 흐름을 먼저 잡기</h2>
+          </div>
+          <p>
+            RTGS + CR을 읽을 때는 이미지 산출물을 섞어 생각하면 안 됩니다. 첫 번째 산출물은 official RTGS
+            image입니다. 이것은 checkpoint, config, camera, timestamp, background, original renderer가 맞는지
+            확인하는 기준선입니다. 두 번째는 snapshot을 CR로 렌더한 single-view image입니다. 이것은 RTGS tensor가
+            CR API를 통과할 수 있는지 확인합니다. 세 번째는 LKG interlaced panel image입니다. 이것은 RGB subpixel마다
+            어떤 view를 보여줄지까지 포함한 최종 display target입니다.
+          </p>
+
+          <div class="pipeline" aria-label="RTGS to CR pipeline">
+            <div class="stage">RTGS checkpoint + config</div>
+            <div class="stage">official <code>Scene</code> + <code>GaussianModel</code> + camera</div>
+            <div class="split">
+              <div class="stage">official RTGS render</div>
+              <div class="stage">timestamp-specific snapshot</div>
+            </div>
+            <div class="stage wide"><code>means [N,3]</code>, <code>covars [N,6]</code>, <code>opacities [N]</code>, <code>colors [N,3]</code> or <code>[C,N,3]</code></div>
+            <div class="split">
+              <div class="stage">CR 1-view validation</div>
+              <div class="stage">LKG lookup + one-shot CR</div>
+            </div>
+            <div class="stage wide">metrics, manifest, timing, sampled comparisons</div>
+          </div>
+
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>단계</th>
+                <th>무엇을 검증하나</th>
+                <th>주요 코드</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>official RTGS</td>
+                <td>original render flow와 camera/timestamp 계약</td>
+                <td><code>official_1view.py</code>, <code>gaussian_renderer.render()</code></td>
+              </tr>
+              <tr>
+                <td>snapshot reference</td>
+                <td>4D/동적 Gaussian을 특정 시간의 3D Gaussian 목록으로 접는 과정</td>
+                <td><code>materialize_rtgs_snapshot()</code>, <code>SnapshotGaussianProxy</code></td>
+              </tr>
+              <tr>
+                <td>CR 1-view</td>
+                <td>all-zero view map에서 RTGS snapshot이 <code>rasterization_CR</code>를 통과하는지</td>
+                <td><code>render_rtgs_coherent()</code>, <code>cr_1view.py</code></td>
+              </tr>
+              <tr>
+                <td>one-shot CR</td>
+                <td>LKG subpixel view selection을 한 CR 경로에서 만드는지</td>
+                <td><code>cr_one_shot.py</code>, <code>rendering_coherent_raster.py</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="3dgs-basics" class="section">
+          <div class="section-heading">
+            <p class="section-label">3DGS Basics</p>
+            <h2>GS 렌더링을 이해하기 위한 최소 개념</h2>
+          </div>
+          <p>
+            3D Gaussian Splatting은 장면을 많은 작은 3D Gaussian으로 표현합니다. 하나의 Gaussian은 카메라에
+            투영되면 화면 위의 타원형 footprint가 되고, 그 영역의 pixel에 color와 alpha를 기여합니다.
+            rasterizer는 camera에서 가까운 순서와 tile별 Gaussian 목록을 이용해 여러 Gaussian의 기여를
+            front-to-back alpha blending으로 누적합니다.
+          </p>
+
+          <div class="concept-grid">
+            <div>
+              <h3>Gaussian 하나가 하는 일</h3>
+              <p>3D center가 2D 위치로 투영되고, covariance나 scale/rotation이 화면 위 footprint 크기와 모양을 만든다.</p>
+            </div>
+            <div>
+              <h3>pixel color가 생기는 방식</h3>
+              <p>여러 Gaussian이 같은 pixel을 덮으면 opacity가 높은 앞쪽 Gaussian부터 색이 섞인다.</p>
+            </div>
+          </div>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>tensor / term</th>
+                <th>초심자용 의미</th>
+                <th>CR에서의 역할</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>means</code></td>
+                <td>Gaussian center positions</td>
+                <td>각 view에서 2D 위치로 projection된다.</td>
+              </tr>
+              <tr>
+                <td><code>covars</code>, <code>scales</code>, <code>quats</code></td>
+                <td>shape and orientation</td>
+                <td>화면 위 ellipse footprint와 blending weight 계산에 쓰인다.</td>
+              </tr>
+              <tr>
+                <td><code>opacities</code></td>
+                <td>how strongly each Gaussian contributes</td>
+                <td>alpha blending에서 투명도를 정한다.</td>
+              </tr>
+              <tr>
+                <td><code>colors</code> / SH</td>
+                <td>color coefficients or evaluated RGB</td>
+                <td>RTGS에서는 view/time에 따라 평가될 수 있어 고정 RGB라고 보면 안 된다.</td>
+              </tr>
+              <tr>
+                <td>rasterizer</td>
+                <td>projects, sorts, and blends</td>
+                <td>official RTGS는 RTGS CUDA rasterizer, CR path는 <code>rasterization_CR</code>를 쓴다.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="rtgs-dynamics" class="section">
+          <div class="section-heading">
+            <p class="section-label">RTGS Dynamics</p>
+            <h2>RTGS는 timestamp마다 3DGS 상태가 달라진다</h2>
+          </div>
+          <p>
+            <code>gaussian_dim=4</code>인 RTGS는 시간 관련 파라미터를 저장합니다. timestamp <code>t</code>에서
+            opacity는 <code>marginal_t</code>로 조정되고, <code>rot_4d</code>가 켜져 있으면 mean/covariance도
+            시간 조건으로 바뀝니다. color는 view-dependent이며, 4D SH를 쓰면 timestamp에도 의존할 수 있습니다.
+          </p>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: dynamic geometry and color</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/rtgs_coherent/cli.py</code></p>
+            <pre><code>if pc.rot_4d:
+    covars, delta_mean = pc.get_current_covariance_and_mean_offset(scaling_modifier, timestamp)
+    means = pc.get_xyz + delta_mean
+
+if pc.gaussian_dim == 4:
+    marginal_t = pc.get_marginal_t(timestamp, scaling_modifier).reshape(-1)
+    opacity = opacity * marginal_t
+    mask = marginal_t &gt; 0.05
+
+rgb = eval_shfs_4d(active_sh_degree, active_sh_degree_t, shs_view, dir_pp, dir_t, duration)</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>왜 snapshot이 필요한가</h3>
+            <p>
+              CoherentRaster는 static 3DGS에 가까운 tensor 계약을 받습니다. 그래서 RTGS 4D Gaussian을 그대로
+              CR에 넣는 것이 아니라, 특정 timestamp에서 렌더링할 3D Gaussian 목록으로 먼저 접어야 합니다.
+              이 과정을 이 문서에서는 timestamp-specific snapshot 또는 materialize 단계라고 부릅니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="camera-contract" class="section">
+          <div class="section-heading">
+            <p class="section-label">Camera Contract</p>
+            <h2>카메라 계약: official RTGS와 gsplat/CR 사이의 번역</h2>
+          </div>
+          <p>
+            official RTGS는 RTGS camera object의 <code>world_view_transform</code>, <code>full_proj_transform</code>,
+            FoV, timestamp 등을 사용합니다. CR adapter는 같은 camera contract를 gsplat-style
+            <code>viewmat</code>과 <code>K</code>로 바꿉니다. 이 번역이 틀리면 CR image가 나빠 보여도 원인은 CR
+            kernel이 아니라 projection convention일 수 있습니다.
+          </p>
+
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>항목</th>
+                <th>official RTGS</th>
+                <th>CR adapter</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>camera matrix</td>
+                <td><code>world_view_transform</code>, <code>full_proj_transform</code></td>
+                <td><code>rtgs_camera_to_gsplat_inputs()</code>가 <code>viewmat</code>, <code>K</code>로 변환</td>
+              </tr>
+              <tr>
+                <td>dnerf style</td>
+                <td>positive FoV 기반 projection</td>
+                <td>FoV에서 focal length를 계산한다.</td>
+              </tr>
+              <tr>
+                <td>N3DV style</td>
+                <td><code>FoVx=FoVy=-1.0</code> sentinel과 explicit intrinsics 사용</td>
+                <td><code>fl_x/fl_y/cx/cy</code>가 positive이면 explicit intrinsics가 우선한다.</td>
+              </tr>
+              <tr>
+                <td>projection adapter</td>
+                <td>original RTGS convention을 유지한다.</td>
+                <td>single/compose는 Python mean/K adapter, one-shot은 CUDA <code>rtgs_projection_adapter</code>를 사용한다.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="inspect">
+            <h3>N3DV sentinel을 잘못 읽으면 생기는 문제</h3>
+            <p>
+              <code>FoVx=FoVy=-1.0</code>은 잘못된 camera 값이라고 단정하면 안 됩니다. N3DV에서는 explicit
+              intrinsics를 쓰기 위한 sentinel contract입니다. acceptance path에서는 FoV를 임의로 positive 값으로
+              normalize하지 않고, 필요한 경우 RTGS-compatible projection adapter를 적용합니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="official-flow" class="section">
+          <div class="section-heading">
+            <p class="section-label">Official Flow</p>
+            <h2>기존 RTGS official 렌더링 흐름</h2>
+          </div>
+          <p>
+            official baseline은 같은 checkpoint를 작은 wrapper가 읽는다는 뜻이 아닙니다. RTGS code root의
+            공식 <code>arguments</code>, <code>Scene</code>, <code>GaussianModel</code>, checkpoint restore,
+            <code>gaussian_renderer.render()</code> 호출 흐름을 최대한 그대로 사용하는 기준선입니다.
+          </p>
+
+          <div class="pipeline">
+            <div class="stage">RTGS YAML config + checkpoint</div>
+            <div class="stage">ModelParams / PipelineParams / OptimizationParams</div>
+            <div class="stage">official <code>Scene</code> construction</div>
+            <div class="stage">official <code>GaussianModel.restore()</code></div>
+            <div class="stage">selected camera + background</div>
+            <div class="stage">official <code>gaussian_renderer.render()</code></div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: official harness</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/rtgs_coherent/official_1view.py</code></p>
+            <pre><code>runtime = prepare_official_rtgs_1view(args)
+official_camera_cuda = runtime.camera.cuda()
+official_render = render(
+    official_camera_cuda,
+    runtime.official.gaussians,
+    runtime.pipe,
+    runtime.background,
+)["render"]</code></pre>
+          </div>
+
+          <div class="why-box">
+            <h3>왜 official baseline이 필요한가</h3>
+            <p>
+              CR output이 나빠졌을 때 가장 먼저 분리할 것은 RTGS loading/camera/timestamp 문제입니다.
+              official baseline이 맞아야 snapshot reference와 CR 결과를 의미 있게 비교할 수 있습니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="snapshot-materialization" class="section">
+          <div class="section-heading">
+            <p class="section-label">Snapshot Materialization</p>
+            <h2>CR로 넘기기 전: timestamp snapshot 만들기</h2>
+          </div>
+          <p>
+            materialization은 시간 <code>t</code>를 하나 고른 뒤, 4D/동적 Gaussian을 그 순간의 3D Gaussian
+            목록으로 접는 과정입니다. snapshot path는 이 결과를 <code>RtgsSnapshot</code>으로 묶고,
+            CR은 이 snapshot의 tensor들을 입력으로 받습니다.
+          </p>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>snapshot field</th>
+                <th>shape</th>
+                <th>설명</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>means</code></td>
+                <td><code>[N,3]</code></td>
+                <td>timestamp-conditioned center. <code>rot_4d</code>이면 mean offset이 반영된다.</td>
+              </tr>
+              <tr>
+                <td><code>covars</code></td>
+                <td><code>[N,6]</code></td>
+                <td>timestamp-conditioned 3D covariance. CR path는 covariance를 직접 넘긴다.</td>
+              </tr>
+              <tr>
+                <td><code>opacities</code></td>
+                <td><code>[N]</code></td>
+                <td>base opacity에 <code>marginal_t</code>를 곱한 뒤 active mask가 적용된다.</td>
+              </tr>
+              <tr>
+                <td><code>colors</code></td>
+                <td><code>[N,3]</code> or <code>[C,N,3]</code></td>
+                <td>single view는 한 camera center, one-shot cluster는 representative camera centers 기준으로 평가한다.</td>
+              </tr>
+              <tr>
+                <td><code>mask</code></td>
+                <td><code>[N_total]</code></td>
+                <td><code>marginal_t &gt; 0.05</code>로 살아남은 Gaussian을 기록한다.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: snapshot adapter</div>
+            <p class="file-ref">참조: <code>cli.py::materialize_rtgs_snapshot</code>, <code>cr_1view.py::SnapshotGaussianProxy</code></p>
+            <pre><code>geometry = materialize_rtgs_geometry(pc, timestamp=timestamp)
+colors = evaluate_rtgs_colors(
+    pc,
+    timestamp=timestamp,
+    camera_center=camera_center,
+    mask=geometry.mask,
+    means_for_color=geometry.means,
+)
+snapshot = RtgsSnapshot(geometry.means, geometry.covars, geometry.opacities, colors, geometry.mask)</code></pre>
+          </div>
+
+          <div class="inspect">
+            <h3>snapshot과 official 차이를 먼저 분리하기</h3>
+            <p>
+              snapshot reference가 official RTGS image와 다르면 그 차이는 temporal covariance, opacity mask,
+              SH/4D SH color, camera convention 중 하나에서 생겼을 수 있습니다. 이 차이를 바로 CR 오류라고
+              해석하면 디버깅 순서가 꼬입니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="cr-1view-ladder" class="section">
+          <div class="section-heading">
+            <p class="section-label">CR 1-View Ladder</p>
+            <h2>1-view CR 검증: official -> snapshot -> CR</h2>
+          </div>
+          <p>
+            1-view CR은 LKG interlacing을 아직 넣지 않은 adapter 검증입니다. <code>viewpoint_index</code>를
+            모두 0으로 만들면 모든 RGB subpixel이 view 0을 선택합니다. 그래서 이 단계는 "RTGS snapshot이 CR
+            renderer를 통과해 같은 camera view를 만들 수 있는가"를 봅니다.
+          </p>
+
+          <div class="pipeline">
+            <div class="stage">official RTGS render</div>
+            <div class="stage">snapshot reference via <code>SnapshotGaussianProxy</code></div>
+            <div class="stage">all-zero <code>viewpoint_index</code></div>
+            <div class="stage">CR render via <code>render_rtgs_coherent()</code></div>
+            <div class="stage">official/snapshot/CR metrics and diff images</div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: one-view CR call</div>
+            <p class="file-ref">참조: <code>experiment/src/lkg_experiment/rtgs_coherent/cli.py::render_rtgs_coherent</code></p>
+            <pre><code>viewpoint_index = np.zeros((height, width, 3), dtype=np.uint32)
+lookup = build_cr_lookup_arrays(viewpoint_index, tile_size=tile_size, use_remapping=True)
+view_idx_matrix, subpixel_coord_matrix = lookup_arrays_to_torch(lookup, device=viewmat.device)
+adjacent_viewmats = viewmat.view(1, 1, 4, 4).contiguous()
+
+colors, _, _ = rasterization_CR(
+    means=snapshot.means,
+    covars=snapshot.covars,
+    opacities=snapshot.opacities,
+    colors=snapshot.colors,
+    adjacent_viewmats=adjacent_viewmats,
+    view_idx_matrix=view_idx_matrix,
+    subpixel_coord_matrix=subpixel_coord_matrix,
+)</code></pre>
+          </div>
+        </section>
+
+        <section id="lkg-lookup" class="section">
+          <div class="section-heading">
+            <p class="section-label">LKG Lookup</p>
+            <h2>LKG viewpoint lookup과 remapping</h2>
+          </div>
+          <p>
+            LKG panel output은 일반 RGB image와 다릅니다. panel의 한 pixel 안에서도 red, green, blue subpixel이
+            서로 다른 view를 참조할 수 있습니다. raw map은 <code>viewpoint_index[y, x, c] = v</code>로 읽습니다.
+          </p>
+
+          <div class="example-box">
+            <h3>작은 예시</h3>
+            <pre><code>panel pixel (10, 20)
+  red subpixel   -> view 12
+  green subpixel -> view 13
+  blue subpixel  -> view 13</code></pre>
+          </div>
+
+          <div class="pipeline">
+            <div class="stage">raw <code>HxWx3</code> view map</div>
+            <div class="stage">pad to tile multiple</div>
+            <div class="stage">patchify to <code>[tile_h,tile_w,3,tile_size,tile_size]</code></div>
+            <div class="stage">optional stable remap by view id</div>
+            <div class="stage">preserve original channel/y/x through <code>subpixel_coord_matrix</code></div>
+          </div>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>CR lookup tensor</th>
+                <th>shape / role</th>
+                <th>오해 방지</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>view_idx_matrix</code></td>
+                <td><code>[tile_h,tile_w,3,tile_size,tile_size]</code>; thread가 사용할 view id</td>
+                <td>view assignment 자체를 담는다.</td>
+              </tr>
+              <tr>
+                <td><code>subpixel_coord_matrix</code></td>
+                <td><code>[tile_h,tile_w,3,tile_size,tile_size,3]</code>; original channel/y/x</td>
+                <td>remapping 후에도 결과가 원래 subpixel 좌표로 돌아가게 한다.</td>
+              </tr>
+              <tr>
+                <td>remapping</td>
+                <td>tile 내부 subpixel 처리 순서를 view id 기준으로 정렬</td>
+                <td>view id를 바꾸는 것이 아니라 memory/coherence를 위한 처리 순서 변경이다.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: lookup conversion</div>
+            <p class="file-ref">참조: <code>coherent_gsplat_bridge.py::build_cr_lookup_arrays</code></p>
+            <pre><code>view_patch = _patchify_image_shape_matrix(view_chw, tile_size)
+coord_patch = _patchify_coordinate_matrix(subpixel_chw, tile_size)
+
+if use_remapping:
+    view_patch, coord_patch = _remap_subpixel_coord(view_patch, coord_patch)</code></pre>
+          </div>
+        </section>
+
+        <section id="cr-66-compose" class="section">
+          <div class="section-heading">
+            <p class="section-label">66-View Compose</p>
+            <h2>66-view compose 경로: correctness bridge</h2>
+          </div>
+          <p>
+            compose path는 66개 synthetic view를 각각 single-view CR로 렌더한 뒤,
+            <code>viewpoint_index</code>가 선택한 subpixel만 final panel에 복사합니다. sampled full-frame view를
+            official RTGS synthetic view와 비교할 수 있어 correctness bridge로 유용합니다.
+          </p>
+
+          <div class="diff-panel">
+            <div class="diff-column">
+              <div class="diff-title">compose path</div>
+              <pre><code>for view_id in range(source_view_count):
+    synthetic_camera = synthetic_camera_from_viewmat_preserving_rtgs_contract(...)
+    colors = evaluate_rtgs_colors(..., camera_center=synthetic_camera.camera_center)
+    cr_image = render_rtgs_coherent(...)
+    accumulate_interlaced_view(interlaced, cr_image, viewpoint_index_t, view_id=view_id)</code></pre>
+            </div>
+            <div class="diff-column">
+              <div class="diff-title">해석 기준</div>
+              <p>
+                compose는 correctness bridge이고, one-shot이 CR식 실행 모델입니다. 66개 view를 각각 렌더하므로
+                CoherentRaster 논문식 one-shot 성능으로 해석하면 안 됩니다.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="one-shot-cr" class="section">
+          <div class="section-heading">
+            <p class="section-label">One-Shot CR</p>
+            <h2>one-shot CR: interlaced panel을 한 번의 CR 호출로 만들기</h2>
+          </div>
+          <p>
+            one-shot CR은 모든 view별 full image를 먼저 만들고 섞는 방식이 아닙니다.
+            grouped/reference-view projection과 lookup tensor를 사용해 interlaced target을 한 CR 경로에서 만듭니다.
+            현재 experiment runner의 user-facing engine 이름도 <code>one_shot</code>입니다.
+          </p>
+
+          <div class="pipeline">
+            <div class="stage">materialize RTGS geometry once per timestamp</div>
+            <div class="stage">synthesize grouped <code>adjacent_viewmats [C,S,4,4]</code></div>
+            <div class="stage">evaluate color at cluster representative camera centers</div>
+            <div class="stage">crop panel lookup to content viewport</div>
+            <div class="stage">call <code>rasterization_CR()</code> once</div>
+            <div class="stage">unpatchify, unpad, paste viewport into panel</div>
+          </div>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: one-shot render</div>
+            <p class="file-ref">참조: <code>cr_one_shot.py::render_rtgs_cr_one_shot_viewport_image</code></p>
+            <pre><code>rendered, _, cr_meta = rasterization_CR(
+    means=state.snapshot.means,
+    covars=state.snapshot.covars,
+    opacities=state.snapshot.opacities,
+    colors=state.snapshot.colors,
+    adjacent_viewmats=state.adjacent_viewmats,
+    Ks=state.K.unsqueeze(0).contiguous(),
+    view_idx_matrix=view_idx_matrix,
+    subpixel_coord_matrix=subpixel_coord_matrix,
+    rtgs_projection_adapter=state.rtgs_projection_adapter,
+    return_timing=True,
+)</code></pre>
+          </div>
+
+          <div class="inspect">
+            <h3>clustered color reuse</h3>
+            <p>
+              RTGS color는 view-dependent입니다. <code>cluster_size=1</code>이면 view마다 color를 평가하므로
+              correctness reference로 쓰기 좋습니다. <code>cluster_size&gt;1</code>에서는 cluster representative
+              view의 color를 재사용하므로 품질과 속도 사이의 trade-off가 생깁니다.
+            </p>
+          </div>
+        </section>
+
+        <section id="cuda-contract" class="section">
+          <div class="section-heading">
+            <p class="section-label">CUDA Contract</p>
+            <h2>CR CUDA 계약</h2>
+          </div>
+          <p>
+            CUDA 쪽은 reference view projection, adjacent view translation, subpixel view selection을 함께 사용합니다.
+            <code>translation_values</code>는 Gaussian별, view별 2D projection offset이고,
+            <code>view_idx_matrix</code>와 <code>subpixel_coord_matrix</code>는 각 thread가 어떤 view를 보고 어디에
+            결과를 써야 하는지 알려줍니다.
+          </p>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>input</th>
+                <th>role</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>adjacent_viewmats [C,S,4,4]</code></td>
+                <td>anchor/source view 주변의 grouped views</td>
+              </tr>
+              <tr>
+                <td><code>view_idx_matrix</code></td>
+                <td>tile/subpixel thread가 사용할 view id</td>
+              </tr>
+              <tr>
+                <td><code>subpixel_coord_matrix</code></td>
+                <td>remapping 후에도 원래 output channel/y/x를 찾기 위한 좌표</td>
+              </tr>
+              <tr>
+                <td><code>translation_values</code></td>
+                <td>reference projection에서 adjacent view projection으로 이동하는 per-Gaussian 2D offset</td>
+              </tr>
+              <tr>
+                <td><code>rtgs_projection_adapter [6]</code></td>
+                <td>N3DV sentinel-FoV projection compensation을 위한 optional CUDA input</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: CUDA subpixel thread</div>
+            <p class="file-ref">참조: <code>rtgs-coherent-raster/modified-files/gsplat/cuda/csrc/CoherentRaster_CRKernel.cu</code></p>
+            <pre><code>uint32_t original_x = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][2];
+uint32_t original_y = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][1];
+uint32_t original_z = subpixel_coord_matrix[tile_y][tile_x][channel][ty][tx][0];
+uint32_t view_number = view_idx_matrix[tile_y][tile_x][channel][ty][tx];
+uint32_t view_group_idx = view_number / view_group_size;
+uint32_t view_idx_in_group = view_number % view_group_size;
+float2 translation_value = translation_values[g][view_group_idx][view_idx_in_group];</code></pre>
+          </div>
+        </section>
+
+        <section id="timing-and-metrics" class="section">
+          <div class="section-heading">
+            <p class="section-label">Timing And Metrics</p>
+            <h2>timing과 metric을 어떻게 읽을 것인가</h2>
+          </div>
+          <p>
+            RTGS + CR timing은 static 3DGS CR timing보다 단계가 많습니다. RTGS dynamic snapshot을 만들고,
+            color를 평가하고, CR core를 실행한 뒤, LKG panel tensor로 후처리합니다. 그래서 metrics row를 읽을 때
+            dynamic RTGS 비용과 CR core 비용을 분리해야 합니다.
+          </p>
+
+          <table class="term-table">
+            <thead>
+              <tr>
+                <th>metric group</th>
+                <th>fields</th>
+                <th>의미</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>RTGS dynamic timing</td>
+                <td><code>dynamic_geometry_ms</code>, <code>temporal_opacity_ms</code>, <code>snapshot_compaction_ms</code>, <code>dynamic_color_ms</code></td>
+                <td>timestamp snapshot과 representative-view color를 준비하는 비용</td>
+              </tr>
+              <tr>
+                <td>CR core timing</td>
+                <td><code>cr_projection_ms</code>, <code>cr_keygen_ms</code>, <code>cr_sort_ms</code>, <code>cr_offset_ms</code>, <code>cr_blend_ms</code></td>
+                <td>CR projection, intersection/key/sort/offset, alpha blending 비용</td>
+              </tr>
+              <tr>
+                <td>LKG post timing</td>
+                <td><code>lkg_unpatchify_ms</code>, <code>lkg_unpad_ms</code>, <code>lkg_panel_paste_ms</code></td>
+                <td>patchified CR output을 panel image로 되돌리는 비용</td>
+              </tr>
+              <tr>
+                <td>aggregate</td>
+                <td><code>frame_ms_without_lkg</code>, <code>frame_ms_with_lkg_interlace</code></td>
+                <td>renderer-only 비교와 LKG-ready tensor 비교를 구분한다.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="evidence">
+            <div class="evidence-title">Code Evidence: timing object</div>
+            <p class="file-ref">참조: <code>cr_one_shot.py::RtgsCrFrameTiming</code>, <code>experiment/docs/rtgs_cr_metric_columns_ko.md</code></p>
+            <pre><code>frame_ms_without_lkg = rtgs_dynamic_total_ms + cr_core_total_ms
+frame_ms_with_lkg_interlace = frame_ms_without_lkg + lkg_interlace_post_ms</code></pre>
+          </div>
+        </section>
+
+        <section id="caveats" class="section">
+          <div class="section-heading">
+            <p class="section-label">Caveats</p>
+            <h2>틀리기 쉬운 해석</h2>
+          </div>
+          <div class="warning-grid">
+            <div>
+              <h3>CR이 RTGS 모델을 바꾼 것이 아니다</h3>
+              <p>CR은 RTGS가 만든 timestamp snapshot을 다른 rasterizer/backend로 렌더링한다.</p>
+            </div>
+            <div>
+              <h3>snapshot 차이는 먼저 분리한다</h3>
+              <p>snapshot과 official 차이는 먼저 분리해야 하며, 자동으로 CR 오류라고 볼 수 없다.</p>
+            </div>
+            <div>
+              <h3>RTGS color는 고정 RGB가 아니다</h3>
+              <p>RTGS color는 SH/4D SH로 view/time에 따라 평가될 수 있다.</p>
+            </div>
+            <div>
+              <h3>N3DV FoV sentinel</h3>
+              <p>N3DV에서는 FoV=-1이 explicit intrinsics를 쓰기 위한 sentinel contract다.</p>
+            </div>
+            <div>
+              <h3>compose는 성능 모델이 아니다</h3>
+              <p>compose는 correctness bridge이고, one-shot이 CR식 실행 모델이다.</p>
+            </div>
+            <div>
+              <h3>shared K 계약</h3>
+              <p>현재 one-shot 경로는 shared K 계약을 전제로 한다.</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="takeaway" class="section final-section">
+          <div class="section-heading">
+            <p class="section-label">Takeaway</p>
+            <h2>최종 요약</h2>
+          </div>
+          <p>
+            RTGS의 핵심은 시간, color, camera contract입니다. CoherentRaster는 그 model stage를 바꾸지 않고,
+            timestamp snapshot을 CR-compatible tensor로 만든 뒤 rasterization/backend와 LKG subpixel view
+            selection을 바꿉니다. 그래서 올바른 해석 순서는 official RTGS, snapshot reference, CR one-view,
+            compose bridge, one-shot CR입니다.
+          </p>
+          <p>
+            구현 관점에서 중요한 경계도 명확합니다. <code>official_1view.py</code>는 기준선을 만들고,
+            <code>cli.py</code>의 materialize 함수들은 snapshot을 만들며, <code>cr_1view.py</code>는 adapter를
+            검증합니다. <code>cr_66views.py</code>의 compose path는 correctness bridge이고,
+            <code>cr_one_shot.py</code>와 <code>rasterization_CR</code>가 LKG interlaced output을 한 CR 경로에서
+            만드는 현재 실험 모델입니다.
+          </p>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
